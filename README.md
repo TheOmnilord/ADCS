@@ -7,6 +7,7 @@ Active Directory Certificate Services related stuff - PowerShell scripts for man
 | Script | Description |
 | --- | --- |
 | [`Set-ADCSTemplateValidity.ps1`](./Set-ADCSTemplateValidity.ps1) | Bulk-update the validity period (and optionally the renewal overlap period) on one or more certificate templates, with wildcard name matching. |
+| [`Submit-CertificateRequests.ps1`](./Submit-CertificateRequests.ps1) | Batch-submit `.req`/`.csr`/`.txt` files to an ADCS CA via `certreq.exe`, track request IDs in a CSV, and later retrieve the issued certificates. |
 
 ---
 
@@ -116,6 +117,102 @@ A color-coded summary is printed at the end:
 3. For each match, decodes the current `pKIExpirationPeriod` / `pKIOverlapPeriod` (8-byte little-endian negative FILETIME ticks).
 4. Compares against the requested value; skips if already equal.
 5. Writes the new byte array via `DirectoryEntry.InvokeSet()` and calls `SetInfo()` to commit.
+
+---
+
+## Submit-CertificateRequests.ps1
+
+Batch-submits certificate signing requests (`.req` / `.csr` / `.txt`) from a folder to an ADCS CA using `certreq.exe`, tracks each submission's request ID in a CSV file, and can later retrieve the issued certificates.
+
+### Features
+
+- **Batch submit** all request files in a folder in one run
+- **CSV tracking file** records request ID, submit time, status, error messages per file
+- **Resume-safe** - files already present in the tracking CSV are skipped on re-run
+- **Retrieve mode** picks up previously-submitted `Pending` requests and pulls issued `.cer` files
+- **Both mode** submits then retrieves in a single invocation
+- **Connectivity pre-check** via `certutil -ping` before any submissions
+- **Per-run timestamped log file** (`CertBatch_yyyyMMdd_HHmmss.log`)
+- **`-WhatIf` / `-Confirm`** support
+- Handles empty files, missing request IDs, denied requests gracefully
+
+### Requirements
+
+- Windows with `certreq.exe` and `certutil.exe` available (standard on Windows)
+- Windows PowerShell 5.1 or PowerShell 7+
+- Permissions to submit to the target CA and template
+- Network connectivity to the CA
+
+### Parameters
+
+| Parameter | Type | Required | Default | Description |
+| --- | --- | --- | --- | --- |
+| `-InputPath` | `string` | Yes | | Folder containing `.req` / `.csr` / `.txt` request files. |
+| `-CAConfig` | `string` | Yes | | CA configuration string, e.g. `CA01.domain.com\Contoso Issuing CA 1`. |
+| `-CertificateTemplate` | `string` | Yes | | Certificate template name (the CN, not the display name). |
+| `-TrackingFile` | `string` | No | `.\CertTracking.csv` | CSV file used to track request IDs and statuses across runs. |
+| `-OutputFolder` | `string` | No | `.\Certificates` | Folder where issued `.cer` files are saved (one per request, named after the request file). |
+| `-Mode` | `Submit` / `Retrieve` / `Both` | No | `Submit` | `Submit` = submit new requests only; `Retrieve` = pull certs for previously-pending requests; `Both` = do both. |
+| `-WhatIf` | switch | No | | Preview without submitting/retrieving. |
+| `-Confirm` | switch | No | | Prompt before each action. |
+
+### Usage
+
+**Submit all CSRs in a folder:**
+```powershell
+.\Submit-CertificateRequests.ps1 `
+    -InputPath "C:\CSRs" `
+    -CAConfig "CA01.domain.com\Contoso Issuing CA 1" `
+    -CertificateTemplate "WebServer" `
+    -Mode Submit
+```
+
+**Retrieve any issued certificates for previously-pending requests:**
+```powershell
+.\Submit-CertificateRequests.ps1 `
+    -InputPath "C:\CSRs" `
+    -CAConfig "CA01.domain.com\Contoso Issuing CA 1" `
+    -CertificateTemplate "WebServer" `
+    -Mode Retrieve
+```
+
+**Submit and retrieve in one go:**
+```powershell
+.\Submit-CertificateRequests.ps1 `
+    -InputPath "C:\CSRs" `
+    -CAConfig "CA01.domain.com\Contoso Issuing CA 1" `
+    -CertificateTemplate "WebServer" `
+    -Mode Both
+```
+
+**Preview what would be submitted:**
+```powershell
+.\Submit-CertificateRequests.ps1 `
+    -InputPath "C:\CSRs" `
+    -CAConfig "CA01.domain.com\Contoso Issuing CA 1" `
+    -CertificateTemplate "WebServer" `
+    -Mode Submit -WhatIf
+```
+
+### Tracking CSV Schema
+
+| Column | Description |
+| --- | --- |
+| `RequestFile` | Full path of the source `.req`/`.csr`/`.txt` file |
+| `RequestID` | Numeric request ID assigned by the CA |
+| `SubmitTime` | ISO-8601 submission timestamp |
+| `Status` | `Issued`, `Pending`, `Denied`, `Error`, or `Unknown` |
+| `OutputCertFile` | Full path where the issued `.cer` is saved |
+| `LastCheckTime` | ISO-8601 timestamp of last status check |
+| `ErrorMessage` | Error output from `certreq` if the submission or retrieval failed |
+
+### Notes
+
+- The tracking CSV is the source of truth for resume behavior. Deleting it will cause the script to re-submit all files (and the CA may issue duplicates).
+- `Pending` typically means the CA requires manager approval. Re-run in `Retrieve` mode after approval to pull the issued cert.
+- Issued `.cer` files are named after the source request file (e.g. `server1.req` -> `server1.cer`).
+- Empty request files are skipped with a warning.
+- A timestamped log file is created in the working directory for each run.
 
 ---
 
