@@ -1,6 +1,13 @@
-# ADCS
+# ADCS — Active Directory Certificate Services PowerShell Tools
 
-Active Directory Certificate Services related stuff - PowerShell scripts for managing ADCS from the command line.
+A set of PowerShell scripts for administering **Active Directory Certificate Services** (AD CS / ADCS) from the command line. Built for Windows PKI administrators who need to manage certificate templates and process certificate requests at scale, without clicking through the Certificate Templates MMC snap-in or the Certification Authority console.
+
+Currently includes:
+
+- **Bulk certificate template validity updates** — useful for rolling out the CA/Browser Forum **SC-081** validity reductions (200 days from March 2026, 100 days from March 2027, 47 days from March 2029) across many templates at once.
+- **Batch CSR submission to an Enterprise CA** via `certreq.exe`, with resume-safe CSV tracking of request IDs and automated retrieval of issued certificates.
+
+No AD PowerShell module dependency. Works on Windows PowerShell 5.1 and PowerShell 7+.
 
 ## Scripts
 
