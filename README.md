@@ -15,6 +15,26 @@ Active Directory Certificate Services related stuff - PowerShell scripts for man
 
 Modifies the `pKIExpirationPeriod` (and optionally `pKIOverlapPeriod`) attribute on ADCS certificate templates in Active Directory. Supports wildcard template name matching so you can update many templates in one go.
 
+### Why you need this
+
+The CA/Browser Forum (ballot **SC-081**, passed April 2025) mandates a phased reduction of the maximum validity period for publicly-trusted TLS server certificates. While ADCS is typically used for internal PKI, many organizations mirror these limits on their internal CAs to keep templates aligned with industry best practice (and to be ready if any templates ever feed into publicly-trusted chains).
+
+| Effective date | New maximum validity (TLS server certs) |
+| --- | --- |
+| Today | 398 days |
+| **15 March 2026** | **200 days** |
+| **15 March 2027** | **100 days** |
+| **15 March 2029** | **47 days** |
+
+As the cadence tightens, manually adjusting every template through the Certificate Templates MMC snap-in becomes painful. This script lets you update dozens of templates in seconds:
+
+```powershell
+# March 2026 rollover: drop TLS templates to 200 days
+.\Set-ADCSTemplateValidity.ps1 -TemplateName "*Web*","*TLS*" -ValidityPeriod 200 -ValidityPeriodUnit Days -WhatIf
+```
+
+Client authentication, code signing, S/MIME, and other non-TLS templates are **not** covered by SC-081 and can keep longer validity periods. Use targeted wildcards to avoid changing those.
+
 ### Features
 
 - **Wildcard matching** on template CN (e.g. `User*`, `*Web*`, `*VPN*`)
