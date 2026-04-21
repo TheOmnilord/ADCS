@@ -1,0 +1,4 @@
+* text=auto eol=lf
+*.ps1 text eol=crlf working-tree-encoding=UTF-8
+*.psm1 text eol=crlf working-tree-encoding=UTF-8
+*.psd1 text eol=crlf working-tree-encoding=UTF-8
