@@ -19,10 +19,9 @@ Modifies the `pKIExpirationPeriod` (and optionally `pKIOverlapPeriod`) attribute
 
 The CA/Browser Forum (ballot **SC-081**, passed April 2025) mandates a phased reduction of the maximum validity period for publicly-trusted TLS server certificates. While ADCS is typically used for internal PKI, many organizations mirror these limits on their internal CAs to keep templates aligned with industry best practice (and to be ready if any templates ever feed into publicly-trusted chains).
 
-| Effective date | New maximum validity (TLS server certs) |
+| Effective date | Maximum validity (TLS server certs) |
 | --- | --- |
-| Today | 398 days |
-| **15 March 2026** | **200 days** |
+| **15 March 2026** (current) | **200 days** |
 | **15 March 2027** | **100 days** |
 | **15 March 2029** | **47 days** |
 
