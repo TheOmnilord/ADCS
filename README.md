@@ -154,11 +154,14 @@ Batch-submits certificate signing requests (`.req` / `.csr` / `.txt`) from a fol
 
 - **Batch submit** all request files in a folder in one run
 - **CSV tracking file** records request ID, submit time, status, error messages per file
-- **Resume-safe** - files already present in the tracking CSV are skipped on re-run
+- **Resume-safe** - files already present in the tracking CSV are skipped on re-run; with `-Force` (or an interactive y/n confirmation) you can resubmit a tracked file as a new request
 - **Retrieve mode** picks up previously-submitted `Pending` requests and pulls issued `.cer` files
 - **Both mode** submits then retrieves in a single invocation
 - **Connectivity pre-check** via `certutil -ping` before any submissions
 - **Per-run timestamped log file** (`CertBatch_yyyyMMdd_HHmmss.log`)
+- **Friendly error hints** for common ADCS failures (unsupported template, denied by policy, bad subject, access denied) — instead of just dumping the raw certreq output
+- **Dual-section summary** — separates *this run's* results from the *cumulative tracking-file totals*, so historical errors don't look like new ones
+- **Automatic `.rsp` cleanup** after retrieval (override with `-KeepRspFile`)
 - **`-WhatIf` / `-Confirm`** support
 - Handles empty files, missing request IDs, denied requests gracefully
 
@@ -179,6 +182,8 @@ Batch-submits certificate signing requests (`.req` / `.csr` / `.txt`) from a fol
 | `-TrackingFile` | `string` | No | `.\CertTracking.csv` | CSV file used to track request IDs and statuses across runs. |
 | `-OutputFolder` | `string` | No | `.\Certificates` | Folder where issued `.cer` files are saved (one per request, named after the request file). |
 | `-Mode` | `Submit` / `Retrieve` / `Both` | No | `Submit` | `Submit` = submit new requests only; `Retrieve` = pull certs for previously-pending requests; `Both` = do both. |
+| `-KeepRspFile` | switch | No | | By default the `.rsp` file `certreq` writes next to each retrieved `.cer` is deleted. Specify this switch to leave it in place. |
+| `-Force` | switch | No | | Resubmit request files that already have a tracked RequestID without prompting. Without `-Force`, the script asks y/n for each already-submitted file (default = No / skip). |
 | `-WhatIf` | switch | No | | Preview without submitting/retrieving. |
 | `-Confirm` | switch | No | | Prompt before each action. |
 
@@ -219,6 +224,42 @@ Batch-submits certificate signing requests (`.req` / `.csr` / `.txt`) from a fol
     -CertificateTemplate "WebServer" `
     -Mode Submit -WhatIf
 ```
+
+**Resubmit already-tracked files (non-interactive) and keep `.rsp` files after retrieval:**
+```powershell
+.\Submit-CertificateRequests.ps1 `
+    -InputPath "C:\CSRs" `
+    -CAConfig "CA01.domain.com\Contoso Issuing CA 1" `
+    -CertificateTemplate "WebServer" `
+    -Mode Both -Force -KeepRspFile
+```
+
+### Friendly Error Hints
+
+When `certreq` rejects a request, the raw output is dumped as a warning *and* the script appends an actionable hint based on the underlying error code. Patterns currently recognized:
+
+| Detected pattern | Hint |
+| --- | --- |
+| `0x80094800` / `CERTSRV_E_UNSUPPORTED_CERT_TYPE` | Template name misspelled, not published on this CA, or you accidentally included the `CertificateTemplate:` prefix. Suggests `certutil -config "<CA>" -CATemplates` to list valid names. |
+| `0x80094012` / `CERTSRV_E_TEMPLATE_DENIED` | Calling account lacks Enroll permission on the template, or the template requires approval/signature. |
+| `0x80094004` / `CERTSRV_E_BAD_REQUESTSUBJECT` | CSR subject/SAN does not match what the template requires. |
+| `0x80070005` / access denied | Calling account lacks "Request Certificates" rights on the CA. |
+
+### Run Summary
+
+The end-of-run summary is split into two sections so you can tell *this run's* results apart from the *cumulative state* of the tracking file:
+
+```
+--- Summary: Retrieve ---
+  Issued: 7
+  Total processed this run: 7
+--- Tracking file total (all history) ---
+  Error: 1
+  Issued: 27
+Tracking file: .\CertTracking.csv
+```
+
+In this example the lone `Error: 1` is a historical row from an earlier session, not something that happened in the current run.
 
 ### Tracking CSV Schema
 
