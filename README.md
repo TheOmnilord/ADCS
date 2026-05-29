@@ -160,6 +160,7 @@ Batch-submits certificate signing requests (`.req` / `.csr` / `.txt`) from a fol
 - **Connectivity pre-check** via `certutil -ping` before any submissions
 - **Per-run timestamped log file** (`CertBatch_yyyyMMdd_HHmmss.log`)
 - **Friendly error hints** for common ADCS failures (unsupported template, denied by policy, bad subject, access denied) — instead of just dumping the raw certreq output
+- **Helpful input-folder diagnostics** — if no `.req`/`.csr`/`.txt` files are found, the script lists what *is* in the folder (or notes that it is empty) and skips Submit cleanly instead of throwing a PowerShell stack trace
 - **Dual-section summary** — separates *this run's* results from the *cumulative tracking-file totals*, so historical errors don't look like new ones
 - **Automatic `.rsp` cleanup** after retrieval (override with `-KeepRspFile`)
 - **`-WhatIf` / `-Confirm`** support

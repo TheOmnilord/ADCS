@@ -126,23 +126,36 @@ function Get-RequestFiles {
     param([string]$Path)
 
     if (-not (Test-Path $Path)) {
-        throw "InputPath does not exist: $Path"
+        Write-Log "InputPath does not exist: $Path" -Level Error
+        return @()
     }
 
-    if ((Get-Item $Path).PSIsContainer) {
-        $files = @(
-            Get-ChildItem -Path $Path -Filter '*.req' -File
-            Get-ChildItem -Path $Path -Filter '*.csr' -File
-            Get-ChildItem -Path $Path -Filter '*.txt' -File
-        )
-        if ($files.Count -eq 0) {
-            throw "No .req/.csr/.txt files found in: $Path"
+    if (-not (Get-Item $Path).PSIsContainer) {
+        Write-Log "InputPath must be a folder, not a file: $Path" -Level Error
+        return @()
+    }
+
+    $files = @(
+        Get-ChildItem -Path $Path -Filter '*.req' -File
+        Get-ChildItem -Path $Path -Filter '*.csr' -File
+        Get-ChildItem -Path $Path -Filter '*.txt' -File
+    )
+
+    if ($files.Count -eq 0) {
+        Write-Log "No .req/.csr/.txt files found in: $Path" -Level Warning
+        $other = @(Get-ChildItem -Path $Path -File -ErrorAction SilentlyContinue)
+        if ($other.Count -gt 0) {
+            $sample = ($other | Select-Object -First 5 -ExpandProperty Name) -join ', '
+            $suffix = if ($other.Count -gt 5) { ", ..." } else { '' }
+            Write-Log "  Folder contains $($other.Count) other file(s): $sample$suffix" -Level Warning
+            Write-Log "  Rename them to .req/.csr/.txt or move CSRs into this folder." -Level Warning
         }
-        return $files
+        else {
+            Write-Log "  Folder is empty." -Level Warning
+        }
     }
-    else {
-        throw "InputPath must be a folder: $Path"
-    }
+
+    return $files
 }
 
 function Get-RequestIdFromOutput {
@@ -417,13 +430,18 @@ if (-not (Test-CAConnectivity -CAConfig $CAConfig)) {
 # Submit mode
 if ($Mode -in 'Submit', 'Both') {
     $requestFiles = @(Get-RequestFiles -Path $InputPath)
-    $existingData = Import-TrackingData -Path $TrackingFile
-    $tracking = [System.Collections.ArrayList]@($existingData)
 
-    $alreadySubmitted = @($tracking | Where-Object { $_.RequestID } | Select-Object -ExpandProperty RequestFile)
-    $runResults = [System.Collections.ArrayList]@()
+    if ($requestFiles.Count -eq 0) {
+        Write-Log "Nothing to submit. Skipping Submit phase." -Level Warning
+    }
+    else {
+        $existingData = Import-TrackingData -Path $TrackingFile
+        $tracking = [System.Collections.ArrayList]@($existingData)
 
-    Write-Log "Found $($requestFiles.Count) request file(s) in $InputPath"
+        $alreadySubmitted = @($tracking | Where-Object { $_.RequestID } | Select-Object -ExpandProperty RequestFile)
+        $runResults = [System.Collections.ArrayList]@()
+
+        Write-Log "Found $($requestFiles.Count) request file(s) in $InputPath"
 
     foreach ($file in $requestFiles) {
         if ($file.FullName -in $alreadySubmitted) {
@@ -481,8 +499,9 @@ if ($Mode -in 'Submit', 'Both') {
         }
     }
 
-    Export-TrackingData -Data @($tracking) -Path $TrackingFile
-    Write-Summary -RunData @($runResults) -AllData @($tracking) -RunLabel 'Submit'
+        Export-TrackingData -Data @($tracking) -Path $TrackingFile
+        Write-Summary -RunData @($runResults) -AllData @($tracking) -RunLabel 'Submit'
+    }
 }
 
 # Retrieve mode
