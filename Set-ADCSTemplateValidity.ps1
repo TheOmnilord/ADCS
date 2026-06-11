@@ -1,4 +1,4 @@
-﻿#Requires -Version 5.1
+#Requires -Version 5.1
 <#
 .SYNOPSIS
     Sets the validity period (and optionally the renewal overlap period) on one or more ADCS certificate templates.
@@ -24,7 +24,7 @@
 
 .PARAMETER OverlapPeriod
     Optional. The numeric value for the renewal overlap period (1–9999).
-    Must be specified together with OverlapPeriodUnit.
+    Must be specified together with OverlapPeriodUnit, and must be shorter than the validity period.
 
 .PARAMETER OverlapPeriodUnit
     Optional. The unit for OverlapPeriod: Years, Months, Weeks, Days, or Hours.
@@ -73,19 +73,27 @@ param(
 begin {
     #region Helpers
 
-    function ConvertTo-PKIPeriodBytes {
+    function ConvertTo-PKIPeriodDays {
         param(
             [int]$Period,
             [string]$PeriodUnit
         )
-        $days = switch ($PeriodUnit) {
+        switch ($PeriodUnit) {
             'Years'  { $Period * 365 }
             'Months' { $Period * 30 }
             'Weeks'  { $Period * 7 }
             'Days'   { $Period }
             'Hours'  { $Period / 24.0 }
         }
-        $ticks = [long]($days * 24 * 60 * 60 * 1e7)
+    }
+
+    function ConvertTo-PKIPeriodBytes {
+        param(
+            [int]$Period,
+            [string]$PeriodUnit
+        )
+        $days = ConvertTo-PKIPeriodDays -Period $Period -PeriodUnit $PeriodUnit
+        $ticks = [long][Math]::Round($days * 24 * 60 * 60 * 1e7)
         [System.BitConverter]::GetBytes(-$ticks)
     }
 
@@ -93,26 +101,27 @@ begin {
         param([byte[]]$Bytes)
         if ($null -eq $Bytes -or $Bytes.Length -ne 8) { return 'N/A' }
         $ticks = [System.BitConverter]::ToInt64($Bytes, 0)
-        $days = [Math]::Abs($ticks) / (24.0 * 60 * 60 * 1e7)
+        $hours = [long][Math]::Round([Math]::Abs($ticks) / (60.0 * 60 * 1e7))
+        if ($hours % 24 -ne 0) {
+            return "$hours hour(s)"
+        }
+        $days = [long]($hours / 24)
         if ($days -ge 365 -and $days % 365 -eq 0) {
-            $val = [int]($days / 365)
-            return "$val year(s)"
+            return "$([int]($days / 365)) year(s)"
         }
-        elseif ($days -ge 30 -and $days % 30 -eq 0) {
-            $val = [int]($days / 30)
-            return "$val month(s)"
+        if ($days -ge 30 -and $days % 30 -eq 0) {
+            return "$([int]($days / 30)) month(s)"
         }
-        elseif ($days -ge 7 -and $days % 7 -eq 0) {
-            $val = [int]($days / 7)
-            return "$val week(s)"
+        if ($days -ge 7 -and $days % 7 -eq 0) {
+            return "$([int]($days / 7)) week(s)"
         }
-        elseif ($days -eq [Math]::Floor($days)) {
-            return "$([int]$days) day(s)"
-        }
-        else {
-            $hours = $days * 24
-            return "$([int]$hours) hour(s)"
-        }
+        return "$([int]$days) day(s)"
+    }
+
+    function ConvertTo-LdapFilterValue {
+        # Escapes RFC 4515 filter metacharacters while preserving * and ? wildcards
+        param([string]$Value)
+        $Value -replace '\\', '\5c' -replace '\(', '\28' -replace '\)', '\29' -replace "`0", '\00'
     }
 
     #endregion
@@ -122,6 +131,14 @@ begin {
 
     if ($setOverlap -xor $setOverlapUnit) {
         throw 'OverlapPeriod and OverlapPeriodUnit must both be specified together.'
+    }
+
+    if ($setOverlap) {
+        $validityDays = ConvertTo-PKIPeriodDays -Period $ValidityPeriod -PeriodUnit $ValidityPeriodUnit
+        $overlapDays = ConvertTo-PKIPeriodDays -Period $OverlapPeriod -PeriodUnit $OverlapPeriodUnit
+        if ($overlapDays -ge $validityDays) {
+            throw "OverlapPeriod ($OverlapPeriod $OverlapPeriodUnit) must be shorter than ValidityPeriod ($ValidityPeriod $ValidityPeriodUnit)."
+        }
     }
 
     $newExpirationBytes = ConvertTo-PKIPeriodBytes -Period $ValidityPeriod -PeriodUnit $ValidityPeriodUnit
@@ -137,7 +154,7 @@ begin {
 
     # Connect to AD and resolve the Certificate Templates container
     try {
-        $rootDSE = [ADSI]'LDAP://RootDSE'
+        $rootDSE = if ($Server) { [ADSI]"LDAP://$Server/RootDSE" } else { [ADSI]'LDAP://RootDSE' }
         $configNC = $rootDSE.configurationNamingContext.Value
         $templateBaseDN = "CN=Certificate Templates,CN=Public Key Services,CN=Services,$configNC"
         $ldapPath = if ($Server) { "LDAP://$Server/$templateBaseDN" } else { "LDAP://$templateBaseDN" }
@@ -161,7 +178,7 @@ begin {
 
 process {
     foreach ($pattern in $TemplateName) {
-        $filter = "(&(objectClass=pKICertificateTemplate)(cn=$pattern))"
+        $filter = "(&(objectClass=pKICertificateTemplate)(cn=$(ConvertTo-LdapFilterValue $pattern)))"
         Write-Verbose "Searching with filter: $filter"
 
         $searcher = [System.DirectoryServices.DirectorySearcher]::new($baseEntry, $filter)
@@ -172,92 +189,55 @@ process {
         ))
         $searcher.PageSize = 1000
 
+        $results = $null
         try {
-            $results = $searcher.FindAll()
-        }
-        catch {
-            Write-Error "LDAP search failed for pattern '$pattern': $_"
-            continue
-        }
-
-        $matchCount = 0
-        foreach ($result in $results) {
-            $dn = $result.Properties['distinguishedname'][0]
-            $cn = $result.Properties['cn'][0]
-            $displayName = if ($result.Properties['displayname'].Count -gt 0) { $result.Properties['displayname'][0] } else { $cn }
-
-            # Deduplication
-            if (-not $processedDNs.Add($dn)) {
-                Write-Verbose "Skipping duplicate: $cn"
+            try {
+                $results = $searcher.FindAll()
+            }
+            catch {
+                Write-Error "LDAP search failed for pattern '$pattern': $_"
+                $errorCount++
                 continue
             }
 
-            $matchCount++
-            $totalMatched++
+            $matchCount = 0
+            foreach ($result in $results) {
+                $dn = $result.Properties['distinguishedname'][0]
+                $cn = $result.Properties['cn'][0]
+                $displayName = if ($result.Properties['displayname'].Count -gt 0) { $result.Properties['displayname'][0] } else { $cn }
 
-            # Decode current values
-            $currentExpirationBytes = if ($result.Properties['pkiexpirationperiod'].Count -gt 0) {
-                [byte[]]$result.Properties['pkiexpirationperiod'][0]
-            } else { $null }
-            $currentOverlapBytes = if ($result.Properties['pkioverlapperiod'].Count -gt 0) {
-                [byte[]]$result.Properties['pkioverlapperiod'][0]
-            } else { $null }
-
-            $currentValidity = ConvertFrom-PKIPeriodBytes -Bytes $currentExpirationBytes
-            $currentOverlap = ConvertFrom-PKIPeriodBytes -Bytes $currentOverlapBytes
-
-            $newValidityDisplay = "$ValidityPeriod $ValidityPeriodUnit"
-            $newOverlapDisplay = if ($setOverlap) { "$OverlapPeriod $OverlapPeriodUnit" } else { '(unchanged)' }
-
-            # Skip if values are already equal
-            $validityEqual = $null -ne $currentExpirationBytes -and
-                [System.Linq.Enumerable]::SequenceEqual([byte[]]$currentExpirationBytes, [byte[]]$newExpirationBytes)
-            $overlapEqual = (-not $setOverlap) -or (
-                $null -ne $currentOverlapBytes -and
-                [System.Linq.Enumerable]::SequenceEqual([byte[]]$currentOverlapBytes, [byte[]]$newOverlapBytes)
-            )
-            if ($validityEqual -and $overlapEqual) {
-                Write-Verbose "Skipping '$cn' - already set to $newValidityDisplay"
-                [PSCustomObject]@{
-                    TemplateName     = $cn
-                    DisplayName      = $displayName
-                    PreviousValidity = $currentValidity
-                    NewValidity      = $newValidityDisplay
-                    PreviousOverlap  = $currentOverlap
-                    NewOverlap       = $newOverlapDisplay
-                    Status           = 'Already set'
+                # Deduplication
+                if (-not $processedDNs.Add($dn)) {
+                    Write-Verbose "Skipping duplicate: $cn"
+                    continue
                 }
-                $alreadySetCount++
-                continue
-            }
 
-            $target = "'$cn' ($displayName) -Validity: $currentValidity -> $newValidityDisplay"
-            if ($setOverlap) {
-                $target += ", Overlap: $currentOverlap -> $newOverlapDisplay"
-            }
-            $action = 'Set certificate template validity period'
+                $matchCount++
+                $totalMatched++
 
-            if ($PSCmdlet.ShouldProcess($target, $action)) {
-                try {
-                    $ldapDN = if ($Server) { "LDAP://$Server/$dn" } else { "LDAP://$dn" }
-                    $entry = [ADSI]$ldapDN
+                # Decode current values
+                $currentExpirationBytes = if ($result.Properties['pkiexpirationperiod'].Count -gt 0) {
+                    [byte[]]$result.Properties['pkiexpirationperiod'][0]
+                } else { $null }
+                $currentOverlapBytes = if ($result.Properties['pkioverlapperiod'].Count -gt 0) {
+                    [byte[]]$result.Properties['pkioverlapperiod'][0]
+                } else { $null }
 
-                    $entry.InvokeSet('pKIExpirationPeriod', [byte[]]$newExpirationBytes)
+                $currentValidity = ConvertFrom-PKIPeriodBytes -Bytes $currentExpirationBytes
+                $currentOverlap = ConvertFrom-PKIPeriodBytes -Bytes $currentOverlapBytes
 
-                    if ($setOverlap) {
-                        $entry.InvokeSet('pKIOverlapPeriod', [byte[]]$newOverlapBytes)
-                    }
+                $newValidityDisplay = "$ValidityPeriod $ValidityPeriodUnit"
+                $newOverlapDisplay = if ($setOverlap) { "$OverlapPeriod $OverlapPeriodUnit" } else { '(unchanged)' }
 
-                    # Bump minor revision so CAs detect the change
-                    $currentRevision = 0
-                    if ($entry.Properties['msPKI-Template-Minor-Revision'].Count -gt 0) {
-                        $currentRevision = [int]$entry.Properties['msPKI-Template-Minor-Revision'][0]
-                    }
-                    $entry.Properties['msPKI-Template-Minor-Revision'].Value = $currentRevision + 1
-
-                    $entry.SetInfo()
-                    $modifiedCount++
-
+                # Skip if values are already equal
+                $validityEqual = $null -ne $currentExpirationBytes -and
+                    [System.Linq.Enumerable]::SequenceEqual([byte[]]$currentExpirationBytes, [byte[]]$newExpirationBytes)
+                $overlapEqual = (-not $setOverlap) -or (
+                    $null -ne $currentOverlapBytes -and
+                    [System.Linq.Enumerable]::SequenceEqual([byte[]]$currentOverlapBytes, [byte[]]$newOverlapBytes)
+                )
+                if ($validityEqual -and $overlapEqual) {
+                    Write-Verbose "Skipping '$cn' - already set to $newValidityDisplay"
                     [PSCustomObject]@{
                         TemplateName     = $cn
                         DisplayName      = $displayName
@@ -265,14 +245,69 @@ process {
                         NewValidity      = $newValidityDisplay
                         PreviousOverlap  = $currentOverlap
                         NewOverlap       = $newOverlapDisplay
-                        Status           = 'Modified'
+                        Status           = 'Already set'
                     }
-
-                    Write-Verbose "Successfully updated: $cn"
+                    $alreadySetCount++
+                    continue
                 }
-                catch {
-                    Write-Error "Failed to update template '$cn': $_"
-                    $errorCount++
+
+                $target = "'$cn' ($displayName) -Validity: $currentValidity -> $newValidityDisplay"
+                if ($setOverlap) {
+                    $target += ", Overlap: $currentOverlap -> $newOverlapDisplay"
+                }
+                $action = 'Set certificate template validity period'
+
+                if ($PSCmdlet.ShouldProcess($target, $action)) {
+                    try {
+                        $ldapDN = if ($Server) { "LDAP://$Server/$dn" } else { "LDAP://$dn" }
+                        $entry = [ADSI]$ldapDN
+
+                        # Assign via the property cache; InvokeSet would unroll the byte
+                        # array into 8 separate values through its params object[] binding
+                        $entry.Properties['pKIExpirationPeriod'].Value = [byte[]]$newExpirationBytes
+
+                        if ($setOverlap) {
+                            $entry.Properties['pKIOverlapPeriod'].Value = [byte[]]$newOverlapBytes
+                        }
+
+                        # Bump minor revision so CAs detect the change
+                        $currentRevision = 0
+                        if ($entry.Properties['msPKI-Template-Minor-Revision'].Count -gt 0) {
+                            $currentRevision = [int]$entry.Properties['msPKI-Template-Minor-Revision'][0]
+                        }
+                        $entry.Properties['msPKI-Template-Minor-Revision'].Value = $currentRevision + 1
+
+                        $entry.SetInfo()
+                        $modifiedCount++
+
+                        [PSCustomObject]@{
+                            TemplateName     = $cn
+                            DisplayName      = $displayName
+                            PreviousValidity = $currentValidity
+                            NewValidity      = $newValidityDisplay
+                            PreviousOverlap  = $currentOverlap
+                            NewOverlap       = $newOverlapDisplay
+                            Status           = 'Modified'
+                        }
+
+                        Write-Verbose "Successfully updated: $cn"
+                    }
+                    catch {
+                        Write-Error "Failed to update template '$cn': $_"
+                        $errorCount++
+                        [PSCustomObject]@{
+                            TemplateName     = $cn
+                            DisplayName      = $displayName
+                            PreviousValidity = $currentValidity
+                            NewValidity      = $newValidityDisplay
+                            PreviousOverlap  = $currentOverlap
+                            NewOverlap       = $newOverlapDisplay
+                            Status           = "Error: $_"
+                        }
+                    }
+                }
+                else {
+                    $skippedCount++
                     [PSCustomObject]@{
                         TemplateName     = $cn
                         DisplayName      = $displayName
@@ -280,29 +315,18 @@ process {
                         NewValidity      = $newValidityDisplay
                         PreviousOverlap  = $currentOverlap
                         NewOverlap       = $newOverlapDisplay
-                        Status           = "Error: $_"
+                        Status           = 'Skipped'
                     }
                 }
             }
-            else {
-                $skippedCount++
-                [PSCustomObject]@{
-                    TemplateName     = $cn
-                    DisplayName      = $displayName
-                    PreviousValidity = $currentValidity
-                    NewValidity      = $newValidityDisplay
-                    PreviousOverlap  = $currentOverlap
-                    NewOverlap       = $newOverlapDisplay
-                    Status           = 'Skipped'
-                }
+
+            if ($matchCount -eq 0) {
+                Write-Warning "No certificate templates found matching '$pattern'."
             }
         }
-
-        $results.Dispose()
-        $searcher.Dispose()
-
-        if ($matchCount -eq 0) {
-            Write-Warning "No certificate templates found matching '$pattern'."
+        finally {
+            if ($null -ne $results) { $results.Dispose() }
+            $searcher.Dispose()
         }
     }
 }

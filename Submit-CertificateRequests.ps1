@@ -1,4 +1,5 @@
-﻿<#
+#Requires -Version 5.1
+<#
 .SYNOPSIS
     Batch submission and retrieval of certificates via ADCS (certreq.exe).
 
@@ -18,17 +19,19 @@
 
 .PARAMETER TrackingFile
     Path to the CSV file that tracks request IDs and statuses.
+    Relative paths are resolved against the current directory and stored as absolute paths.
 
 .PARAMETER OutputFolder
     Folder where issued certificates (.cer) are saved.
+    Relative paths are resolved against the current directory and stored as absolute paths.
 
 .PARAMETER Mode
     Submit   = Submit new certificate requests.
-    Retrieve = Retrieve issued certificates for pending requests.
+    Retrieve = Retrieve issued certificates for unresolved requests.
     Both     = Run Submit, then Retrieve.
 
 .PARAMETER KeepRspFile
-    By default, the .rsp file created next to each retrieved .cer is deleted.
+    By default, the .rsp file created next to each .cer (at both submit and retrieve) is deleted.
     Specify -KeepRspFile to leave it in place.
 
 .PARAMETER Force
@@ -77,9 +80,16 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$script:LogFile = ".\CertBatch_{0:yyyyMMdd_HHmmss}.log" -f (Get-Date)
-
 #region Functions
+
+function Resolve-FullPath {
+    param([Parameter(Mandatory)][string]$Path)
+
+    if ([System.IO.Path]::IsPathRooted($Path)) {
+        return [System.IO.Path]::GetFullPath($Path)
+    }
+    return [System.IO.Path]::GetFullPath((Join-Path (Get-Location).ProviderPath $Path))
+}
 
 function Write-Log {
     param(
@@ -95,11 +105,13 @@ function Write-Log {
 
     switch ($Level) {
         'Warning' { Write-Warning $Message }
-        'Error'   { Write-Host $entry -ForegroundColor Red }
+        'Error'   { Write-Error -Message $entry -ErrorAction Continue }
         default   { Write-Host $entry }
     }
 
-    $entry | Out-File -FilePath $script:LogFile -Append -Encoding utf8
+    if (-not $script:SuppressLogFile) {
+        $entry | Out-File -FilePath $script:LogFile -Append -Encoding utf8
+    }
 }
 
 function Test-CAConnectivity {
@@ -107,7 +119,12 @@ function Test-CAConnectivity {
 
     Write-Log "Testing connectivity to CA: $CAConfig"
     try {
-        $output = & certutil.exe -ping -config $CAConfig 2>&1
+        # Localized EAP: with $ErrorActionPreference = 'Stop', 2>&1 turns native
+        # stderr lines into terminating errors in Windows PowerShell 5.1
+        $output = & {
+            $ErrorActionPreference = 'Continue'
+            certutil.exe -ping -config $CAConfig 2>&1 | ForEach-Object { "$_" }
+        }
         $exitCode = $LASTEXITCODE
         if ($exitCode -ne 0) {
             Write-Log "certutil -ping failed (exit $exitCode): $($output -join ' ')" -Level Error
@@ -173,10 +190,9 @@ function Get-DispositionFromOutput {
     param([string[]]$Output)
 
     $joined = $Output -join "`n"
-    if ($joined -match 'Certificate retrieved\(Issued\)') { return 'Issued' }
-    if ($joined -match 'retrieved\(Issued\)')             { return 'Issued' }
-    if ($joined -match 'pending|Taken Under Submission')  { return 'Pending' }
-    if ($joined -match 'denied|Denied')                   { return 'Denied' }
+    if ($joined -match 'retrieved\(Issued\)')            { return 'Issued' }
+    if ($joined -match 'pending|Taken Under Submission') { return 'Pending' }
+    if ($joined -match 'denied')                         { return 'Denied' }
     return 'Unknown'
 }
 
@@ -238,16 +254,24 @@ function Export-TrackingData {
     Move-Item -Path $tempFile -Destination $Path -Force
 }
 
+function Remove-RspFile {
+    param([string]$CerPath)
+
+    $rspPath = [System.IO.Path]::ChangeExtension($CerPath, '.rsp')
+    if (Test-Path $rspPath) {
+        Remove-Item -Path $rspPath -Force -ErrorAction SilentlyContinue
+        Write-Log "  Deleted .rsp file: $rspPath"
+    }
+}
+
 function Submit-SingleRequest {
     param(
         [System.IO.FileInfo]$RequestFile,
         [string]$CAConfig,
         [string]$CertificateTemplate,
-        [string]$OutputFolder
+        [string]$CerPath,
+        [switch]$KeepRspFile
     )
-
-    $baseName = [System.IO.Path]::GetFileNameWithoutExtension($RequestFile.Name)
-    $cerPath = Join-Path $OutputFolder "$baseName.cer"
 
     Write-Log "Submitting: $($RequestFile.Name)"
 
@@ -260,7 +284,7 @@ function Submit-SingleRequest {
             '-config', "`"$CAConfig`"",
             '-attrib', "`"CertificateTemplate:$CertificateTemplate`"",
             "`"$($RequestFile.FullName)`"",
-            "`"$cerPath`""
+            "`"$CerPath`""
         ) -NoNewWindow -Wait -PassThru -RedirectStandardOutput $stdoutFile -RedirectStandardError $stderrFile
 
         $stdout = @(Get-Content -Path $stdoutFile -ErrorAction SilentlyContinue)
@@ -300,13 +324,17 @@ function Submit-SingleRequest {
             RequestID      = $requestId
             SubmitTime     = (Get-Date -Format 'o')
             Status         = $disposition
-            OutputCertFile = $cerPath
+            OutputCertFile = $CerPath
             LastCheckTime  = (Get-Date -Format 'o')
             ErrorMessage   = $errorMsg
         }
     }
     finally {
         Remove-Item -Path $stdoutFile, $stderrFile -ErrorAction SilentlyContinue
+
+        if (-not $KeepRspFile) {
+            Remove-RspFile -CerPath $CerPath
+        }
     }
 }
 
@@ -363,18 +391,12 @@ function Get-IssuedCertificate {
                 Write-Log "  Unknown status: $disposition" -Level Warning
             }
         }
-
-        return $Record
     }
     finally {
         Remove-Item -Path $stdoutFile, $stderrFile -ErrorAction SilentlyContinue
 
         if (-not $KeepRspFile) {
-            $rspPath = [System.IO.Path]::ChangeExtension($Record.OutputCertFile, '.rsp')
-            if (Test-Path $rspPath) {
-                Remove-Item -Path $rspPath -Force -ErrorAction SilentlyContinue
-                Write-Log "  Deleted .rsp file: $rspPath"
-            }
+            Remove-RspFile -CerPath $Record.OutputCertFile
         }
     }
 }
@@ -416,10 +438,19 @@ function Write-Summary {
 
 #region Main
 
+# Resolve to absolute paths so tracking records stay valid when later runs
+# use a different working directory
+$TrackingFile = Resolve-FullPath -Path $TrackingFile
+$OutputFolder = Resolve-FullPath -Path $OutputFolder
+$script:LogFile = Resolve-FullPath -Path (".\CertBatch_{0:yyyyMMdd_HHmmss}.log" -f (Get-Date))
+$script:SuppressLogFile = [bool]$WhatIfPreference
+
 # Validation
 if (-not (Test-Path $OutputFolder)) {
-    New-Item -Path $OutputFolder -ItemType Directory -Force | Out-Null
-    Write-Log "Created output folder: $OutputFolder"
+    if ($PSCmdlet.ShouldProcess($OutputFolder, 'Create output folder')) {
+        New-Item -Path $OutputFolder -ItemType Directory -Force | Out-Null
+        Write-Log "Created output folder: $OutputFolder"
+    }
 }
 
 # CA connectivity test
@@ -441,50 +472,70 @@ if ($Mode -in 'Submit', 'Both') {
         $alreadySubmitted = @($tracking | Where-Object { $_.RequestID } | Select-Object -ExpandProperty RequestFile)
         $runResults = [System.Collections.ArrayList]@()
 
+        # Files sharing a base name (a.req + a.csr) would collide on a.cer;
+        # those keep the full file name in their .cer name instead
+        $duplicateBaseNames = @(
+            $requestFiles |
+                Group-Object { [System.IO.Path]::GetFileNameWithoutExtension($_.Name) } |
+                Where-Object { $_.Count -gt 1 } |
+                Select-Object -ExpandProperty Name
+        )
+
         Write-Log "Found $($requestFiles.Count) request file(s) in $InputPath"
 
-    foreach ($file in $requestFiles) {
-        if ($file.FullName -in $alreadySubmitted) {
-            $existing = @($tracking | Where-Object { $_.RequestFile -eq $file.FullName -and $_.RequestID }) |
-                        Select-Object -Last 1
-            $prevId = $existing.RequestID
-            $prevStatus = $existing.Status
-
-            if ($Force) {
-                Write-Log "Resubmitting (-Force): $($file.Name) [previous RequestID: $prevId, Status: $prevStatus]" -Level Warning
+        foreach ($file in $requestFiles) {
+            if ($file.Length -eq 0) {
+                Write-Log "Skipping (empty file): $($file.Name)" -Level Warning
+                continue
             }
-            else {
-                $yes = New-Object System.Management.Automation.Host.ChoiceDescription '&Yes', 'Resubmit as a new certificate request'
-                $no  = New-Object System.Management.Automation.Host.ChoiceDescription '&No',  'Skip this file'
-                $choices = [System.Management.Automation.Host.ChoiceDescription[]]@($yes, $no)
-                $message = "File '$($file.Name)' was already submitted (RequestID: $prevId, Status: $prevStatus). Resubmit as a new request?"
-                $decision = $Host.UI.PromptForChoice('Already submitted', $message, $choices, 1)
-                if ($decision -ne 0) {
-                    Write-Log "Skipping (already submitted): $($file.Name)"
-                    continue
+
+            if (-not $PSCmdlet.ShouldProcess($file.Name, "Submit certificate request to $CAConfig")) {
+                continue
+            }
+
+            if ($file.FullName -in $alreadySubmitted) {
+                $existing = @($tracking | Where-Object { $_.RequestFile -eq $file.FullName -and $_.RequestID }) |
+                            Select-Object -Last 1
+                $prevId = $existing.RequestID
+                $prevStatus = $existing.Status
+
+                if ($Force) {
+                    Write-Log "Resubmitting (-Force): $($file.Name) [previous RequestID: $prevId, Status: $prevStatus]" -Level Warning
                 }
-                Write-Log "Resubmitting on user confirmation: $($file.Name) [previous RequestID: $prevId, Status: $prevStatus]" -Level Warning
+                else {
+                    $yes = New-Object System.Management.Automation.Host.ChoiceDescription '&Yes', 'Resubmit as a new certificate request'
+                    $no  = New-Object System.Management.Automation.Host.ChoiceDescription '&No',  'Skip this file'
+                    $choices = [System.Management.Automation.Host.ChoiceDescription[]]@($yes, $no)
+                    $message = "File '$($file.Name)' was already submitted (RequestID: $prevId, Status: $prevStatus). Resubmit as a new request?"
+                    try {
+                        $decision = $Host.UI.PromptForChoice('Already submitted', $message, $choices, 1)
+                    }
+                    catch {
+                        Write-Log "Host cannot prompt; skipping already-submitted file: $($file.Name). Use -Force to resubmit." -Level Warning
+                        continue
+                    }
+                    if ($decision -ne 0) {
+                        Write-Log "Skipping (already submitted): $($file.Name)"
+                        continue
+                    }
+                    Write-Log "Resubmitting on user confirmation: $($file.Name) [previous RequestID: $prevId, Status: $prevStatus]" -Level Warning
+                }
             }
-        }
 
-        if ($file.Length -eq 0) {
-            Write-Log "Skipping (empty file): $($file.Name)" -Level Warning
-            continue
-        }
+            $baseName = [System.IO.Path]::GetFileNameWithoutExtension($file.Name)
+            $cerName = if ($baseName -in $duplicateBaseNames) { "$($file.Name).cer" } else { "$baseName.cer" }
+            $cerPath = Join-Path $OutputFolder $cerName
 
-        if ($PSCmdlet.ShouldProcess($file.Name, "Submit certificate request to $CAConfig")) {
             try {
                 $result = Submit-SingleRequest -RequestFile $file `
                     -CAConfig $CAConfig `
                     -CertificateTemplate $CertificateTemplate `
-                    -OutputFolder $OutputFolder
-
-                [void]$tracking.Add($result)
-                [void]$runResults.Add($result)
+                    -CerPath $cerPath `
+                    -KeepRspFile:$KeepRspFile
             }
             catch {
                 Write-Log "Error submitting $($file.Name): $_" -Level Error
-                $errRecord = [PSCustomObject]@{
+                $result = [PSCustomObject]@{
                     RequestFile    = $file.FullName
                     RequestID      = $null
                     SubmitTime     = (Get-Date -Format 'o')
@@ -493,13 +544,15 @@ if ($Mode -in 'Submit', 'Both') {
                     LastCheckTime  = (Get-Date -Format 'o')
                     ErrorMessage   = $_.ToString()
                 }
-                [void]$tracking.Add($errRecord)
-                [void]$runResults.Add($errRecord)
             }
-        }
-    }
 
-        Export-TrackingData -Data @($tracking) -Path $TrackingFile
+            [void]$tracking.Add($result)
+            [void]$runResults.Add($result)
+
+            # Persist after every file so request IDs survive a mid-batch crash
+            Export-TrackingData -Data @($tracking) -Path $TrackingFile
+        }
+
         Write-Summary -RunData @($runResults) -AllData @($tracking) -RunLabel 'Submit'
     }
 }
@@ -510,38 +563,42 @@ if ($Mode -in 'Retrieve', 'Both') {
 
     if ($tracking.Count -eq 0) {
         Write-Log "No data in tracking file. Run Submit first." -Level Warning
-        return
     }
+    else {
+        # Retry anything with a RequestID that is not finally resolved - including
+        # rows stuck in 'Unknown' or 'Error' that the CA may have issued since
+        $unresolved = @($tracking | Where-Object { $_.RequestID -and $_.Status -notin 'Issued', 'Denied' })
+        Write-Log "Found $($unresolved.Count) unresolved request(s) with a RequestID"
 
-    $pending = @($tracking | Where-Object { $_.Status -eq 'Pending' })
-    Write-Log "Found $($pending.Count) pending request(s)"
+        $runResults = [System.Collections.ArrayList]@()
 
-    $runResults = [System.Collections.ArrayList]@()
+        foreach ($record in $unresolved) {
+            if ($PSCmdlet.ShouldProcess("RequestID $($record.RequestID)", "Retrieve certificate from $CAConfig")) {
+                try {
+                    Get-IssuedCertificate -Record $record -CAConfig $CAConfig -KeepRspFile:$KeepRspFile
+                }
+                catch {
+                    Write-Log "Error retrieving RequestID $($record.RequestID): $_" -Level Error
+                    $record.ErrorMessage = $_.ToString()
+                    $record.LastCheckTime = (Get-Date -Format 'o')
+                    $record.Status = 'Error'
+                }
+                [void]$runResults.Add($record)
 
-    foreach ($record in $pending) {
-        if (-not $record.RequestID) {
-            Write-Log "Skipping row without RequestID: $($record.RequestFile)" -Level Warning
-            continue
+                # Persist after every record so status updates survive a mid-batch crash
+                Export-TrackingData -Data $tracking -Path $TrackingFile
+            }
         }
 
-        if ($PSCmdlet.ShouldProcess("RequestID $($record.RequestID)", "Retrieve certificate from $CAConfig")) {
-            try {
-                $updated = Get-IssuedCertificate -Record $record -CAConfig $CAConfig -KeepRspFile:$KeepRspFile
-            }
-            catch {
-                Write-Log "Error retrieving RequestID $($record.RequestID): $_" -Level Error
-                $record.ErrorMessage = $_.ToString()
-                $record.LastCheckTime = (Get-Date -Format 'o')
-                $record.Status = 'Error'
-            }
-            [void]$runResults.Add($record)
-        }
+        Write-Summary -RunData @($runResults) -AllData $tracking -RunLabel 'Retrieve'
     }
-
-    Export-TrackingData -Data $tracking -Path $TrackingFile
-    Write-Summary -RunData @($runResults) -AllData $tracking -RunLabel 'Retrieve'
 }
 
-Write-Log "Done. Log file: $script:LogFile"
+if ($script:SuppressLogFile) {
+    Write-Log "Done. (-WhatIf run: log file not written)"
+}
+else {
+    Write-Log "Done. Log file: $script:LogFile"
+}
 
 #endregion
