@@ -10,12 +10,15 @@
 
 .PARAMETER InputPath
     Folder containing .req/.csr/.txt request files for submission.
+    Required when -Mode is Submit or Both. Not used, and not required, for -Mode Retrieve.
 
 .PARAMETER CAConfig
     CA configuration string for certreq, e.g. "CA01.domain.com\Contoso Issuing CA 1".
+    Always required.
 
 .PARAMETER CertificateTemplate
     Certificate template name used for submission.
+    Required when -Mode is Submit or Both. Not used, and not required, for -Mode Retrieve.
 
 .PARAMETER TrackingFile
     Path to the CSV file that tracks request IDs and statuses.
@@ -56,13 +59,11 @@
 
 [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'Medium')]
 param(
-    [Parameter(Mandatory)]
     [string]$InputPath,
 
     [Parameter(Mandatory)]
     [string]$CAConfig,
 
-    [Parameter(Mandatory)]
     [string]$CertificateTemplate,
 
     [string]$TrackingFile = ".\CertTracking.csv",
@@ -446,6 +447,15 @@ $script:LogFile = Resolve-FullPath -Path (".\CertBatch_{0:yyyyMMdd_HHmmss}.log" 
 $script:SuppressLogFile = [bool]$WhatIfPreference
 
 # Validation
+if ($Mode -in 'Submit', 'Both') {
+    if (-not $InputPath) {
+        throw "-InputPath is required when -Mode is '$Mode'."
+    }
+    if (-not $CertificateTemplate) {
+        throw "-CertificateTemplate is required when -Mode is '$Mode'."
+    }
+}
+
 if (-not (Test-Path $OutputFolder)) {
     if ($PSCmdlet.ShouldProcess($OutputFolder, 'Create output folder')) {
         New-Item -Path $OutputFolder -ItemType Directory -Force | Out-Null
