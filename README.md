@@ -163,7 +163,7 @@ Batch-submits certificate signing requests (`.req` / `.csr` / `.txt`) from a fol
 - **Batch submit** all request files in a folder in one run
 - **CSV tracking file** records request ID, submit time, status, error messages per file
 - **Resume-safe** - files already present in the tracking CSV are skipped on re-run; with `-Force` (or an interactive y/n confirmation) you can resubmit a tracked file as a new request
-- **Retrieve mode** picks up previously-submitted `Pending` requests and pulls issued `.cer` files
+- **Retrieve mode** picks up any tracked request that isn't yet finally resolved (`Pending`, `Unknown`, or `Error`) and pulls issued `.cer` files; only needs `-CAConfig` and a tracking file, not `-InputPath` / `-CertificateTemplate`
 - **Both mode** submits then retrieves in a single invocation
 - **Connectivity pre-check** via `certutil -ping` before any submissions
 - **Per-run timestamped log file** (`CertBatch_yyyyMMdd_HHmmss.log`)
@@ -185,9 +185,9 @@ Batch-submits certificate signing requests (`.req` / `.csr` / `.txt`) from a fol
 
 | Parameter | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
-| `-InputPath` | `string` | Yes | | Folder containing `.req` / `.csr` / `.txt` request files. |
-| `-CAConfig` | `string` | Yes | | CA configuration string, e.g. `CA01.domain.com\Contoso Issuing CA 1`. |
-| `-CertificateTemplate` | `string` | Yes | | Certificate template name (the CN, not the display name). |
+| `-InputPath` | `string` | Submit/Both only | | Folder containing `.req` / `.csr` / `.txt` request files. Not used, and not required, for `-Mode Retrieve`. |
+| `-CAConfig` | `string` | Yes | | CA configuration string, e.g. `CA01.domain.com\Contoso Issuing CA 1`. Always required. |
+| `-CertificateTemplate` | `string` | Submit/Both only | | Certificate template name (the CN, not the display name). Not used, and not required, for `-Mode Retrieve`. |
 | `-TrackingFile` | `string` | No | `.\CertTracking.csv` | CSV file used to track request IDs and statuses across runs. |
 | `-OutputFolder` | `string` | No | `.\Certificates` | Folder where issued `.cer` files are saved (one per request, named after the request file). |
 | `-Mode` | `Submit` / `Retrieve` / `Both` | No | `Submit` | `Submit` = submit new requests only; `Retrieve` = pull certs for previously-pending requests; `Both` = do both. |
@@ -207,12 +207,10 @@ Batch-submits certificate signing requests (`.req` / `.csr` / `.txt`) from a fol
     -Mode Submit
 ```
 
-**Retrieve any issued certificates for previously-pending requests:**
+**Retrieve any issued certificates for previously-unresolved requests** (only `-CAConfig` and the tracking file are needed — `-InputPath` / `-CertificateTemplate` aren't used in this mode):
 ```powershell
 .\Submit-CertificateRequests.ps1 `
-    -InputPath "C:\CSRs" `
     -CAConfig "CA01.domain.com\Contoso Issuing CA 1" `
-    -CertificateTemplate "WebServer" `
     -Mode Retrieve
 ```
 

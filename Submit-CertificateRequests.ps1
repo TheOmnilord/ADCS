@@ -47,9 +47,7 @@
         -CertificateTemplate "WebServer" -Mode Submit
 
 .EXAMPLE
-    .\Submit-CertificateRequests.ps1 -InputPath "C:\CSRs" `
-        -CAConfig "CA01.domain.com\Contoso Issuing CA 1" `
-        -CertificateTemplate "WebServer" -Mode Retrieve
+    .\Submit-CertificateRequests.ps1 -CAConfig "CA01.domain.com\Contoso Issuing CA 1" -Mode Retrieve
 
 .EXAMPLE
     .\Submit-CertificateRequests.ps1 -InputPath "C:\CSRs" `
