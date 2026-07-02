@@ -6,6 +6,7 @@ Currently includes:
 
 - **Bulk certificate template validity updates** — useful for rolling out the CA/Browser Forum **SC-081** validity reductions (200 days from March 2026, 100 days from March 2027, 47 days from March 2029) across many templates at once.
 - **Batch CSR submission to an Enterprise CA** via `certreq.exe`, with resume-safe CSV tracking of request IDs and automated retrieval of issued certificates.
+- **Cross-forest certificate template sync** — export a template from one forest and import it into another via `certutil`, reapplying the standard enrollment permissions after import.
 
 No AD PowerShell module dependency. Works on Windows PowerShell 5.1 and PowerShell 7+.
 
@@ -15,6 +16,7 @@ No AD PowerShell module dependency. Works on Windows PowerShell 5.1 and PowerShe
 | --- | --- |
 | [`Set-ADCSTemplateValidity.ps1`](./Set-ADCSTemplateValidity.ps1) | Bulk-update the validity period (and optionally the renewal overlap period) on one or more certificate templates, with wildcard name matching. |
 | [`Submit-CertificateRequests.ps1`](./Submit-CertificateRequests.ps1) | Batch-submit `.req`/`.csr`/`.txt` files to an ADCS CA via `certreq.exe`, track request IDs in a CSV, and later retrieve the issued certificates. |
+| [`Sync-KerberosAuthTemplate.ps1`](./Sync-KerberosAuthTemplate.ps1) | Export the Kerberos Authentication (or any) certificate template from a source forest and import it into a target forest via `certutil`, then reapply the standard DC/RODC/Authenticated Users enrollment permissions. |
 
 ---
 
@@ -289,6 +291,70 @@ In this example the lone `Error: 1` is a historical row from an earlier session,
 - Issued `.cer` files are named after the source request file (e.g. `server1.req` -> `server1.cer`).
 - Empty request files are skipped with a warning.
 - A timestamped log file is created in the working directory for each run.
+
+---
+
+## Sync-KerberosAuthTemplate.ps1
+
+Copies a certificate template (by default the built-in **Kerberos Authentication** template) between AD forests. It exports the template definition from a source forest with `certutil -dsTemplate`, and imports it into a target forest with `certutil -f -dsAddTemplate` — then reapplies the standard enrollment permissions, since the security descriptor is forest-specific and is not part of the export.
+
+### Why you need this
+
+The security descriptor (ACL) of a certificate template contains forest-specific SIDs, so it is deliberately excluded from the `certutil` export. After importing a template into a new forest you therefore have to reapply the correct permissions by hand. This script automates the round-trip and sets the standard ACL for you:
+
+- **Domain Controllers** → Read, Enroll, Autoenroll
+- **Enterprise Read-only Domain Controllers** → Read, Enroll, Autoenroll
+- **Authenticated Users** → Read
+
+These three principals are resolved by well-known SID/RID (not by group name), so the script also works on **non-English forests** where the group names are localized. The three principals' ACEs are purged and re-added, so re-running is idempotent (no duplicate ACEs); any other ACEs from `certutil`'s default security descriptor (e.g. Enterprise/Domain Admins Full Control) are left intact.
+
+### Requirements
+
+- Windows PowerShell 5.1 or PowerShell 7+
+- `certutil.exe` (part of RSAT **AD CS Tools** or the AD CS role). **No AD PowerShell module and no CA role** are required.
+- **Export**: read access to the template (Authenticated Users has this by default).
+- **Import**: Enterprise Admin, or delegated write access to the `CN=Certificate Templates` container in the Configuration naming context.
+
+### Parameters
+
+| Parameter | Type | Required | Default | Description |
+| --- | --- | --- | --- | --- |
+| `-Mode` | `Export` / `Import` | Yes | | `Export` dumps the template to a file (run in the source forest); `Import` loads it and applies the ACL (run in the target forest). |
+| `-Path` | `string` | Yes | | Template file (`.inf`/`.txt`) to write (Export) or read (Import). |
+| `-TemplateName` | `string` | No | `KerberosAuthentication` | The CN / internal name of the template as `certutil` knows it (no space). |
+| `-TemplateDisplayName` | `string` | No | `Kerberos Authentication` | The display name used to locate the object in AD when applying permissions after import. |
+| `-Server` | `string` | No | | Pin both the `certutil` operation and the AD reads/writes to a specific DC. Recommended in multi-site forests to avoid a replication race right after import. |
+| `-SkipAcl` | switch | No | | Import only; skip the permission setup. |
+| `-WhatIf` | switch | No | | Preview without making changes. |
+| `-Confirm` | switch | No | | Prompt before each change. |
+
+### Usage
+
+**Export the template in the source forest:**
+```powershell
+.\Sync-KerberosAuthTemplate.ps1 -Mode Export -Path .\KerberosAuthentication.inf
+```
+
+**Copy the file to the target forest, then import and apply the standard ACL:**
+```powershell
+.\Sync-KerberosAuthTemplate.ps1 -Mode Import -Path .\KerberosAuthentication.inf
+```
+
+**Pin every step to one DC (recommended in multi-site forests):**
+```powershell
+.\Sync-KerberosAuthTemplate.ps1 -Mode Import -Path .\KerberosAuthentication.inf -Server dc01.target.local
+```
+
+**Preview an import without making changes:**
+```powershell
+.\Sync-KerberosAuthTemplate.ps1 -Mode Import -Path .\KerberosAuthentication.inf -WhatIf
+```
+
+### Notes
+
+- Import uses `certutil -f`, which **overwrites** an existing template of the same name. The script warns before doing so; use `-WhatIf` first to preview.
+- Each run emits a `PSCustomObject` describing the result and writes step-by-step progress to the verbose stream (`-Verbose`).
+- The exported file is written as UTF-8 so localized/accented template names and descriptions survive the round-trip.
 
 ---
 
