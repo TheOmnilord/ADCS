@@ -408,7 +408,7 @@ function Resolve-TemplateOid {
                 throw "-OidRoot '$OidRoot' is not a valid dotted OID (digits and dots only, no leading zeros in an arc)."
             }
             if ($OidRoot -notlike '1.3.6.1.4.1.311.21.8.*') {
-                Write-Warning "-OidRoot '$OidRoot' does not start with the Microsoft V2 template root '1.3.6.1.4.1.311.21.8'; Windows may not treat the result as a certificate-template OID."
+                Write-Warning "-OidRoot '$OidRoot' is outside the conventional Microsoft template arc '1.3.6.1.4.1.311.21.8'; Windows matches template OIDs by exact value, so this generally works, but stays off the standard namespace."
             }
             $oid = New-TemplateOid -ConfigNC $ConfigNC -ADParams $ADParams -BaseOid $OidRoot
             return @{ Oid = $oid.TemplateOid; CompanionCn = $oid.OidObjectCn; CompanionContainerDN = $oid.ContainerDN }
@@ -443,6 +443,7 @@ function Export-Template {
         [string]$Path,
         [switch]$StripIdentity,
         [switch]$StripOid,
+        [switch]$NoImportHint,   # internal (Validate): suppress the "copy to the target forest" hint
         [hashtable]$ADParams,
         [System.Management.Automation.PSCmdlet]$CallerCmdlet
     )
@@ -497,7 +498,9 @@ function Export-Template {
     if ($StripIdentity) {
         Write-Host "Identity stripped - you must supply -NewTemplateName and -NewDisplayName on import." -ForegroundColor Yellow
     }
-    Write-Host "Copy this file to the target forest and run the script there with -Mode Import." -ForegroundColor Yellow
+    if (-not $NoImportHint) {
+        Write-Host "Copy this file to the target forest and run the script there with -Mode Import." -ForegroundColor Yellow
+    }
 }
 
 function Import-Template {
@@ -981,7 +984,7 @@ function Invoke-RoundTripValidation {
 
     try {
         # Exercise the real pipeline: export (serialize to JSON) -> import (deserialize + create).
-        Export-Template -TemplateName $TemplateName -Path $Path -ADParams $ADParams -CallerCmdlet $CallerCmdlet
+        Export-Template -TemplateName $TemplateName -Path $Path -ADParams $ADParams -CallerCmdlet $CallerCmdlet -NoImportHint
         if (-not (Test-Path $Path)) {
             # Export write declined at a -Confirm prompt: abort gracefully instead of a raw
             # "file not found" from the import step.
