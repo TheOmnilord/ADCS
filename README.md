@@ -6,9 +6,9 @@ Currently includes:
 
 - **Bulk certificate template validity updates** — useful for rolling out the CA/Browser Forum **SC-081** validity reductions (200 days from March 2026, 100 days from March 2027, 47 days from March 2029) across many templates at once.
 - **Batch CSR submission to an Enterprise CA** via `certreq.exe`, with resume-safe CSV tracking of request IDs and automated retrieval of issued certificates.
-- **Cross-forest certificate template sync** — export a template from one forest and import it into another via `certutil`, reapplying the standard enrollment permissions after import.
+- **Cross-forest certificate template sync** — export a template from one forest as JSON and recreate it in another via LDAP, with optional rename, controlled OID handling, and a composable enrollment ACL. Works even when the target forest has **no AD CS installed** — e.g. to publish a template that an external CA such as **EJBCA** reads for enrollment authorization.
 
-No AD PowerShell module dependency. Works on Windows PowerShell 5.1 and PowerShell 7+.
+Works on Windows PowerShell 5.1 and PowerShell 7+. `Set-ADCSTemplateValidity` and `Submit-CertificateRequests` have no AD PowerShell module dependency; `Sync-KerberosAuthTemplate` requires the RSAT ActiveDirectory module (see its requirements).
 
 ## Scripts
 
@@ -16,7 +16,7 @@ No AD PowerShell module dependency. Works on Windows PowerShell 5.1 and PowerShe
 | --- | --- |
 | [`Set-ADCSTemplateValidity.ps1`](./Set-ADCSTemplateValidity.ps1) | Bulk-update the validity period (and optionally the renewal overlap period) on one or more certificate templates, with wildcard name matching. |
 | [`Submit-CertificateRequests.ps1`](./Submit-CertificateRequests.ps1) | Batch-submit `.req`/`.csr`/`.txt` files to an ADCS CA via `certreq.exe`, track request IDs in a CSV, and later retrieve the issued certificates. |
-| [`Sync-KerberosAuthTemplate.ps1`](./Sync-KerberosAuthTemplate.ps1) | Export the Kerberos Authentication (or any) certificate template from a source forest and import it into a target forest via `certutil`, then reapply the standard DC/RODC/Authenticated Users enrollment permissions. |
+| [`Sync-KerberosAuthTemplate.ps1`](./Sync-KerberosAuthTemplate.ps1) | Export the Kerberos Authentication (or any v2+) certificate template from a source forest as JSON and recreate it in a target forest via LDAP — optional rename, four OID-handling modes, a composable enrollment ACL, and a round-trip validation mode. Target forest does not need AD CS. |
 
 ---
 
@@ -296,65 +296,93 @@ In this example the lone `Error: 1` is a historical row from an earlier session,
 
 ## Sync-KerberosAuthTemplate.ps1
 
-Copies a certificate template (by default the built-in **Kerberos Authentication** template) between AD forests. It exports the template definition from a source forest with `certutil -dsTemplate`, and imports it into a target forest with `certutil -f -dsAddTemplate` — then reapplies the standard enrollment permissions, since the security descriptor is forest-specific and is not part of the export.
+Copies a certificate template (by default the built-in **Kerberos Authentication** template) between AD forests. It reads the template's functional attributes from the source forest over LDAP, serializes them to a JSON file, and recreates the template in the target forest with `New-ADObject` — deriving the container DN, `objectCategory`, and (optionally) a fresh template OID from the **target** forest, then applying a composable enrollment ACL.
 
 ### Why you need this
 
-The security descriptor (ACL) of a certificate template contains forest-specific SIDs, so it is deliberately excluded from the `certutil` export. After importing a template into a new forest you therefore have to reapply the correct permissions by hand. This script automates the round-trip and sets the standard ACL for you:
+There is no supported UI path for moving a template definition between forests, and the classic `certutil -dsTemplate` / `-dsAddTemplate` round-trip cannot rename the template, always carries the source OID, and leaves the ACL to you. This script does the whole job, including two scenarios the certutil approach cannot handle:
 
-- **Domain Controllers** → Read, Enroll, Autoenroll
-- **Enterprise Read-only Domain Controllers** → Read, Enroll, Autoenroll
-- **Authenticated Users** → Read
+- **Target forest without AD CS.** The template objects live in the (CA-independent) `Certificate Templates` container that every forest has, so you can publish a template into a forest that never had AD CS — e.g. so an external CA such as **EJBCA** (Microsoft auto-enrollment / MSAE) can read the template and its ACL as the enrollment-authorization source.
+- **Renamed copies with controlled identity.** Import under a new cn/display name, and choose whether the OID is carried over or freshly minted.
 
-These three principals are resolved by well-known SID/RID (not by group name), so the script also works on **non-English forests** where the group names are localized. The three principals' ACEs are purged and re-added, so re-running is idempotent (no duplicate ACEs); any other ACEs from `certutil`'s default security descriptor (e.g. Enterprise/Domain Admins Full Control) are left intact.
+The ACL is the part EJBCA actually consumes, so it gets first-class treatment: bases (`-AclBase`) that either replace or extend the schema-default DACL, plus per-principal additions (`-EnrollPrincipals`) for enrollees and template admins. Principals are resolved by well-known SID/RID (not by group name), so the script also works on **non-English forests** where group names are localized.
+
+### Features
+
+- **LDAP attribute copy** (JSON file format) — no `certutil`, no text-dump parsing
+- **Works against a target forest with no AD CS** (default OID mode needs no PKI OID root)
+- **Rename on import** (`-NewTemplateName` / `-NewDisplayName`)
+- **Four OID modes** (`-OidHandling`): `Preserve` (default; carry source OID), `Generate` (mint under the target forest's real OID root), `GenerateFromRoot` (mint under a base you supply), `GenerateRandom` (mint under a synthesized base) — every mode registers the companion OID "display" object so Windows resolves the OID to the template name
+- **Composable ACL**: `-AclBase Standard | Schema | SchemaPlusStandard | PrincipalsOnly` plus additive `-EnrollPrincipals` (principal → Read/Write/Enroll/Autoenroll/FullControl)
+- **`-Mode Validate`**: proves round-trip fidelity by importing a throwaway copy and diffing every PKI attribute of the source (byte-array attributes included), then cleaning up
+- **Fail-fast pre-flights**: refuses duplicate cn, duplicate template OID, missing containers, unresolvable principals — all before anything is created
+- **`-WhatIf` / `-Confirm`** support end to end; UTF-8 BOM file format safe across PowerShell 5.1 ↔ 7
 
 ### Requirements
 
 - Windows PowerShell 5.1 or PowerShell 7+
-- `certutil.exe` (part of RSAT **AD CS Tools** or the AD CS role). **No AD PowerShell module and no CA role** are required.
-- **Export**: read access to the template (Authenticated Users has this by default).
-- **Import**: Enterprise Admin, or delegated write access to the `CN=Certificate Templates` container in the Configuration naming context.
+- **RSAT ActiveDirectory PowerShell module** (this script is the exception to the repo's otherwise module-free approach — the module is what makes typed attribute writes, `-Server` pinning, and clean rollback practical)
+- No CA role, no RSAT AD CS Tools, and no reachable CA in either forest
+- **Export**: read access to the template (Authenticated Users has this by default)
+- **Import/Validate**: Enterprise Admin, or delegated write access to the `CN=Certificate Templates` (and, for the Generate modes, `CN=OID`) containers in the Configuration naming context
 
 ### Parameters
 
 | Parameter | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
-| `-Mode` | `Export` / `Import` | Yes | | `Export` dumps the template to a file (run in the source forest); `Import` loads it and applies the ACL (run in the target forest). |
-| `-Path` | `string` | Yes | | Template file (`.inf`/`.txt`) to write (Export) or read (Import). |
-| `-TemplateName` | `string` | No | `KerberosAuthentication` | The CN / internal name of the template as `certutil` knows it (no space). |
-| `-TemplateDisplayName` | `string` | No | `Kerberos Authentication` | The display name used to locate the object in AD when applying permissions after import. |
-| `-Server` | `string` | No | | Pin both the `certutil` operation and the AD reads/writes to a specific DC. Recommended in multi-site forests to avoid a replication race right after import. |
-| `-SkipAcl` | switch | No | | Import only; skip the permission setup. |
-| `-WhatIf` | switch | No | | Preview without making changes. |
-| `-Confirm` | switch | No | | Prompt before each change. |
+| `-Mode` | `Export` / `Import` / `Validate` | Yes | | `Export` writes the JSON (source forest); `Import` recreates the template + ACL (target forest); `Validate` round-trips a template into a throwaway copy and diffs it. |
+| `-Path` | `string` | Export/Import | | JSON file to write (Export) or read (Import). Optional for Validate (temp file used). |
+| `-TemplateName` | `string` | No | `KerberosAuthentication` | Export/Validate: the cn (internal name) of the source template. |
+| `-NewTemplateName` | `string` | No | file's `name` | Import: new cn in the target forest (letters, digits, `._-` only). |
+| `-NewDisplayName` | `string` | No | file's `displayName` | Import: new display name in the target forest. |
+| `-StripIdentity` | switch | No | | Export: omit `name`/`displayName` from the file, forcing explicit naming on import. |
+| `-StripOid` | switch | No | | Export: omit the source OID (then import needs a Generate mode). |
+| `-OidHandling` | `Preserve` / `Generate` / `GenerateFromRoot` / `GenerateRandom` | No | `Preserve` | How the template OID is chosen on import (see Features). |
+| `-OidRoot` | `string` | With `GenerateFromRoot` | | Base OID to mint under, e.g. `1.3.6.1.4.1.311.21.8.<arcs>`. |
+| `-AclBase` | `Standard` / `Schema` / `SchemaPlusStandard` / `PrincipalsOnly` | No | `Standard` | ACL foundation. `Standard` writes the stock Kerberos Authentication ACL, replacing the schema default; `Schema` keeps the schema default; `SchemaPlusStandard` keeps it and adds the standard set; `PrincipalsOnly` writes exactly `-EnrollPrincipals`. |
+| `-EnrollPrincipals` | `hashtable` | With `PrincipalsOnly` | | Principal → rights map added on top of the base, e.g. `@{ 'DomainControllers'='Enroll','Autoenroll'; 'PKI-Admins'='FullControl' }`. Keys: SID, sAMAccountName, or well-known token. |
+| `-SkipAcl` | switch | No | | Import: skip the permission step entirely. |
+| `-KeepArtifacts` | switch | No | | Validate: keep the throwaway template/OID object/file for inspection. |
+| `-Server` | `string` | No | auto-discover | Pin all operations to a specific (writable) DC. |
+| `-WhatIf` / `-Confirm` | switch | No | | Preview / prompt. `-WhatIf` shows the planned template, OID object, and exact ACL grants. |
 
 ### Usage
 
-**Export the template in the source forest:**
+**Source forest — export:**
 ```powershell
-.\Sync-KerberosAuthTemplate.ps1 -Mode Export -Path .\KerberosAuthentication.inf
+.\Sync-KerberosAuthTemplate.ps1 -Mode Export -Path .\KerberosAuth.json
 ```
 
-**Copy the file to the target forest, then import and apply the standard ACL:**
+**Target forest (no AD CS needed) — import with the standard ACL:**
 ```powershell
-.\Sync-KerberosAuthTemplate.ps1 -Mode Import -Path .\KerberosAuthentication.inf
+.\Sync-KerberosAuthTemplate.ps1 -Mode Import -Path .\KerberosAuth.json
 ```
 
-**Pin every step to one DC (recommended in multi-site forests):**
+**Import as a renamed copy with a freshly minted (forest-independent) OID:**
 ```powershell
-.\Sync-KerberosAuthTemplate.ps1 -Mode Import -Path .\KerberosAuthentication.inf -Server dc01.target.local
+.\Sync-KerberosAuthTemplate.ps1 -Mode Import -Path .\KerberosAuth.json -OidHandling GenerateRandom `
+    -NewTemplateName "YY-KerberosAuthentication" -NewDisplayName "YY-Kerberos Authentication"
 ```
 
-**Preview an import without making changes:**
+**Standard ACL plus a template-admin group (what an external CA like EJBCA will read):**
 ```powershell
-.\Sync-KerberosAuthTemplate.ps1 -Mode Import -Path .\KerberosAuthentication.inf -WhatIf
+.\Sync-KerberosAuthTemplate.ps1 -Mode Import -Path .\KerberosAuth.json -EnrollPrincipals @{
+    'CONTOSO\PKI-Admins' = 'FullControl'
+}
+```
+
+**Prove round-trip fidelity in the source forest first (creates and removes a throwaway copy):**
+```powershell
+.\Sync-KerberosAuthTemplate.ps1 -Mode Validate -TemplateName "KerberosAuthentication"
 ```
 
 ### Notes
 
-- Import uses `certutil -f`, which **overwrites** an existing template of the same name. The script warns before doing so; use `-WhatIf` first to preview.
-- Each run emits a `PSCustomObject` describing the result and writes step-by-step progress to the verbose stream (`-Verbose`).
-- The exported file is written as UTF-8 so localized/accented template names and descriptions survive the round-trip.
+- Import **refuses** to overwrite an existing template (same cn) or to duplicate an existing template OID — delete or rename instead of clobbering.
+- Only v2+ templates can be recreated (v1 built-ins cannot); the ACL is intentionally not exported — it is forest-specific and is rebuilt from `-AclBase`/`-EnrollPrincipals` on import.
+- Import does **not** publish the template to any CA; with a Microsoft CA that remains a separate "Certificate Templates to Issue" step, and with EJBCA you configure the template mapping there.
+- The JSON is written with a UTF-8 BOM so localized/accented display names survive a PowerShell 7 → 5.1 round-trip.
+- Run `-Mode Validate` in a lab or the source forest before the first production import — it exercises the full export→import pipeline and diffs every PKI attribute the source carries.
 
 ---
 
