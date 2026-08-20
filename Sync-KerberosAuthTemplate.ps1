@@ -470,7 +470,7 @@ function Export-Template {
     $props = $template | Select-Object -Property name, displayName, objectClass, flags, revision, *pki*
 
     if ($props.'msPKI-Template-Schema-Version' -and [int]$props.'msPKI-Template-Schema-Version' -lt 2) {
-        Write-Warning "This looks like a schema version 1 template; v1 (built-in) templates generally cannot be recreated by import."
+        Write-Warning "Schema version 1 template: the object will round-trip, but v1 semantics are fixed in Windows (no editing, no autoenrollment) and v1 consumers match by NAME - import it under its original name, or duplicate it as v2+ in the source forest instead."
     }
 
     if ($StripOid) {
