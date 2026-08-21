@@ -6,7 +6,7 @@ Currently includes:
 
 - **Bulk certificate template validity updates** — useful for rolling out the CA/Browser Forum **SC-081** validity reductions (200 days from March 2026, 100 days from March 2027, 47 days from March 2029) across many templates at once.
 - **Batch CSR submission to an Enterprise CA** via `certreq.exe`, with resume-safe CSV tracking of request IDs and automated retrieval of issued certificates.
-- **Cross-forest certificate template sync** — export a template from one forest as JSON and recreate it in another via LDAP, with optional rename, controlled OID handling, and a composable enrollment ACL. Works even when the target forest has **no AD CS installed** — e.g. to publish a template that an external CA such as **EJBCA** reads for enrollment authorization.
+- **Cross-forest certificate template sync** — copy a template between forests via LDAP, either through a JSON export/import or **directly forest-to-forest in one run** (`-Mode Sync`, with optional explicit credentials per side, so no trust is required). Optional rename, controlled OID handling, and a composable enrollment ACL. Works even when the target forest has **no AD CS installed** — e.g. to publish a template that an external CA such as **EJBCA** reads for enrollment authorization.
 
 Works on Windows PowerShell 5.1 and PowerShell 7+. `Set-ADCSTemplateValidity` and `Submit-CertificateRequests` have no AD PowerShell module dependency; `Sync-KerberosAuthTemplate` requires the RSAT ActiveDirectory module (see its requirements).
 
@@ -16,7 +16,7 @@ Works on Windows PowerShell 5.1 and PowerShell 7+. `Set-ADCSTemplateValidity` an
 | --- | --- |
 | [`Set-ADCSTemplateValidity.ps1`](./Set-ADCSTemplateValidity.ps1) | Bulk-update the validity period (and optionally the renewal overlap period) on one or more certificate templates, with wildcard name matching. |
 | [`Submit-CertificateRequests.ps1`](./Submit-CertificateRequests.ps1) | Batch-submit `.req`/`.csr`/`.txt` files to an ADCS CA via `certreq.exe`, track request IDs in a CSV, and later retrieve the issued certificates. |
-| [`Sync-KerberosAuthTemplate.ps1`](./Sync-KerberosAuthTemplate.ps1) | Export the Kerberos Authentication (or any v2+) certificate template from a source forest as JSON and recreate it in a target forest via LDAP — optional rename, four OID-handling modes, a composable enrollment ACL, and a round-trip validation mode. Target forest does not need AD CS. |
+| [`Sync-KerberosAuthTemplate.ps1`](./Sync-KerberosAuthTemplate.ps1) | Copy the Kerberos Authentication (or any v2+) certificate template between forests via LDAP — through a JSON file or directly forest-to-forest in one run — with optional rename, four OID-handling modes, per-side credentials, a composable enrollment ACL, and a round-trip validation mode. Target forest does not need AD CS. |
 
 ---
 
@@ -294,7 +294,12 @@ In this example the lone `Error: 1` is a historical row from an earlier session,
 
 ## Sync-KerberosAuthTemplate.ps1
 
-Copies a certificate template (by default the built-in **Kerberos Authentication** template) between AD forests. It reads the template's functional attributes from the source forest over LDAP, serializes them to a JSON file, and recreates the template in the target forest with `New-ADObject` — deriving the container DN, `objectCategory`, and (optionally) a fresh template OID from the **target** forest, then applying a composable enrollment ACL.
+Copies a certificate template (by default the built-in **Kerberos Authentication** template) between AD forests. It reads the template's functional attributes from the source forest over LDAP and recreates the template in the target forest with `New-ADObject` — deriving the container DN, `objectCategory`, and (optionally) a fresh template OID from the **target** forest, then applying a composable enrollment ACL. Two interchangeable flows share the same pipeline:
+
+- **File-based** (`-Mode Export` / `-Mode Import`) — serialize to a JSON file in the source forest, import it in the target forest. Right for air-gapped or change-controlled environments.
+- **Direct** (`-Mode Sync`) — read from a DC in the source forest (`-SourceServer`) and write to the target side in a single run, no intermediate file. With a trust, the current identity can usually do both sides; without one, pass `-SourceCredential` and/or `-Credential` — explicit credentials against explicitly named DCs need no trust at all.
+
+The flows mix freely: a JSON exported earlier imports into a remote forest with `-Mode Import -Server <target DC> -Credential (...)`, and `-Mode Export` equally accepts `-Server`/`-Credential` to read from a remote source forest.
 
 ### Why you need this
 
@@ -307,7 +312,9 @@ The ACL is the part EJBCA actually consumes, so it gets first-class treatment: b
 
 ### Features
 
-- **LDAP attribute copy** (JSON file format) — no `certutil`, no text-dump parsing
+- **LDAP attribute copy** — no `certutil`, no text-dump parsing; JSON file or direct forest-to-forest
+- **`-Mode Sync`**: one-run direct sync between forests, no intermediate file (also skips the JSON serialization step entirely)
+- **Per-side credentials** (`-Credential` for the target, `-SourceCredential` for the source) — works across a trust with the current identity, or with **no trust at all** using explicit credentials
 - **Works against a target forest with no AD CS** (default OID mode needs no PKI OID root)
 - **Rename on import** (`-NewTemplateName` / `-NewDisplayName`)
 - **Four OID modes** (`-OidHandling`): `Preserve` (default; carry source OID), `Generate` (mint under the target forest's real OID root), `GenerateFromRoot` (mint under a base you supply), `GenerateRandom` (mint under a synthesized base) — every mode registers the companion OID "display" object so Windows resolves the OID to the template name
@@ -321,16 +328,17 @@ The ACL is the part EJBCA actually consumes, so it gets first-class treatment: b
 - Windows PowerShell 5.1 or PowerShell 7+
 - **RSAT ActiveDirectory PowerShell module** (this script is the exception to the repo's otherwise module-free approach — the module is what makes typed attribute writes, `-Server` pinning, and clean rollback practical)
 - No CA role, no RSAT AD CS Tools, and no reachable CA in either forest
-- **Export**: read access to the template (Authenticated Users has this by default)
-- **Import/Validate**: Enterprise Admin, or delegated write access to the `CN=Certificate Templates` (and, for the Generate modes, `CN=OID`) containers in the Configuration naming context
+- **Export** (and the read side of Sync): read access to the template (Authenticated Users has this by default)
+- **Import/Validate** (and the write side of Sync): Enterprise Admin, or delegated write access to the `CN=Certificate Templates` (and, for the Generate modes, `CN=OID`) containers in the Configuration naming context
+- **Sync**: network reachability to a DC in *each* forest from the machine it runs on; a trust between the forests **or** explicit `-SourceCredential`/`-Credential`
 
 ### Parameters
 
 | Parameter | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
-| `-Mode` | `Export` / `Import` / `Validate` | Yes | | `Export` writes the JSON (source forest); `Import` recreates the template + ACL (target forest); `Validate` round-trips a template into a throwaway copy and diffs it. |
-| `-Path` | `string` | Export/Import | | JSON file to write (Export) or read (Import). Optional for Validate (temp file used). |
-| `-TemplateName` | `string` | No | `KerberosAuthentication` | Export/Validate: the cn (internal name) of the source template. |
+| `-Mode` | `Export` / `Import` / `Sync` / `Validate` | Yes | | `Export` writes the JSON (source forest); `Import` recreates the template + ACL (target forest); `Sync` does both directly forest-to-forest with no file; `Validate` round-trips a template into a throwaway copy and diffs it. |
+| `-Path` | `string` | Export/Import | | JSON file to write (Export) or read (Import). Optional for Validate (temp file used); not used by Sync. |
+| `-TemplateName` | `string` | No | `KerberosAuthentication` | Export/Validate/Sync: the cn (internal name) of the source template. |
 | `-NewTemplateName` | `string` | No | file's `name` | Import: new cn in the target forest (letters, digits, `._-` only). |
 | `-NewDisplayName` | `string` | No | file's `displayName` | Import: new display name in the target forest. |
 | `-StripIdentity` | switch | No | | Export: omit `name`/`displayName` from the file, forcing explicit naming on import. |
@@ -341,7 +349,10 @@ The ACL is the part EJBCA actually consumes, so it gets first-class treatment: b
 | `-EnrollPrincipals` | `hashtable` | With `PrincipalsOnly` | | Principal → rights map added on top of the base, e.g. `@{ 'DomainControllers'='Enroll','Autoenroll'; 'PKI-Admins'='FullControl' }`. Keys: SID, sAMAccountName, or well-known token. |
 | `-SkipAcl` | switch | No | | Import: skip the permission step entirely. |
 | `-KeepArtifacts` | switch | No | | Validate: keep the throwaway template/OID object/file for inspection. |
-| `-Server` | `string` | No | auto-discover | Pin all operations to a specific (writable) DC. |
+| `-Server` | `string` | No | auto-discover | Pin all (target-side, for Sync) operations to a specific writable DC — point it at another forest's DC to operate there. Required together with `-Credential`. |
+| `-Credential` | `pscredential` | No | current identity | Credentials for the target-side operations (all modes). With `-Server`, enables operating on a forest you are not logged on to — no trust needed. |
+| `-SourceServer` | `string` | Sync | | Sync: DC (or domain name) in the **source** forest to read the template from. |
+| `-SourceCredential` | `pscredential` | No | current identity | Sync: credentials for the source-side read. |
 | `-WhatIf` / `-Confirm` | switch | No | | Preview / prompt. `-WhatIf` shows the planned template, OID object, and exact ACL grants. |
 
 ### Usage
@@ -369,6 +380,25 @@ The ACL is the part EJBCA actually consumes, so it gets first-class treatment: b
 }
 ```
 
+**Direct sync — run in the target forest, pull from the source forest over the trust (no file):**
+```powershell
+.\Sync-KerberosAuthTemplate.ps1 -Mode Sync -SourceServer dc01.source.example `
+    -NewTemplateName "YY-KerberosAuthentication" -NewDisplayName "YY-Kerberos Authentication"
+```
+
+**Direct sync from a third machine with explicit credentials on both sides (no trust needed):**
+```powershell
+.\Sync-KerberosAuthTemplate.ps1 -Mode Sync `
+    -SourceServer dc01.a.example -SourceCredential (Get-Credential A\template.reader) `
+    -Server dc01.b.example -Credential (Get-Credential B\ent.admin)
+```
+
+**Mixed flow — import a previously exported JSON straight into another forest:**
+```powershell
+.\Sync-KerberosAuthTemplate.ps1 -Mode Import -Path .\KerberosAuth.json `
+    -Server dc01.b.example -Credential (Get-Credential B\ent.admin)
+```
+
 **Prove round-trip fidelity in the source forest first (creates and removes a throwaway copy):**
 ```powershell
 .\Sync-KerberosAuthTemplate.ps1 -Mode Validate -TemplateName "KerberosAuthentication"
@@ -376,7 +406,9 @@ The ACL is the part EJBCA actually consumes, so it gets first-class treatment: b
 
 ### Notes
 
-- Import **refuses** to overwrite an existing template (same cn) or to duplicate an existing template OID — delete or rename instead of clobbering.
+- Import/Sync **refuse** to overwrite an existing template (same cn) or to duplicate an existing template OID — delete or rename instead of clobbering.
+- The companion `msPKI-Enterprise-Oid` "display" object is the only OID-container object involved, and Import/Sync register it automatically; the source forest's own OID object is deliberately **not** copied verbatim (its other attributes are forest-specific).
+- **Authentication Mechanism Assurance (AMA) links are not carried over.** If an issuance policy OID in the source forest is linked to a group via `msDS-OIDToGroupLink` (AMA — the group SID is injected into the Kerberos ticket only when the user logs on with a qualifying certificate), that link is a DN of a group in the *source* forest and cannot be copied. After import/sync, recreate the link in the target forest manually: link the policy OID object to a local **universal** security group with **no static members** (AD enforces both). Until you do, certificates issued from the synced template will not grant the AMA group membership in the target forest.
 - Only v2+ templates can be recreated (v1 built-ins cannot); the ACL is intentionally not exported — it is forest-specific and is rebuilt from `-AclBase`/`-EnrollPrincipals` on import.
 - Import does **not** publish the template to any CA; with a Microsoft CA that remains a separate "Certificate Templates to Issue" step, and with EJBCA you configure the template mapping there.
 - The JSON is written with a UTF-8 BOM so localized/accented display names survive a PowerShell 7 → 5.1 round-trip.

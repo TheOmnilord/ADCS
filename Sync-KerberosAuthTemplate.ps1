@@ -1,14 +1,16 @@
 #Requires -Modules ActiveDirectory
+
 <#
 .SYNOPSIS
-    Exports a certificate template from one AD forest and recreates it in another using direct
-    LDAP attribute copy. Optionally renames the template, either preserves or regenerates the
-    template OID, and applies standard AD CS permissions after import. Works even against a target
-    forest that has never had AD CS (Certificate Services) installed.
+    Copies a certificate template from one AD forest to another using direct LDAP attribute copy -
+    either through a JSON file (Export/Import) or forest-to-forest in a single run (Sync).
+    Optionally renames the template, either preserves or regenerates the template OID, and applies
+    standard AD CS permissions after import. Works even against a target forest that has never had
+    AD CS (Certificate Services) installed.
 
 .DESCRIPTION
-    This is an LDAP-based export/import (no certutil). It uses the ActiveDirectory PowerShell
-    module for BOTH modes, so the module is required for Export as well as Import.
+    This is an LDAP-based template copy (no certutil). It uses the ActiveDirectory PowerShell
+    module for ALL modes, so the module is required for Export as well as Import/Sync.
 
       -Mode Export
           Run in the SOURCE forest. Reads the template's functional attributes (flags, revision,
@@ -38,6 +40,22 @@
               decide who may enrol.
           Requires Enterprise Admin (or delegated write access to the Certificate Templates and
           OID containers in the Configuration partition).
+
+      -Mode Sync
+          Direct forest-to-forest copy in one run - no intermediate file. Reads the template from a
+          DC in the SOURCE forest (-SourceServer, optionally -SourceCredential) and recreates it on
+          the TARGET side exactly as -Mode Import would (-Server / discovered DC, optionally
+          -Credential) - including -OidHandling, -NewTemplateName / -NewDisplayName, and the full
+          ACL handling described under -Mode Import. Because it feeds the read attributes straight
+          into the import pipeline, it also skips the JSON serialization step that -Mode Validate
+          exists to check.
+
+          Authentication: with a (two-way) trust between the forests, the identity running the
+          script can typically read the source as-is (Authenticated Users has read access to
+          templates) while holding Enterprise Admin rights in the target - then only -SourceServer
+          is needed. Without a trust, or when running as neither identity, pass -SourceCredential
+          and/or -Credential: explicit credentials against explicitly named servers need no trust
+          at all.
 
       -Mode Validate
           Proves round-trip fidelity in a single forest, without touching a CA. Reads a source
@@ -74,16 +92,21 @@
         as fallbacks.
 
 .PARAMETER Mode
-    "Export", "Import", or "Validate".
+    "Export", "Import", "Sync", or "Validate". The file-based and direct flows mix freely: a JSON
+    exported earlier imports into a remote forest with -Mode Import -Server <target DC> (plus
+    -Credential when needed), and -Mode Export equally accepts -Server/-Credential to read from a
+    remote source forest.
 
 .PARAMETER Path
-    JSON file path. Written on Export, read on Import. Required for Export and Import. On Validate
-    it is optional: if given, the intermediate export is written there and kept for inspection; if
-    omitted, a temporary file is used and deleted afterwards.
+    JSON file path. Written on Export, read on Import. Required for Export and Import; not used by
+    Sync (no intermediate file is involved). On Validate it is optional: if given, the intermediate
+    export is written there and kept for inspection; if omitted, a temporary file is used and
+    deleted afterwards.
 
 .PARAMETER TemplateName
-    Export/Validate. The internal name (cn) of the source template to export. cn is unique within
-    the templates container, so this matches exactly one template. Default: "KerberosAuthentication".
+    Export/Validate/Sync. The internal name (cn) of the source template to read. cn is unique
+    within the templates container, so this matches exactly one template.
+    Default: "KerberosAuthentication".
 
 .PARAMETER StripIdentity
     Export only. Removes the source name and displayName from the JSON file, forcing you to supply
@@ -120,8 +143,26 @@
     the other modes.
 
 .PARAMETER Server
-    Optional domain controller to target for configuration-partition operations. If omitted on
-    import, a DC is discovered and used consistently for the write and the follow-up ACL step.
+    Optional domain controller to target for configuration-partition operations - on Sync this is
+    the TARGET side (the source side is -SourceServer). If omitted on Import/Sync/Validate, a
+    writable DC in the CURRENT forest is discovered and used consistently for the write and the
+    follow-up ACL step; point it at a DC in another forest (with -Credential as needed) to operate
+    there instead. Required whenever -Credential is given, so the credentials are guaranteed to be
+    used against the forest you intend.
+
+.PARAMETER Credential
+    Optional credentials for the target-side operations (-Server): the config-partition reads and
+    writes, the principal lookups, and the LDAP ACL bind. Works with every mode; combined with
+    -Server it lets Export read from - or Import/Sync write to - a forest you are not logged on to,
+    with no trust required. Requires -Server (see above).
+
+.PARAMETER SourceServer
+    Sync only (required there). A domain controller, or domain name, in the SOURCE forest to read
+    the template from.
+
+.PARAMETER SourceCredential
+    Sync only. Optional credentials used against -SourceServer. Omit to read as the current
+    identity (works across a trust, or when running inside the source forest itself).
 
 .PARAMETER SkipAcl
     Import only. Skips the permission setup after import. Mutually exclusive with -EnrollPrincipals.
@@ -198,6 +239,23 @@
     }
 
 .EXAMPLE
+    # Direct sync, no file - run in the TARGET forest and pull from the source forest over the trust:
+    .\Sync-KerberosAuthTemplate.ps1 -Mode Sync -SourceServer dc01.source.example `
+        -TemplateName "XX-KerberosAuthentication" `
+        -NewTemplateName "YY-KerberosAuthentication" -NewDisplayName "YY-Kerberos Authentication"
+
+.EXAMPLE
+    # Direct sync from a third machine, explicit credentials on both sides (no trust needed):
+    .\Sync-KerberosAuthTemplate.ps1 -Mode Sync `
+        -SourceServer dc01.a.example -SourceCredential (Get-Credential A\template.reader) `
+        -Server dc01.b.example -Credential (Get-Credential B\ent.admin)
+
+.EXAMPLE
+    # Mixed flow: import a previously exported JSON straight into another forest, no logon there:
+    .\Sync-KerberosAuthTemplate.ps1 -Mode Import -Path .\KerberosAuth.json `
+        -Server dc01.b.example -Credential (Get-Credential B\ent.admin)
+
+.EXAMPLE
     # Prove export -> import preserves every functional attribute (creates and removes a throwaway copy):
     .\Sync-KerberosAuthTemplate.ps1 -Mode Validate -TemplateName "KerberosAuthentication"
 
@@ -207,18 +265,24 @@
     - With -OidHandling Preserve (default) the target forest need not have (or ever have had) AD CS;
       it only needs the Certificate Templates container. -OidHandling Generate needs the target
       forest's PKI OID root (present after AD CS has been deployed there once).
-    - Run Export in the source forest and Import in the target forest (or point -Server at a DC
-      in the relevant forest).
-    - Import does NOT publish the template to any CA; publish/issue it from the CA afterwards.
-    - The security descriptor is intentionally not carried across forests; -Mode Import reapplies
+    - Run Export in the source forest and Import in the target forest (or point -Server, with
+      -Credential as needed, at a DC in the relevant forest). -Mode Sync does both sides in one
+      run and needs network reachability to a DC in EACH forest from where it runs.
+    - Import/Sync do NOT publish the template to any CA; publish/issue it from the CA afterwards.
+    - The security descriptor is intentionally not carried across forests; Import/Sync reapply
       standard permissions instead (unless -SkipAcl).
+    - Authentication Mechanism Assurance (AMA) links are NOT carried over: an msDS-OIDToGroupLink
+      on a source-forest issuance policy OID points at a group DN in THAT forest and cannot be
+      copied. If you use AMA, recreate the link in the target forest manually (policy OID object ->
+      a local universal group with no static members); until then, certificates from the synced
+      template grant no AMA group membership there.
     - Only version 2+ templates can be meaningfully recreated (built-in v1 templates cannot).
 #>
 
 [CmdletBinding(SupportsShouldProcess)]
 param(
     [Parameter(Mandatory)]
-    [ValidateSet("Export", "Import", "Validate")]
+    [ValidateSet("Export", "Import", "Sync", "Validate")]
     [string]$Mode,
 
     [string]$Path,
@@ -239,6 +303,12 @@ param(
     [string]$OidRoot,
 
     [string]$Server,
+
+    [pscredential]$Credential,
+
+    [string]$SourceServer,
+
+    [pscredential]$SourceCredential,
 
     [switch]$SkipAcl,
 
@@ -424,12 +494,12 @@ function Resolve-TemplateOid {
             # in a forest that never had AD CS (this is what certutil -dsAddTemplate did). A display
             # object is still registered (when possible) so Windows can resolve the carried OID.
             if (-not $SourceOid) {
-                throw "OidHandling 'Preserve' needs the source OID in the file, but msPKI-Cert-Template-OID is missing (exported with -StripOid?). Re-export without -StripOid, or use -OidHandling GenerateFromRoot / GenerateRandom / Generate."
+                throw "OidHandling 'Preserve' needs the source template's OID, but msPKI-Cert-Template-OID is missing (a v1 template, or exported with -StripOid?). Re-export without -StripOid, or use -OidHandling GenerateFromRoot / GenerateRandom / Generate."
             }
             if ($SourceOid -notmatch '^(0|[1-9]\d*)(\.(0|[1-9]\d*))+$') {
-                # File-supplied value: validate before it reaches any LDAP filter or gets written as
-                # the template's identity (a tampered '*' would otherwise wildcard-match and be stored).
-                throw "The file's msPKI-Cert-Template-OID ('$SourceOid') is not a valid dotted OID - the export file looks corrupted or tampered with."
+                # Externally-supplied value: validate before it reaches any LDAP filter or gets written
+                # as the template's identity (a tampered '*' would otherwise wildcard-match and be stored).
+                throw "The source msPKI-Cert-Template-OID ('$SourceOid') is not a valid dotted OID - the export file (or source object) looks corrupted or tampered with."
             }
             $disp = Resolve-OidDisplay -TemplateOid $SourceOid -ConfigNC $ConfigNC -ADParams $ADParams
             return @{ Oid = $SourceOid; CompanionCn = $disp.CompanionCn; CompanionContainerDN = $disp.CompanionContainerDN }
@@ -437,15 +507,12 @@ function Resolve-TemplateOid {
     }
 }
 
-function Export-Template {
+function Get-SourceTemplate {
+    # Reads the source template and returns the functional + identity attribute view that both the
+    # file export (-Mode Export) and the direct forest-to-forest copy (-Mode Sync) work from.
     param(
         [string]$TemplateName,
-        [string]$Path,
-        [switch]$StripIdentity,
-        [switch]$StripOid,
-        [switch]$NoImportHint,   # internal (Validate): suppress the "copy to the target forest" hint
-        [hashtable]$ADParams,
-        [System.Management.Automation.PSCmdlet]$CallerCmdlet
+        [hashtable]$ADParams
     )
 
     $configNC = Get-ConfigNC -ADParams $ADParams
@@ -472,6 +539,22 @@ function Export-Template {
     if ($props.'msPKI-Template-Schema-Version' -and [int]$props.'msPKI-Template-Schema-Version' -lt 2) {
         Write-Warning "Schema version 1 template: the object will round-trip, but v1 semantics are fixed in Windows (no editing, no autoenrollment) and v1 consumers match by NAME - import it under its original name, or duplicate it as v2+ in the source forest instead."
     }
+
+    $props
+}
+
+function Export-Template {
+    param(
+        [string]$TemplateName,
+        [string]$Path,
+        [switch]$StripIdentity,
+        [switch]$StripOid,
+        [switch]$NoImportHint,   # internal (Validate): suppress the "copy to the target forest" hint
+        [hashtable]$ADParams,
+        [System.Management.Automation.PSCmdlet]$CallerCmdlet
+    )
+
+    $props = Get-SourceTemplate -TemplateName $TemplateName -ADParams $ADParams
 
     if ($StripOid) {
         $props.PSObject.Properties.Remove('msPKI-Cert-Template-OID')
@@ -506,6 +589,7 @@ function Export-Template {
 function Import-Template {
     param(
         [string]$Path,
+        [psobject]$InputObject,   # in-memory alternative to -Path (used by -Mode Sync)
         [string]$NewTemplateName,
         [string]$NewDisplayName,
         [string]$OidHandling = 'Preserve',
@@ -515,14 +599,20 @@ function Import-Template {
         [System.Management.Automation.PSCmdlet]$CallerCmdlet
     )
 
-    if (-not (Test-Path $Path)) {
-        throw "File '$Path' was not found."
+    if ($InputObject) {
+        # Direct sync: the attribute set was just read from the source forest, no file involved.
+        $import = $InputObject
     }
+    else {
+        if (-not (Test-Path $Path)) {
+            throw "File '$Path' was not found."
+        }
 
-    # Read as UTF-8 explicitly (BOM or BOM-less): Get-Content -Raw on Windows PowerShell 5.1 decodes a
-    # BOM-less UTF-8 file (e.g. written by PS7) as ANSI, silently corrupting non-ASCII names.
-    $fullPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
-    $import = [System.IO.File]::ReadAllText($fullPath, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+        # Read as UTF-8 explicitly (BOM or BOM-less): Get-Content -Raw on Windows PowerShell 5.1 decodes a
+        # BOM-less UTF-8 file (e.g. written by PS7) as ANSI, silently corrupting non-ASCII names.
+        $fullPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
+        $import = [System.IO.File]::ReadAllText($fullPath, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+    }
 
     # Resolve identity: explicit parameters win, else fall back to whatever the file carries.
     $cn = if ($NewTemplateName) { $NewTemplateName } elseif ($import.name) { $import.name } else { $null }
@@ -580,7 +670,7 @@ function Import-Template {
         # identity/handled-elsewhere fields (name, displayName, objectClass, msPKI-Cert-Template-OID) are ignored
     }
     if ($unconsumed.Count) {
-        Write-Warning "The export file carries PKI attribute(s) this script does not know how to copy; they will NOT be written to the new template: $($unconsumed -join ', '). Add them to the attribute type lists if they matter."
+        Write-Warning "The source carries PKI attribute(s) this script does not know how to copy; they will NOT be written to the new template: $($unconsumed -join ', '). Add them to the attribute type lists if they matter."
     }
 
     # Resolve the OID (Preserve / Generate / explicit) BEFORE the ShouldProcess gate, so a missing
@@ -755,7 +845,11 @@ function Resolve-TemplateGrants {
         $rootDomainSID = $targetDomain.DomainSID.Value
     }
     else {
-        $rootDomainSID = (Get-ADDomain -Server $targetForest.RootDomain -ErrorAction Stop).DomainSID.Value
+        # Carry an explicit -Credential into the root-domain lookup too (this call replaces the
+        # splat's -Server with the forest root, so it must re-add the credential itself).
+        $rootParams = @{ Server = $targetForest.RootDomain; ErrorAction = 'Stop' }
+        if ($ADParams.ContainsKey('Credential')) { $rootParams['Credential'] = $ADParams['Credential'] }
+        $rootDomainSID = (Get-ADDomain @rootParams).DomainSID.Value
     }
 
     $validRights = @('read', 'write', 'enroll', 'autoenroll', 'fullcontrol')
@@ -860,7 +954,16 @@ function Set-TemplateAcl {
         # NOT stop a function under the default ErrorActionPreference - without the try/catch a failed
         # bind would cascade through null $sec and still print the green success line.
         try {
-            $entry = New-Object System.DirectoryServices.DirectoryEntry($ldapPath)
+            # An explicit -Credential must also reach this LDAP-389 bind (it does not flow through
+            # the AD-cmdlet splat). The constructor defaults to secure (signed/sealed) binding.
+            if ($ADParams.ContainsKey('Credential')) {
+                $cred = $ADParams['Credential']
+                $entry = New-Object System.DirectoryServices.DirectoryEntry(
+                    $ldapPath, $cred.UserName, $cred.GetNetworkCredential().Password)
+            }
+            else {
+                $entry = New-Object System.DirectoryServices.DirectoryEntry($ldapPath)
+            }
             $sec = $entry.ObjectSecurity   # lazy bind fires here
             if (-not $sec) { throw "Bind returned no security descriptor." }
 
@@ -1100,12 +1203,26 @@ function Invoke-RoundTripValidation {
 # --- Main logic ---
 Import-Module ActiveDirectory -ErrorAction Stop
 
+if ($Mode -ne 'Sync' -and ($SourceServer -or $SourceCredential)) {
+    throw "-SourceServer and -SourceCredential apply only to -Mode Sync. For the file-based flow, -Mode Export reads the source forest via -Server (and -Credential)."
+}
+
 $adParams = @{}
 if ($Server) { $adParams['Server'] = $Server }
+if ($Credential) { $adParams['Credential'] = $Credential }
 
-# Import and Validate write to the config partition and then read back / bind by DN. Pin a concrete
-# DC so those operations hit the same server (avoids read-after-write races on serverless binding).
-if ($Mode -in 'Import', 'Validate' -and -not $adParams.ContainsKey('Server')) {
+# -Credential is meant for "operate on a forest I am not logged on to" - but DC discovery is
+# DC-locator based and always finds the CURRENT forest. Requiring -Server alongside it guarantees
+# the credentials are used against the forest the caller intends (a trust could otherwise let
+# foreign credentials silently authenticate to - and write into - the local forest).
+if ($Credential -and -not $Server) {
+    throw "-Credential requires -Server: name the DC (in the forest those credentials belong to) explicitly, so the operation cannot land on a discovered DC in the current forest instead."
+}
+
+# Import, Sync and Validate write to the config partition and then read back / bind by DN. Pin a
+# concrete DC so those operations hit the same server (avoids read-after-write races on serverless
+# binding).
+if ($Mode -in 'Import', 'Sync', 'Validate' -and -not $adParams.ContainsKey('Server')) {
     # -Writable: plain -Discover can return an RODC in an RODC-only site, and every config-partition
     # write would then fail after the reads succeeded.
     $dc = Get-ADDomainController -Discover -Writable -ErrorAction Stop
@@ -1118,8 +1235,13 @@ switch ($Mode) {
         Export-Template -TemplateName $TemplateName -Path $Path `
             -StripIdentity:$StripIdentity -StripOid:$StripOid -ADParams $adParams -CallerCmdlet $PSCmdlet
     }
-    "Import" {
-        if (-not $Path) { throw "-Path is required for -Mode Import." }
+    { $_ -in 'Import', 'Sync' } {
+        if ($Mode -eq 'Import' -and -not $Path) { throw "-Path is required for -Mode Import." }
+        if ($Mode -eq 'Sync') {
+            if (-not $SourceServer) { throw "-SourceServer is required for -Mode Sync (a DC, or domain name, in the SOURCE forest to read the template from)." }
+            if ($Path) { throw "-Path is not used by -Mode Sync (no intermediate file is involved). Use -Mode Export / -Mode Import for the file-based flow." }
+            if ($StripIdentity -or $StripOid) { throw "-StripIdentity / -StripOid are Export-only. With -Mode Sync use -NewTemplateName / -NewDisplayName and -OidHandling directly." }
+        }
         if ($SkipAcl -and $EnrollPrincipals -and $EnrollPrincipals.Count -gt 0) {
             throw "-SkipAcl and -EnrollPrincipals are mutually exclusive (-SkipAcl skips the very ACL that -EnrollPrincipals defines)."
         }
@@ -1128,9 +1250,26 @@ switch ($Mode) {
         # input aborts with nothing created (and -WhatIf still exercises the resolution).
         $grants = if (-not $SkipAcl) { @(Resolve-TemplateGrants -AclBase $AclBase -EnrollPrincipals $EnrollPrincipals -ADParams $adParams) } else { $null }
 
-        $templateDN = Import-Template -Path $Path -NewTemplateName $NewTemplateName `
-            -NewDisplayName $NewDisplayName -OidHandling $OidHandling -OidRoot $OidRoot `
-            -ADParams $adParams -CallerCmdlet $PSCmdlet
+        $importArgs = @{
+            NewTemplateName = $NewTemplateName
+            NewDisplayName  = $NewDisplayName
+            OidHandling     = $OidHandling
+            OidRoot         = $OidRoot
+            ADParams        = $adParams
+            CallerCmdlet    = $PSCmdlet
+        }
+        if ($Mode -eq 'Sync') {
+            # Direct forest-to-forest: read the template from the source forest and feed it straight
+            # into the same import pipeline the file-based flow uses (no JSON round-trip at all).
+            $sourceParams = @{ Server = $SourceServer }
+            if ($SourceCredential) { $sourceParams['Credential'] = $SourceCredential }
+            $importArgs['InputObject'] = Get-SourceTemplate -TemplateName $TemplateName -ADParams $sourceParams
+        }
+        else {
+            $importArgs['Path'] = $Path
+        }
+
+        $templateDN = Import-Template @importArgs
 
         if (-not $SkipAcl) {
             # Standard/PrincipalsOnly replace the schema-default DACL; Schema/SchemaPlusStandard add to it.
