@@ -12,7 +12,7 @@ jobs:
     name: PSScriptAnalyzer
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install PSScriptAnalyzer
         shell: pwsh
@@ -32,7 +32,7 @@ jobs:
     name: Pester (5.1 + 7)
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # The Guard tier invokes the script, which does Import-Module ActiveDirectory up front.
       # Its validation throws fire BEFORE any domain controller is contacted, so the module is

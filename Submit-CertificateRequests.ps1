@@ -90,7 +90,7 @@ function Resolve-FullPath {
     return [System.IO.Path]::GetFullPath((Join-Path (Get-Location).ProviderPath $Path))
 }
 
-function Write-Log {
+function Write-BatchLog {
     param(
         [Parameter(Mandatory)]
         [string]$Message,
@@ -116,7 +116,7 @@ function Write-Log {
 function Test-CAConnectivity {
     param([string]$CAConfig)
 
-    Write-Log "Testing connectivity to CA: $CAConfig"
+    Write-BatchLog "Testing connectivity to CA: $CAConfig"
     try {
         # Localized EAP: with $ErrorActionPreference = 'Stop', 2>&1 turns native
         # stderr lines into terminating errors in Windows PowerShell 5.1
@@ -126,14 +126,14 @@ function Test-CAConnectivity {
         }
         $exitCode = $LASTEXITCODE
         if ($exitCode -ne 0) {
-            Write-Log "certutil -ping failed (exit $exitCode): $($output -join ' ')" -Level Error
+            Write-BatchLog "certutil -ping failed (exit $exitCode): $($output -join ' ')" -Level Error
             return $false
         }
-        Write-Log "CA connectivity OK."
+        Write-BatchLog "CA connectivity OK."
         return $true
     }
     catch {
-        Write-Log "Could not reach CA: $_" -Level Error
+        Write-BatchLog "Could not reach CA: $_" -Level Error
         return $false
     }
 }
@@ -142,12 +142,12 @@ function Get-RequestFiles {
     param([string]$Path)
 
     if (-not (Test-Path $Path)) {
-        Write-Log "InputPath does not exist: $Path" -Level Error
+        Write-BatchLog "InputPath does not exist: $Path" -Level Error
         return @()
     }
 
     if (-not (Get-Item $Path).PSIsContainer) {
-        Write-Log "InputPath must be a folder, not a file: $Path" -Level Error
+        Write-BatchLog "InputPath must be a folder, not a file: $Path" -Level Error
         return @()
     }
 
@@ -158,16 +158,16 @@ function Get-RequestFiles {
     )
 
     if ($files.Count -eq 0) {
-        Write-Log "No .req/.csr/.txt files found in: $Path" -Level Warning
+        Write-BatchLog "No .req/.csr/.txt files found in: $Path" -Level Warning
         $other = @(Get-ChildItem -Path $Path -File -ErrorAction SilentlyContinue)
         if ($other.Count -gt 0) {
             $sample = ($other | Select-Object -First 5 -ExpandProperty Name) -join ', '
             $suffix = if ($other.Count -gt 5) { ", ..." } else { '' }
-            Write-Log "  Folder contains $($other.Count) other file(s): $sample$suffix" -Level Warning
-            Write-Log "  Rename them to .req/.csr/.txt or move CSRs into this folder." -Level Warning
+            Write-BatchLog "  Folder contains $($other.Count) other file(s): $sample$suffix" -Level Warning
+            Write-BatchLog "  Rename them to .req/.csr/.txt or move CSRs into this folder." -Level Warning
         }
         else {
-            Write-Log "  Folder is empty." -Level Warning
+            Write-BatchLog "  Folder is empty." -Level Warning
         }
     }
 
@@ -245,7 +245,7 @@ function Export-TrackingData {
 
     $filtered = @($Data | Where-Object { $_ -ne $null })
     if ($filtered.Count -eq 0) {
-        Write-Log "No tracking data to export." -Level Warning
+        Write-BatchLog "No tracking data to export." -Level Warning
         return
     }
     $tempFile = "$Path.tmp"
@@ -259,7 +259,7 @@ function Remove-RspFile {
     $rspPath = [System.IO.Path]::ChangeExtension($CerPath, '.rsp')
     if (Test-Path $rspPath) {
         Remove-Item -Path $rspPath -Force -ErrorAction SilentlyContinue
-        Write-Log "  Deleted .rsp file: $rspPath"
+        Write-BatchLog "  Deleted .rsp file: $rspPath"
     }
 }
 
@@ -272,7 +272,7 @@ function Submit-SingleRequest {
         [switch]$KeepRspFile
     )
 
-    Write-Log "Submitting: $($RequestFile.Name)"
+    Write-BatchLog "Submitting: $($RequestFile.Name)"
 
     $stdoutFile = [System.IO.Path]::GetTempFileName()
     $stderrFile = [System.IO.Path]::GetTempFileName()
@@ -298,14 +298,14 @@ function Submit-SingleRequest {
             if (-not $requestId) {
                 $disposition = 'Error'
             }
-            Write-Log "certreq failed for $($RequestFile.Name): $errorMsg" -Level Warning
+            Write-BatchLog "certreq failed for $($RequestFile.Name): $errorMsg" -Level Warning
         }
 
         if ($requestId) {
-            Write-Log "  RequestID: $requestId - Status: $disposition"
+            Write-BatchLog "  RequestID: $requestId - Status: $disposition"
         }
         else {
-            Write-Log "  Could not parse RequestID from output" -Level Warning
+            Write-BatchLog "  Could not parse RequestID from output" -Level Warning
             $disposition = 'Error'
             $errorMsg = "No RequestID in output: $($stdout -join ' ')"
         }
@@ -314,7 +314,7 @@ function Submit-SingleRequest {
             $hints = Get-FriendlyErrorHint -Output ($stdout + $stderr) `
                 -CertificateTemplate $CertificateTemplate -CAConfig $CAConfig
             foreach ($h in $hints) {
-                Write-Log $h -Level Error
+                Write-BatchLog $h -Level Error
             }
         }
 
@@ -344,7 +344,7 @@ function Get-IssuedCertificate {
         [switch]$KeepRspFile
     )
 
-    Write-Log "Retrieving certificate for RequestID: $($Record.RequestID)"
+    Write-BatchLog "Retrieving certificate for RequestID: $($Record.RequestID)"
 
     $stdoutFile = [System.IO.Path]::GetTempFileName()
     $stderrFile = [System.IO.Path]::GetTempFileName()
@@ -367,27 +367,27 @@ function Get-IssuedCertificate {
         switch ($disposition) {
             'Issued' {
                 if (Test-Path $Record.OutputCertFile) {
-                    Write-Log "  Certificate retrieved: $($Record.OutputCertFile)"
+                    Write-BatchLog "  Certificate retrieved: $($Record.OutputCertFile)"
                 }
                 else {
-                    Write-Log "  Status Issued, but .cer file was not created" -Level Warning
+                    Write-BatchLog "  Status Issued, but .cer file was not created" -Level Warning
                 }
             }
             'Pending' {
-                Write-Log "  Still pending" -Level Warning
+                Write-BatchLog "  Still pending" -Level Warning
             }
             'Denied' {
                 $Record.ErrorMessage = ($stderr + $stdout) -join ' '
-                Write-Log "  Request DENIED" -Level Error
+                Write-BatchLog "  Request DENIED" -Level Error
                 $hints = Get-FriendlyErrorHint -Output ($stdout + $stderr) `
                     -CertificateTemplate '(see original submit)' -CAConfig $CAConfig
                 foreach ($h in $hints) {
-                    Write-Log $h -Level Error
+                    Write-BatchLog $h -Level Error
                 }
             }
             default {
                 $Record.ErrorMessage = ($stderr + $stdout) -join ' '
-                Write-Log "  Unknown status: $disposition" -Level Warning
+                Write-BatchLog "  Unknown status: $disposition" -Level Warning
             }
         }
     }
@@ -410,27 +410,27 @@ function Write-Summary {
     $run = @($RunData | Where-Object { $_ -ne $null })
     $all = @($AllData | Where-Object { $_ -ne $null })
 
-    Write-Log "--- Summary: $RunLabel ---"
+    Write-BatchLog "--- Summary: $RunLabel ---"
     if ($run.Count -eq 0) {
-        Write-Log "  (no records processed in this run)"
+        Write-BatchLog "  (no records processed in this run)"
     }
     else {
         $run | Group-Object Status | Sort-Object Name | ForEach-Object {
-            Write-Log "  $($_.Name): $($_.Count)"
+            Write-BatchLog "  $($_.Name): $($_.Count)"
         }
-        Write-Log "  Total processed this run: $($run.Count)"
+        Write-BatchLog "  Total processed this run: $($run.Count)"
     }
 
-    Write-Log "--- Tracking file total (all history) ---"
+    Write-BatchLog "--- Tracking file total (all history) ---"
     if ($all.Count -eq 0) {
-        Write-Log "  (tracking file is empty)"
+        Write-BatchLog "  (tracking file is empty)"
     }
     else {
         $all | Group-Object Status | Sort-Object Name | ForEach-Object {
-            Write-Log "  $($_.Name): $($_.Count)"
+            Write-BatchLog "  $($_.Name): $($_.Count)"
         }
     }
-    Write-Log "Tracking file: $TrackingFile"
+    Write-BatchLog "Tracking file: $TrackingFile"
 }
 
 #endregion
@@ -457,7 +457,7 @@ if ($Mode -in 'Submit', 'Both') {
 if (-not (Test-Path $OutputFolder)) {
     if ($PSCmdlet.ShouldProcess($OutputFolder, 'Create output folder')) {
         New-Item -Path $OutputFolder -ItemType Directory -Force | Out-Null
-        Write-Log "Created output folder: $OutputFolder"
+        Write-BatchLog "Created output folder: $OutputFolder"
     }
 }
 
@@ -471,7 +471,7 @@ if ($Mode -in 'Submit', 'Both') {
     $requestFiles = @(Get-RequestFiles -Path $InputPath)
 
     if ($requestFiles.Count -eq 0) {
-        Write-Log "Nothing to submit. Skipping Submit phase." -Level Warning
+        Write-BatchLog "Nothing to submit. Skipping Submit phase." -Level Warning
     }
     else {
         $existingData = Import-TrackingData -Path $TrackingFile
@@ -489,11 +489,11 @@ if ($Mode -in 'Submit', 'Both') {
                 Select-Object -ExpandProperty Name
         )
 
-        Write-Log "Found $($requestFiles.Count) request file(s) in $InputPath"
+        Write-BatchLog "Found $($requestFiles.Count) request file(s) in $InputPath"
 
         foreach ($file in $requestFiles) {
             if ($file.Length -eq 0) {
-                Write-Log "Skipping (empty file): $($file.Name)" -Level Warning
+                Write-BatchLog "Skipping (empty file): $($file.Name)" -Level Warning
                 continue
             }
 
@@ -508,7 +508,7 @@ if ($Mode -in 'Submit', 'Both') {
                 $prevStatus = $existing.Status
 
                 if ($Force) {
-                    Write-Log "Resubmitting (-Force): $($file.Name) [previous RequestID: $prevId, Status: $prevStatus]" -Level Warning
+                    Write-BatchLog "Resubmitting (-Force): $($file.Name) [previous RequestID: $prevId, Status: $prevStatus]" -Level Warning
                 }
                 else {
                     $yes = New-Object System.Management.Automation.Host.ChoiceDescription '&Yes', 'Resubmit as a new certificate request'
@@ -519,14 +519,14 @@ if ($Mode -in 'Submit', 'Both') {
                         $decision = $Host.UI.PromptForChoice('Already submitted', $message, $choices, 1)
                     }
                     catch {
-                        Write-Log "Host cannot prompt; skipping already-submitted file: $($file.Name). Use -Force to resubmit." -Level Warning
+                        Write-BatchLog "Host cannot prompt; skipping already-submitted file: $($file.Name). Use -Force to resubmit." -Level Warning
                         continue
                     }
                     if ($decision -ne 0) {
-                        Write-Log "Skipping (already submitted): $($file.Name)"
+                        Write-BatchLog "Skipping (already submitted): $($file.Name)"
                         continue
                     }
-                    Write-Log "Resubmitting on user confirmation: $($file.Name) [previous RequestID: $prevId, Status: $prevStatus]" -Level Warning
+                    Write-BatchLog "Resubmitting on user confirmation: $($file.Name) [previous RequestID: $prevId, Status: $prevStatus]" -Level Warning
                 }
             }
 
@@ -542,7 +542,7 @@ if ($Mode -in 'Submit', 'Both') {
                     -KeepRspFile:$KeepRspFile
             }
             catch {
-                Write-Log "Error submitting $($file.Name): $_" -Level Error
+                Write-BatchLog "Error submitting $($file.Name): $_" -Level Error
                 $result = [PSCustomObject]@{
                     RequestFile    = $file.FullName
                     RequestID      = $null
@@ -570,13 +570,13 @@ if ($Mode -in 'Retrieve', 'Both') {
     $tracking = @(Import-TrackingData -Path $TrackingFile)
 
     if ($tracking.Count -eq 0) {
-        Write-Log "No data in tracking file. Run Submit first." -Level Warning
+        Write-BatchLog "No data in tracking file. Run Submit first." -Level Warning
     }
     else {
         # Retry anything with a RequestID that is not finally resolved - including
         # rows stuck in 'Unknown' or 'Error' that the CA may have issued since
         $unresolved = @($tracking | Where-Object { $_.RequestID -and $_.Status -notin 'Issued', 'Denied' })
-        Write-Log "Found $($unresolved.Count) unresolved request(s) with a RequestID"
+        Write-BatchLog "Found $($unresolved.Count) unresolved request(s) with a RequestID"
 
         $runResults = [System.Collections.ArrayList]@()
 
@@ -586,7 +586,7 @@ if ($Mode -in 'Retrieve', 'Both') {
                     Get-IssuedCertificate -Record $record -CAConfig $CAConfig -KeepRspFile:$KeepRspFile
                 }
                 catch {
-                    Write-Log "Error retrieving RequestID $($record.RequestID): $_" -Level Error
+                    Write-BatchLog "Error retrieving RequestID $($record.RequestID): $_" -Level Error
                     $record.ErrorMessage = $_.ToString()
                     $record.LastCheckTime = (Get-Date -Format 'o')
                     $record.Status = 'Error'
@@ -603,10 +603,10 @@ if ($Mode -in 'Retrieve', 'Both') {
 }
 
 if ($script:SuppressLogFile) {
-    Write-Log "Done. (-WhatIf run: log file not written)"
+    Write-BatchLog "Done. (-WhatIf run: log file not written)"
 }
 else {
-    Write-Log "Done. Log file: $script:LogFile"
+    Write-BatchLog "Done. Log file: $script:LogFile"
 }
 
 #endregion
