@@ -350,7 +350,7 @@ function Get-IssuedCertificate {
     $stderrFile = [System.IO.Path]::GetTempFileName()
 
     try {
-        $proc = Start-Process -FilePath 'certreq.exe' -ArgumentList @(
+        $null = Start-Process -FilePath 'certreq.exe' -ArgumentList @(
             '-retrieve', '-f',
             '-config', "`"$CAConfig`"",
             "$($Record.RequestID)",

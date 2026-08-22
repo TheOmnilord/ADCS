@@ -35,6 +35,12 @@
     }
     Invoke-Pester -Container $cfg
 #>
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingConvertToSecureStringWithPlainText', '',
+    Justification = 'a dummy credential built solely to trigger the -Credential-requires-Server guard; never used to authenticate')]
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingEmptyCatchBlock', '',
+    Justification = 'best-effort polling and cleanup paths (retry loop, AfterEach/AfterAll teardown) deliberately swallow per-attempt errors')]
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', '',
+    Justification = 'container parameters are consumed inside Pester Describe/BeforeDiscovery scriptblocks, which the analyzer cannot see through')]
 param(
     [bool]   $RunLab          = $false,
     [string] $ScriptPath      = (Join-Path (Split-Path $PSScriptRoot -Parent) 'Sync-ADCSTemplate.ps1'),

@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
     Sets the validity period (and optionally the renewal overlap period) on one or more ADCS certificate templates.
