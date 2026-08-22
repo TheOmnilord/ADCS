@@ -15,14 +15,14 @@
 
       -Mode Export
           Run in the SOURCE forest. Reads the template's functional attributes (flags, revision,
-          and all msPKI-*/pKI* attributes) via LDAP and writes them to a JSON file. Forest-specific
+          and all msPKI-*/pKI* attributes) via ADWS and writes them to a JSON file. Forest-specific
           data is deliberately NOT exported: the security descriptor, distinguishedName, and
           objectCategory are left out because they are derived/reapplied in the target forest.
           The source template OID and identity fields (name/displayName) can additionally be
           stripped from the file (-StripOid / -StripIdentity).
 
       -Mode Import
-          Run in the TARGET forest. Recreates the template from the JSON file via LDAP:
+          Run in the TARGET forest. Recreates the template from the JSON file via ADWS:
             * handles the template OID per -OidHandling (Preserve carries the source OID; Generate
               mints under the forest's real OID root; GenerateFromRoot mints under a base you supply
               in -OidRoot; GenerateRandom mints under a synthesized base). Every mode also registers an
@@ -66,9 +66,10 @@
           name, exercising exactly what -Mode Sync does (live AD values reach the import casts
           untouched by JSON, so the file check cannot stand in for it). Each throwaway gets a
           unique OID that needs no OID root; every copied attribute of each copy is diffed -
-          byte[] attributes included. By default the throwaway templates and the temp file are
-          removed afterwards (keep them for inspection with -KeepArtifacts). Requires the same
-          write access as Import.
+          byte[] attributes included. Any mismatch makes the run FAIL with a terminating error
+          (non-zero exit code), so Validate can gate automation; cleanup still runs first. By
+          default the throwaway templates and the temp file are removed afterwards (keep them for
+          inspection with -KeepArtifacts). Requires the same write access as Import.
 
     No CA required:
       * Export, Import and Validate operate ONLY on the certificate TEMPLATE objects in AD's
@@ -118,13 +119,15 @@
     -NewTemplateName / -NewDisplayName on import.
 
 .PARAMETER StripOid
-    Export only. Removes the source msPKI-Cert-Template-OID from the JSON file. Only safe with
-    -OidHandling Generate on import; with the default -OidHandling Preserve the import needs that OID
-    and will error if it was stripped.
+    Export only. Removes the source msPKI-Cert-Template-OID from the JSON file. Only safe when the
+    import mints a new OID (-OidHandling Generate, GenerateFromRoot, or GenerateRandom); with the
+    default -OidHandling Preserve the import needs that OID and will error if it was stripped.
 
 .PARAMETER NewTemplateName
-    Import/Sync. New internal name (cn) for the template in the target forest (no spaces). Falls
-    back to the source's name if omitted.
+    Import/Sync. New internal name (cn) for the template in the target forest. Letters (non-ASCII
+    included), digits, non-edge spaces and . _ - ( ) are allowed; characters that carry meaning in a
+    DN (, + = " \ ; < >) and the LDAP wildcard (*) and / # are rejected. Parentheses are permitted
+    and escaped where a name reaches an LDAP filter. Falls back to the source's name if omitted.
 
 .PARAMETER NewDisplayName
     Import/Sync. New display name for the template in the target forest. Falls back to the
@@ -144,8 +147,8 @@
 
 .PARAMETER OidRoot
     Import/Sync. Required with -OidHandling GenerateFromRoot: the base OID to generate the template OID
-    under, e.g. "1.3.6.1.4.1.311.21.8.100000001.100000002.100000003.100000004.100000005". Ignored by
-    the other modes.
+    under, e.g. "1.3.6.1.4.1.311.21.8.100000001.100000002.100000003.100000004.100000005". Supplying
+    it with any other -OidHandling is rejected up front (it would otherwise be silently ignored).
 
 .PARAMETER Server
     Optional domain controller to target for configuration-partition operations - on Sync this is
@@ -171,11 +174,14 @@
     identity (works across a trust, or when running inside the source forest itself).
 
 .PARAMETER SkipAcl
-    Import/Sync. Skips the permission setup after import. Mutually exclusive with -EnrollPrincipals.
+    Import/Sync. Skips the permission setup after import. Mutually exclusive with -EnrollPrincipals
+    and with an explicit -AclBase.
 
 .PARAMETER AclBase
     Import/Sync. The base the template ACL is built from; -EnrollPrincipals (if any) is always added on
-    top. Default: Standard.
+    top. Default: Standard. NOTE: the default is the KERBEROS AUTHENTICATION set (DC-oriented) - when
+    it applies only by default to a template whose name does not look like a Kerberos Authentication
+    copy, the script warns so the DC-oriented grants are a conscious choice, not an accident.
       Standard           the script's standard Kerberos Authentication set (see -Mode Import above),
                          REPLACING AD's schema-default ACL (so admins are not left with Full Control).
       Schema             leave AD's schema-default ACL as created (Domain/Enterprise Admins Full
@@ -188,12 +194,18 @@
 .PARAMETER EnrollPrincipals
     Import/Sync. Hashtable mapping each principal to the rights it should receive; these grants are
     ADDED on top of the -AclBase base (and are the sole content when -AclBase PrincipalsOnly). Keys: a
-    SID (S-1-5-...), a sAMAccountName (optionally DOMAIN\-prefixed - the prefix must name the target
-    domain), or a well-known token (DomainControllers, DomainComputers, DomainUsers, DomainAdmins,
-    EnterpriseAdmins, EnterpriseRODCs, EnterpriseDomainControllers, AuthenticatedUsers, Everyone).
-    Values: one or more of Read, Write, Enroll, Autoenroll, FullControl. Named principals are looked up
-    in the target (-Server) domain; use a SID for a principal in another domain. Validated up front,
-    before anything is created. Example:
+    SID (S-1-5-...), a sAMAccountName or UPN (user@domain), optionally DOMAIN\-prefixed - the prefix
+    must name the target domain, or a well-known token (DomainControllers, DomainComputers,
+    DomainUsers, DomainAdmins, EnterpriseAdmins, EnterpriseRODCs, EnterpriseDomainControllers,
+    AuthenticatedUsers, Everyone). Resolution is fail-closed: a bare string that matches BOTH a
+    well-known token AND a directory object with a DIFFERENT SID is refused (a planted account
+    cannot hijack a token, and a token cannot shadow a distinct real group - disambiguate with a
+    SID or a DOMAIN\ prefix); the built-in groups' own names (e.g. 'Domain Admins') resolve
+    normally, since both readings yield the same SID. A name matching more than one object
+    (duplicate UPNs) is refused rather than guessed. Values: one
+    or more of Read, Write, Enroll, Autoenroll, FullControl. Named principals are looked up in the
+    target (-Server) domain; use a SID for a principal in another domain. Validated up front, before
+    anything is created. Example:
         -AclBase PrincipalsOnly -EnrollPrincipals @{
             'DomainControllers'    = 'Enroll','Autoenroll'
             'AuthenticatedUsers'   = 'Read'
@@ -201,17 +213,20 @@
         }
 
 .PARAMETER KeepArtifacts
-    Validate only. Leaves the throwaway template, its OID object, and the export file in place after
-    the diff (default is to remove them).
+    Validate only. Leaves the throwaway templates and the export file in place after the diff
+    (default is to remove them). No companion OID object is ever created for the throwaways (they use
+    a self-contained explicit OID), so there is none to keep.
 
 .EXAMPLE
     # Source forest - export the built-in Kerberos Authentication template:
     .\Sync-KerberosAuthTemplate.ps1 -Mode Export -Path .\KerberosAuth.json
 
 .EXAMPLE
-    # Source forest - export a custom template as a clean, name-neutral copy:
+    # Source forest - export a custom template as a name-neutral copy (identity stripped; the OID
+    # stays in the file so the default -OidHandling Preserve works on import - add -StripOid only
+    # when the import will mint a new OID with one of the Generate modes):
     .\Sync-KerberosAuthTemplate.ps1 -Mode Export -TemplateName "XX-KerberosAuthentication" `
-        -Path .\XX.json -StripIdentity -StripOid
+        -Path .\XX.json -StripIdentity
 
 .EXAMPLE
     # Target forest with NO AD CS (default) - import under a new name, carrying the source OID:
@@ -269,11 +284,26 @@
 .NOTES
     - Requires the ActiveDirectory PowerShell module (RSAT) for all modes. certutil and the
       AD CS role are no longer used or required, and no CA needs to be reachable.
-    - ALL directory access - including the ACL write - runs over ADWS (TCP 9389) against the
-      named/pinned server; no LDAP (389) connectivity is needed. Give -Server a single DC's name,
-      not a domain name, so the write, read-back, and ACL steps are guaranteed to hit one server.
-    - Parameters a mode does not consume are rejected up front (e.g. -StripOid with -Mode Import)
-      rather than silently ignored.
+    - ALL directory access - including the ACL write - runs over ADWS (TCP 9389); no LDAP (389)
+      connectivity is needed. -Server (and -SourceServer) values are always used VERBATIM - the
+      script never substitutes an endpoint the operator did not type. Name ONE DC: a DOMAIN name
+      (DNS or NetBIOS) locates a different DC per connection, so the create, read-back and ACL
+      steps could hit different replicas - the script detects that case and warns loudly (and a
+      lagging read-back fails the run rather than leaving a template mis-secured).
+    - Parameters a mode does not consume are rejected up front (e.g. -StripOid with -Mode Import,
+      -OidRoot without -OidHandling GenerateFromRoot, -AclBase with -SkipAcl) rather than silently
+      ignored.
+    - PKI attributes the built-in type lists don't know (a genuine schema extension linked to the
+      pKICertificateTemplate class) are typed automatically from the TARGET forest's schema; an
+      attribute is dropped with a warning when the target schema cannot type it, does not permit it
+      on the template class, or types it single-valued while the source value is empty or
+      multi-valued (schema divergence between the forests). (Note: v3/v4 CNG algorithm settings are
+      NOT separate directory attributes - they travel packed inside msPKI-RA-Application-Policies,
+      which is copied as-is.)
+    - v3/v4 templates can embed a private-key SDDL (msPKI-Key-Security-Descriptor) packed inside
+      msPKI-RA-Application-Policies; it is copied verbatim and any domain SIDs in it are
+      SOURCE-forest SIDs - the script warns so the key ACL can be reviewed in the target forest.
+    - -Mode Validate exits non-zero when any attribute differs, so it can gate CI/automation.
     - With -OidHandling Preserve (default) the target forest need not have (or ever have had) AD CS;
       it only needs the Certificate Templates container. -OidHandling Generate needs the target
       forest's PKI OID root (present after AD CS has been deployed there once).
@@ -350,10 +380,34 @@ $script:MultiValueAttributes = @(
 )
 $script:ByteAttributes = @('pKIExpirationPeriod', 'pKIKeyUsage', 'pKIOverlapPeriod')
 
+# Per-run caches: schema-derived types for attributes the static lists don't know, and the target
+# forest-root domain SID (resolved lazily, only when a grant actually needs it).
+$script:SchemaTypeCache     = @{}
+$script:TemplateAllowedCache = $null
+$script:RootDomainSidCache  = $null
+
 function Get-RandomHex {
     param([int]$Length)
     $hex = '0123456789ABCDEF'
     -join (1..$Length | ForEach-Object { $hex[(Get-Random -Minimum 0 -Maximum 16)] })
+}
+
+function ConvertTo-LdapFilterValue {
+    # RFC 4515 escaping so a value cannot break an LDAP filter or inject a wildcard. Defined before
+    # every function that calls it.
+    param([string]$Value)
+    $sb = New-Object System.Text.StringBuilder
+    foreach ($ch in $Value.ToCharArray()) {
+        switch ($ch) {
+            '\'  { [void]$sb.Append('\5c') }
+            '*'  { [void]$sb.Append('\2a') }
+            '('  { [void]$sb.Append('\28') }
+            ')'  { [void]$sb.Append('\29') }
+            "`0" { [void]$sb.Append('\00') }
+            default { [void]$sb.Append($ch) }
+        }
+    }
+    $sb.ToString()
 }
 
 function Get-ConfigNC {
@@ -395,16 +449,19 @@ function Get-ADObjectIfPresent {
 }
 
 function Test-UniqueTemplateOid {
+    # -ErrorAction Stop: "unique" may only mean "a successful search found nothing". A swallowed
+    # query failure here would return $true unverified and let a colliding OID through.
     param([string]$OidObjectCn, [string]$TemplateOid, [string]$OidContainerDN, [hashtable]$ADParams)
     $match = Get-ADObject @ADParams -SearchBase $OidContainerDN `
-        -LDAPFilter "(|(cn=$OidObjectCn)(msPKI-Cert-Template-OID=$TemplateOid))" -ErrorAction SilentlyContinue
+        -LDAPFilter "(|(cn=$OidObjectCn)(msPKI-Cert-Template-OID=$TemplateOid))" -ErrorAction Stop
     -not $match
 }
 
 function New-SyntheticOidBase {
     # A well-formed but forest-independent enterprise OID base: the Microsoft V2+ certificate-template
-    # root (szOID_ENTERPRISE_OID_ROOT) plus 5 pseudo-forest arcs (mirrors the arc count AD CS derives
-    # from the forest GUID). ~5x8 digits of entropy makes a collision with a real forest negligible.
+    # root (szOID_ENTERPRISE_OID_ROOT) plus 5 pseudo-random arcs of 7-8 digits each. (Real AD CS bases
+    # derive 6 GUID-based arcs of varying width, so this shape is recognizably synthetic; the ~35+
+    # digits of entropy make a collision with a real forest base negligible.)
     "1.3.6.1.4.1.311.21.8." + ((1..5 | ForEach-Object { Get-Random -Minimum 1000000 -Maximum 99999999 }) -join '.')
 }
 
@@ -458,12 +515,14 @@ function Resolve-OidDisplay {
     if (-not (Get-ADObjectIfPresent -Identity $oidContainerDN -ADParams $ADParams)) {
         return @{ CompanionCn = $null; CompanionContainerDN = $null }
     }
-    if (Get-ADObject @ADParams -SearchBase $oidContainerDN -LDAPFilter "(msPKI-Cert-Template-OID=$TemplateOid)" -ErrorAction SilentlyContinue) {
+    # -ErrorAction Stop on both probes: a swallowed query failure would be indistinguishable from
+    # "no display object yet" and produce a DUPLICATE companion (or an unverified cn).
+    if (Get-ADObject @ADParams -SearchBase $oidContainerDN -LDAPFilter "(msPKI-Cert-Template-OID=$TemplateOid)" -ErrorAction Stop) {
         return @{ CompanionCn = $null; CompanionContainerDN = $null }
     }
     do {
         $cn = "$(Get-Random -Minimum 10000000 -Maximum 99999999).$(Get-RandomHex -Length 32)"
-    } until (-not (Get-ADObject @ADParams -SearchBase $oidContainerDN -LDAPFilter "(cn=$cn)" -ErrorAction SilentlyContinue))
+    } until (-not (Get-ADObject @ADParams -SearchBase $oidContainerDN -LDAPFilter "(cn=$cn)" -ErrorAction Stop))
     return @{ CompanionCn = $cn; CompanionContainerDN = $oidContainerDN }
 }
 
@@ -482,6 +541,11 @@ function Resolve-TemplateOid {
     )
 
     if ($ExplicitOid) {
+        # Internal (Validate) path today, but validate all the same: this value reaches an LDAP
+        # filter and becomes the new template's stored identity.
+        if ($ExplicitOid -notmatch '^(0|[1-9]\d*)(\.(0|[1-9]\d*))+$') {
+            throw "The explicit OID '$ExplicitOid' is not a valid dotted OID."
+        }
         return @{ Oid = $ExplicitOid; CompanionCn = $null; CompanionContainerDN = $null }
     }
 
@@ -501,7 +565,10 @@ function Resolve-TemplateOid {
             if ($OidRoot -notmatch '^(0|[1-9]\d*)(\.(0|[1-9]\d*))+$') {
                 throw "-OidRoot '$OidRoot' is not a valid dotted OID (digits and dots only, no leading zeros in an arc)."
             }
-            if ($OidRoot -notlike '1.3.6.1.4.1.311.21.8.*') {
+            if ($OidRoot -eq '1.3.6.1.4.1.311.21.8') {
+                Write-Warning "-OidRoot is the bare shared Microsoft template arc: template OIDs will be minted directly under it with only two random arcs, which risks prefix-colliding with real forests' GUID-derived bases. Prefer a deeper base of your own beneath this arc."
+            }
+            elseif ($OidRoot -notlike '1.3.6.1.4.1.311.21.8.*') {
                 Write-Warning "-OidRoot '$OidRoot' is outside the conventional Microsoft template arc '1.3.6.1.4.1.311.21.8'; Windows matches template OIDs by exact value, so this generally works, but stays off the standard namespace."
             }
             $oid = New-TemplateOid -ConfigNC $ConfigNC -ADParams $ADParams -BaseOid $OidRoot
@@ -559,9 +626,11 @@ function Get-SourceTemplate {
     }
     $template = $template[0]
 
-    # Select functional + identity attributes only. The DN, objectCategory and security descriptor
-    # are intentionally excluded (they are forest-specific and reapplied/derived on import).
-    $props = $template | Select-Object -Property name, displayName, objectClass, flags, revision, *pki*
+    # Select functional + identity attributes only. The DN, objectCategory and security descriptors
+    # are intentionally excluded (they are forest-specific and reapplied/derived on import) -
+    # pKIEnrollmentAccess is an ACL-bearing attribute the *pki* wildcard would otherwise catch.
+    $props = $template | Select-Object -Property name, displayName, objectClass, flags, revision, *pki* `
+        -ExcludeProperty pKIEnrollmentAccess
 
     if ($props.'msPKI-Template-Schema-Version' -and [int]$props.'msPKI-Template-Schema-Version' -lt 2) {
         Write-Warning "Schema version 1 template: the object will round-trip, but v1 semantics are fixed in Windows (no editing, no autoenrollment) and v1 consumers match by NAME - import it under its original name, or duplicate it as v2+ in the source forest instead."
@@ -573,6 +642,8 @@ function Get-SourceTemplate {
 function Export-Template {
     param(
         [string]$TemplateName,
+        [psobject]$InputObject,  # internal (Validate): a pre-read source view; skips the directory read.
+                                 # Callers passing it must not also use Strip* (which would mutate it).
         [string]$Path,
         [switch]$StripIdentity,
         [switch]$StripOid,
@@ -581,7 +652,7 @@ function Export-Template {
         [System.Management.Automation.PSCmdlet]$CallerCmdlet
     )
 
-    $props = Get-SourceTemplate -TemplateName $TemplateName -ADParams $ADParams
+    $props = if ($InputObject) { $InputObject } else { Get-SourceTemplate -TemplateName $TemplateName -ADParams $ADParams }
 
     if ($StripOid) {
         $props.PSObject.Properties.Remove('msPKI-Cert-Template-OID')
@@ -590,11 +661,20 @@ function Export-Template {
         'name', 'displayName' | ForEach-Object { $props.PSObject.Properties.Remove($_) }
     }
 
-    if (-not $CallerCmdlet.ShouldProcess($Path, "Write template export file")) {
+    # An existing file at -Path is replaced: say so in the ShouldProcess action and warn, so a reused
+    # path cannot silently destroy an earlier export (possibly the only copy in an air-gapped flow).
+    $fileExists = Test-Path -LiteralPath $Path
+    $action = if ($fileExists) { "OVERWRITE the existing template export file" } else { "Write template export file" }
+    if (-not $CallerCmdlet.ShouldProcess($Path, $action)) {
         # -WhatIf, or the write was declined at the -Confirm prompt: no file is written, say so
-        # honestly instead of printing a success message for a file that does not exist.
+        # honestly instead of printing a success message for a file that does not exist. Return
+        # $false so a caller (Validate) can tell "not written" from "written" without inspecting the
+        # filesystem (a declined OVERWRITE leaves the STALE file in place - Test-Path would lie).
         Write-Host "Export file was NOT written (-WhatIf or declined): $Path" -ForegroundColor Yellow
-        return
+        return $false
+    }
+    if ($fileExists) {
+        Write-Warning "Overwriting existing file: $Path"
     }
 
     # Write via .NET with a UTF-8 BOM: PS7's Out-File -Encoding utf8 is BOM-less, which Windows
@@ -611,6 +691,7 @@ function Export-Template {
     if (-not $NoImportHint) {
         Write-Host "Copy this file to the target forest and run the script there with -Mode Import." -ForegroundColor Yellow
     }
+    return $true
 }
 
 function Read-TemplateExport {
@@ -619,14 +700,82 @@ function Read-TemplateExport {
     # direct read from the source forest).
     param([Parameter(Mandatory)][string]$Path)
 
-    if (-not (Test-Path $Path)) {
-        throw "File '$Path' was not found."
+    # -LiteralPath: a filename containing [ ] must not be wildcard-expanded; -PathType Leaf: a
+    # directory must fail here with a clear message, not inside ReadAllText with a raw exception.
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "File '$Path' was not found (or is not a file)."
     }
 
     # Read as UTF-8 explicitly (BOM or BOM-less): Get-Content -Raw on Windows PowerShell 5.1 decodes a
     # BOM-less UTF-8 file (e.g. written by PS7) as ANSI, silently corrupting non-ASCII names.
     $fullPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
     [System.IO.File]::ReadAllText($fullPath, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+}
+
+function Get-TemplateAllowedAttributes {
+    # The effective set of attributes a pKICertificateTemplate may hold in the TARGET forest,
+    # lowercased and cached for the run. Read as the constructed 'allowedAttributes' of an existing
+    # template instance - authoritative because AD computes it from the whole class hierarchy AND any
+    # auxiliary classes, so a vendor schema extension attached via an auxiliary class is included
+    # (reading only the class's own mayContain would wrongly drop those). Falls back to the
+    # classSchema's mayContain/systemMayContain if the container holds no template to sample.
+    # Gates schema typing: an attribute not in this set is dropped with a warning rather than admitted
+    # into the create (which would otherwise fail server-side with a raw objectClassViolation).
+    param([string]$ConfigNC, [hashtable]$ADParams)
+
+    if ($null -ne $script:TemplateAllowedCache) { return $script:TemplateAllowedCache }
+
+    $set = @{}
+    $templatesDN = "CN=Certificate Templates,CN=Public Key Services,CN=Services,$ConfigNC"
+    $sample = Get-ADObject @ADParams -SearchBase $templatesDN -LDAPFilter '(objectClass=pKICertificateTemplate)' `
+        -ResultSetSize 1 -Properties allowedAttributes -ErrorAction Stop
+    if ($sample -and $sample.allowedAttributes) {
+        foreach ($a in @($sample.allowedAttributes)) { if ($a) { $set[$a.ToLowerInvariant()] = $true } }
+    }
+    else {
+        $schemaNC = "CN=Schema,$ConfigNC"
+        $cls = Get-ADObject @ADParams -SearchBase $schemaNC -ErrorAction Stop `
+            -LDAPFilter "(&(objectClass=classSchema)(lDAPDisplayName=pKICertificateTemplate))" `
+            -Properties mayContain, systemMayContain
+        foreach ($a in @(@($cls.mayContain) + @($cls.systemMayContain))) {
+            if ($a) { $set[$a.ToLowerInvariant()] = $true }
+        }
+    }
+    $script:TemplateAllowedCache = $set
+    $set
+}
+
+function Get-SchemaAttributeType {
+    # Types an attribute the static lists don't know by asking the TARGET forest's schema
+    # (attributeSyntax + isSingleValued), so newer or vendor msPKI-* attributes copy correctly
+    # without a script edit. Returns 'Int', 'String', 'MultiString', 'Bytes', or $null (attribute
+    # unknown in the target schema, not permitted on the template class, or a syntax this script
+    # cannot round-trip). Cached per attribute name for the run.
+    param([string]$AttributeName, [string]$ConfigNC, [hashtable]$ADParams)
+
+    if ($script:SchemaTypeCache.ContainsKey($AttributeName)) { return $script:SchemaTypeCache[$AttributeName] }
+
+    $type = $null
+    # Only type attributes the template class actually permits: an attributeSchema can exist while
+    # the class link was never applied, and admitting it would make New-ADObject fail with a raw
+    # objectClassViolation instead of a clean warn-and-drop.
+    if ((Get-TemplateAllowedAttributes -ConfigNC $ConfigNC -ADParams $ADParams).ContainsKey($AttributeName.ToLowerInvariant())) {
+        $schemaNC = "CN=Schema,$ConfigNC"
+        $attr = Get-ADObject @ADParams -SearchBase $schemaNC -ErrorAction Stop `
+            -LDAPFilter "(&(objectClass=attributeSchema)(lDAPDisplayName=$(ConvertTo-LdapFilterValue $AttributeName)))" `
+            -Properties attributeSyntax, isSingleValued
+        if ($attr) {
+            $single = [bool]$attr.isSingleValued
+            $type = switch ($attr.attributeSyntax) {
+                '2.5.5.9'  { if ($single) { 'Int' } else { $null } }             # integer / enumeration
+                '2.5.5.12' { if ($single) { 'String' } else { 'MultiString' } }  # unicode string
+                '2.5.5.10' { if ($single) { 'Bytes' } else { $null } }           # octet string (multi-valued octet does not round-trip JSON unambiguously)
+                default    { $null }                                             # incl. 2.5.5.15 NT-Sec-Desc: never copied
+            }
+        }
+    }
+    $script:SchemaTypeCache[$AttributeName] = $type
+    $type
 }
 
 function Import-Template {
@@ -655,11 +804,13 @@ function Import-Template {
     if (-not $displayName) {
         throw "No display name available. The source carries no 'displayName' (a template created without one, or stripped on export?) - supply -NewDisplayName."
     }
-    # Strict allowlist: the cn is interpolated into DNs, LDAP filters, and an ADSI ADsPath, where
-    # characters like , + = " \ ; < > # / ( ) * or whitespace change meaning (DN injection, wildcard
-    # matching, ADsPath separators). Real template cns are alphanumeric with . _ - so enforce that.
-    if ($cn -notmatch '^[A-Za-z0-9._-]+$') {
-        throw "The internal template name (cn) may only contain letters, digits, '.', '_' and '-': '$cn'. Put spaces and special characters in -NewDisplayName instead."
+    # Allowlist: the cn lands in DN strings and LDAP filters, so DN/filter metacharacters
+    # (, + = " \ ; < > # * /) stay banned - but legal real-world names are allowed: letters
+    # (non-ASCII included), digits, spaces (not leading/trailing) and . _ - ( ). Filter values are
+    # escaped at every use site, the RDN is escaped by New-ADObject itself, and the authoritative
+    # DN comes from -PassThru.
+    if ($cn -notmatch '^[\p{L}\p{Nd}._()\- ]+$' -or $cn -match '^\s|\s$') {
+        throw "The internal template name (cn) may only contain letters, digits, spaces and . _ - ( ), with no leading or trailing space: '$cn'. Put other special characters in -NewDisplayName instead."
     }
 
     $configNC = if ($ConfigNC) { $ConfigNC } else { Get-ConfigNC -ADParams $ADParams }
@@ -673,9 +824,9 @@ function Import-Template {
         throw "The Certificate Templates container was not found at '$templatesDN'. This forest is missing the Public Key Services structure; this script does not provision it."
     }
 
-    # Pre-flight: refuse to clobber an existing template of the same cn. (The allowlist above already
-    # bars LDAP metacharacters; escaping is defense in depth.)
-    $existing = Get-ADObject @ADParams -SearchBase $templatesDN -LDAPFilter "(cn=$(ConvertTo-LdapFilterValue $cn))" -ErrorAction SilentlyContinue
+    # Pre-flight: refuse to clobber an existing template of the same cn. -ErrorAction Stop: the
+    # guard may only pass on a SUCCESSFUL empty search - a swallowed query failure would skip it.
+    $existing = Get-ADObject @ADParams -SearchBase $templatesDN -LDAPFilter "(cn=$(ConvertTo-LdapFilterValue $cn))" -ErrorAction Stop
     if ($existing) {
         throw "A template with cn '$cn' already exists ($newTemplateDN). Choose a different -NewTemplateName or remove the existing template first."
     }
@@ -685,6 +836,17 @@ function Import-Template {
     $unconsumed = @()
     foreach ($prop in ($import | Get-Member -MemberType NoteProperty)) {
         $name = $prop.Name
+        # Identity/handled-elsewhere fields are skipped; a $null value means "attribute not set on
+        # the source" and is skipped too - coercing it would fabricate a value ([int]$null -> 0)
+        # or hand New-ADObject a $null it rejects mid-create.
+        if ($name -in 'name', 'displayName', 'objectClass', 'msPKI-Cert-Template-OID') { continue }
+        if ($null -eq $import.$name) { continue }
+        if ($name -eq 'pKIEnrollmentAccess') {
+            # An ACL-bearing attribute (present only in exports made before it was excluded):
+            # security descriptors are deliberately never copied - the ACL is rebuilt on import.
+            Write-Verbose "Skipping pKIEnrollmentAccess (ACLs are rebuilt on import, never copied)."
+            continue
+        }
         if ($name -in $script:IntAttributes) {
             $oa[$name] = [System.Int32]$import.$name
         }
@@ -694,14 +856,45 @@ function Import-Template {
         elseif ($name -in $script:ByteAttributes) {
             $oa[$name] = [System.Byte[]]$import.$name
         }
-        elseif ($name -match '^(msPKI-|pKI)' -and $name -ne 'msPKI-Cert-Template-OID' -and $null -ne $import.$name) {
-            # A PKI attribute the type lists don't know. Never drop data silently - surface it.
-            $unconsumed += $name
+        elseif ($name -match '^(msPKI-|pKI)') {
+            # A PKI attribute the static lists don't know (a schema extension linked to the template
+            # class): type it from the TARGET forest's schema instead of dropping it. Returns $null
+            # when the attribute is not permitted on the template class or has a type this script
+            # cannot round-trip - then it is dropped (surfaced below), never silently.
+            # The Int/String branches are SINGLE-valued in the target schema: exactly one element is
+            # required - a multi-element value would be corrupted (space-joined) or crash the cast,
+            # and an EMPTY array would fabricate a value ([int]$null -> 0), so both shapes drop to
+            # $unconsumed. @(...)[0] also unwraps a one-element array, which [System.Int32] alone
+            # would not. The try/catch turns any remaining cast failure (schema-divergent shapes,
+            # e.g. a string where the target expects octets) into the same drop-with-warning instead
+            # of a raw terminating cast error.
+            $schemaType = Get-SchemaAttributeType -AttributeName $name -ConfigNC $configNC -ADParams $ADParams
+            $oneValue = @($import.$name).Count -eq 1
+            try {
+                switch ($schemaType) {
+                    'Int'         { if ($oneValue) { $oa[$name] = [System.Int32]@($import.$name)[0] } else { $unconsumed += $name } }
+                    'String'      { if ($oneValue) { $oa[$name] = [string]@($import.$name)[0] } else { $unconsumed += $name } }
+                    'MultiString' { $oa[$name] = [Microsoft.ActiveDirectory.Management.ADPropertyValueCollection]$import.$name }
+                    'Bytes'       { $oa[$name] = [System.Byte[]]$import.$name }
+                    default       { $unconsumed += $name }
+                }
+            }
+            catch {
+                $oa.Remove($name)
+                $unconsumed += $name
+            }
         }
-        # identity/handled-elsewhere fields (name, displayName, objectClass, msPKI-Cert-Template-OID) are ignored
     }
     if ($unconsumed.Count) {
-        Write-Warning "The source carries PKI attribute(s) this script does not know how to copy; they will NOT be written to the new template: $($unconsumed -join ', '). Add them to the attribute type lists if they matter."
+        Write-Warning "The source carries PKI attribute(s) the target forest's schema does not permit on the template class (or whose type/shape this script cannot copy there); they will NOT be written to the new template: $($unconsumed -join ', ')."
+    }
+
+    # v3/v4 templates can pack a private-key security descriptor (msPKI-Key-Security-Descriptor,
+    # an SDDL string) inside msPKI-RA-Application-Policies. It copies verbatim, but any domain SIDs
+    # inside it are SOURCE-forest SIDs that will not resolve in this forest - surface that.
+    if ($oa.ContainsKey('msPKI-RA-Application-Policies') -and
+        (@($oa['msPKI-RA-Application-Policies']) -match 'msPKI-Key-Security-Descriptor')) {
+        Write-Warning "msPKI-RA-Application-Policies embeds an msPKI-Key-Security-Descriptor (private-key SDDL). Domain SIDs inside it are from the SOURCE forest and will not resolve here - review and adjust the key security descriptor on the copied template if it carries custom key permissions."
     }
 
     # Resolve the OID (Preserve / Generate / explicit) BEFORE the ShouldProcess gate, so a missing
@@ -716,7 +909,7 @@ function Import-Template {
     # ambiguous. Mainly bites Preserve (re-importing the same file under a new name); the Generate*
     # modes make a collision here statistically negligible but are checked all the same.
     $oidClash = Get-ADObject @ADParams -SearchBase $templatesDN `
-        -LDAPFilter "(msPKI-Cert-Template-OID=$($oidPlan.Oid))" -ErrorAction SilentlyContinue
+        -LDAPFilter "(msPKI-Cert-Template-OID=$($oidPlan.Oid))" -ErrorAction Stop
     if ($oidClash) {
         throw "A template already carries OID $($oidPlan.Oid): $($oidClash.DistinguishedName). Importing another template with the same OID would make OID-based template lookups (Windows, EJBCA) ambiguous. Use -OidHandling Generate, GenerateFromRoot, or GenerateRandom to mint a different OID."
     }
@@ -726,7 +919,10 @@ function Import-Template {
         $actionText += " and companion OID display object CN=$($oidPlan.CompanionCn),$($oidPlan.CompanionContainerDN)"
     }
     if (-not $CallerCmdlet.ShouldProcess($newTemplateDN, $actionText)) {
-        return $newTemplateDN   # -WhatIf / declined: nothing created; DN returned for messaging only
+        if ($WhatIfPreference) {
+            return $newTemplateDN   # -WhatIf: DN returned so the ACL preview can name its target
+        }
+        return $null                # declined at the -Confirm prompt: nothing was created
     }
 
     # A companion msPKI-Enterprise-Oid "display" object is created whenever the resolved OID is not
@@ -739,8 +935,11 @@ function Import-Template {
             'flags'                   = [System.Int32]1
             'msPKI-Cert-Template-OID' = $oidPlan.Oid
         }
+        # -ErrorAction Stop: without it a failure here (e.g. write access to CN=Certificate Templates
+        # but not CN=OID) is only statement-terminating - the import would carry on, create the
+        # template anyway, and report green success for an action that half-happened.
         New-ADObject @ADParams -Path $oidPlan.CompanionContainerDN -Name $oidPlan.CompanionCn `
-            -Type 'msPKI-Enterprise-Oid' -OtherAttributes $oidObjectAttrs -Confirm:$false
+            -Type 'msPKI-Enterprise-Oid' -OtherAttributes $oidObjectAttrs -Confirm:$false -ErrorAction Stop
         $companionDN = "CN=$($oidPlan.CompanionCn),$($oidPlan.CompanionContainerDN)"
     }
 
@@ -774,32 +973,101 @@ function Import-Template {
     return $newTemplateDN
 }
 
-function ConvertTo-LdapFilterValue {
-    # RFC 4515 escaping so a principal name cannot break the filter or inject a wildcard.
-    param([string]$Value)
-    $sb = New-Object System.Text.StringBuilder
-    foreach ($ch in $Value.ToCharArray()) {
-        switch ($ch) {
-            '\'  { [void]$sb.Append('\5c') }
-            '*'  { [void]$sb.Append('\2a') }
-            '('  { [void]$sb.Append('\28') }
-            ')'  { [void]$sb.Append('\29') }
-            "`0" { [void]$sb.Append('\00') }
-            default { [void]$sb.Append($ch) }
+function Get-RootDomainSid {
+    # Resolves the forest-root domain SID (for the RID-498/519 grants) - called ONLY when a grant
+    # actually needs it, and cached for the run. When the named -Server DC is in a child domain,
+    # the root domain lives somewhere the caller never named: prefer reading the root domain head's
+    # objectSid from the named DC's own Global Catalog (port 3268), which keeps the explicitly-
+    # named-servers contract intact (no DNS/firewall dependency on an unnamed root-domain DC). Only
+    # if the named DC is not a GC fall back to locating a root-domain DC by domain name.
+    param($TargetDomain, $TargetForest, [hashtable]$ADParams)
+
+    if ($script:RootDomainSidCache) { return $script:RootDomainSidCache }
+
+    if ($TargetDomain.DNSRoot -eq $TargetForest.RootDomain) {
+        $script:RootDomainSidCache = $TargetDomain.DomainSID.Value
+        return $script:RootDomainSidCache
+    }
+
+    $rootDomainSID = $null
+    $rootNC = 'DC=' + (($TargetForest.RootDomain -split '\.') -join ',DC=')
+    if ($ADParams.ContainsKey('Server')) {
+        # Build the Global Catalog endpoint (port 3268) from -Server, replacing any explicit port.
+        # Bracket a bare IPv6 literal so the port is unambiguous and the trailing hextet is not
+        # mistaken for a port (a plain ':\d+$' strip would turn '2001:db8::1' into '2001:db8:').
+        $srv = $ADParams['Server']
+        $gcServer = if ($srv -match '^\[(.+)\](:\d+)?$') { "[$($Matches[1])]:3268" }        # [ipv6] or [ipv6]:port
+                    elseif (($srv -split ':').Count -gt 2)   { "[$srv]:3268" }               # bare IPv6 literal
+                    else                                     { ($srv -replace ':\d+$', '') + ':3268' }  # host / ipv4 (:port)
+        $gcParams = @{} + $ADParams
+        $gcParams['Server'] = $gcServer
+        try {
+            $rootSid = (Get-ADObject @gcParams -Identity $rootNC -Properties objectSid -ErrorAction Stop).objectSid
+            if ($rootSid -is [byte[]]) { $rootSid = New-Object System.Security.Principal.SecurityIdentifier($rootSid, 0) }
+            if ($rootSid) { $rootDomainSID = $rootSid.Value }
+        }
+        catch {
+            Write-Verbose "Global Catalog read of '$rootNC' via $($gcParams['Server']) failed ($($_.Exception.Message)); falling back to a root-domain DC lookup."
         }
     }
-    $sb.ToString()
+    if (-not $rootDomainSID) {
+        $rootParams = @{ Server = $TargetForest.RootDomain; ErrorAction = 'Stop' }
+        if ($ADParams.ContainsKey('Credential')) { $rootParams['Credential'] = $ADParams['Credential'] }
+        try {
+            $rootDomainSID = (Get-ADDomain @rootParams).DomainSID.Value
+        }
+        catch {
+            throw "Could not determine the forest-root domain SID: the named DC's Global Catalog (port 3268) was not readable and no DC of root domain '$($TargetForest.RootDomain)' could be reached by name. Point -Server at a DC in the forest root domain, or allow GC (3268) access to the named DC. Underlying error: $($_.Exception.Message)"
+        }
+    }
+
+    $script:RootDomainSidCache = $rootDomainSID
+    $rootDomainSID
+}
+
+function Get-WellKnownTokenSid {
+    # SID for a normalized well-known token name; $null when the name is not a token. The
+    # enterprise tokens resolve the forest-root domain SID on first use (cached).
+    param([string]$Norm, $TargetDomain, $TargetForest, [hashtable]$ADParams)
+
+    $domSid = $TargetDomain.DomainSID.Value
+    switch ($Norm) {
+        'authenticatedusers'          { return New-Object System.Security.Principal.SecurityIdentifier('S-1-5-11') }
+        'everyone'                    { return New-Object System.Security.Principal.SecurityIdentifier('S-1-1-0') }
+        'enterprisedomaincontrollers' { return New-Object System.Security.Principal.SecurityIdentifier('S-1-5-9') }
+        'domaincontrollers'           { return New-Object System.Security.Principal.SecurityIdentifier("$domSid-516") }
+        'domaincomputers'             { return New-Object System.Security.Principal.SecurityIdentifier("$domSid-515") }
+        'domainusers'                 { return New-Object System.Security.Principal.SecurityIdentifier("$domSid-513") }
+        'domainadmins'                { return New-Object System.Security.Principal.SecurityIdentifier("$domSid-512") }
+        'enterpriseadmins' {
+            $rootSid = Get-RootDomainSid -TargetDomain $TargetDomain -TargetForest $TargetForest -ADParams $ADParams
+            return New-Object System.Security.Principal.SecurityIdentifier("$rootSid-519")
+        }
+        { $_ -in 'enterprisereadonlydomaincontrollers', 'enterpriserodcs' } {
+            $rootSid = Get-RootDomainSid -TargetDomain $TargetDomain -TargetForest $TargetForest -ADParams $ADParams
+            return New-Object System.Security.Principal.SecurityIdentifier("$rootSid-498")
+        }
+    }
+    return $null
 }
 
 function Resolve-PrincipalSid {
-    # Resolves a principal (for -EnrollPrincipals) to a SID. Accepts a raw SID string, a language-
-    # invariant well-known token, or a name (sAMAccountName / UPN / cn, optionally DOMAIN\-prefixed).
-    # Named principals are looked up in the target (-Server) domain; use a SID for a principal that
-    # lives in a different domain of a multi-domain forest.
+    # Resolves a principal (for -EnrollPrincipals) to a SID. Accepts a raw SID string, a name
+    # (sAMAccountName / UPN, optionally DOMAIN\-prefixed), or a language-invariant well-known token.
+    # Collisions are resolved fail-closed, never guessed:
+    #   * a bare string that matches a well-known token (DomainAdmins, EnterpriseRODCs, ...) AND also
+    #     matches a directory object is accepted only when both resolve to the SAME SID (e.g.
+    #     'Domain Admins' on an English forest, where the built-in group's own sAMAccountName equals
+    #     the token); a DIFFERENT SID means a planted or shadowing object and is refused -
+    #     disambiguate with a SID or DOMAIN\ prefix;
+    #   * a name (sAMAccountName/UPN) that matches more than one object is refused (AD does not enforce
+    #     UPN uniqueness) - pick with a SID.
+    # A DOMAIN\-prefixed input is an explicit directory reference: it never token-matches (the
+    # backslash survives normalization) and is looked up only in the target (-Server) domain.
     param(
         [string]$Identity,
         $TargetDomain,          # Get-ADDomain result (has .DomainSID)
-        [string]$RootDomainSID, # SID string of the forest root domain
+        $TargetForest,          # Get-ADForest result (for the lazily-resolved root-domain SID)
         [hashtable]$ADParams
     )
 
@@ -809,29 +1077,9 @@ function Resolve-PrincipalSid {
         return New-Object System.Security.Principal.SecurityIdentifier($id)
     }
 
-    $domSid = $TargetDomain.DomainSID.Value
-    $norm   = ($id -replace '[\s_\-]', '').ToLowerInvariant()
-    $wellKnown = @{
-        'authenticatedusers'                  = 'S-1-5-11'
-        'everyone'                            = 'S-1-1-0'
-        'domaincontrollers'                   = "$domSid-516"
-        'domaincomputers'                     = "$domSid-515"
-        'domainusers'                         = "$domSid-513"
-        'domainadmins'                        = "$domSid-512"
-        'enterpriseadmins'                    = "$RootDomainSID-519"
-        'enterprisereadonlydomaincontrollers' = "$RootDomainSID-498"
-        'enterpriserodcs'                     = "$RootDomainSID-498"
-        'enterprisedomaincontrollers'         = 'S-1-5-9'
-    }
-    if ($wellKnown.ContainsKey($norm)) {
-        return New-Object System.Security.Principal.SecurityIdentifier($wellKnown[$norm])
-    }
-
-    # Directory lookup in the target (-Server) domain, matching sAMAccountName first (unique within a
-    # domain), then UPN - both LDAP-escaped ('\' never goes into a filter). A DOMAIN\ prefix is
-    # honoured only when it names the target domain itself; a mismatched prefix is rejected rather than
-    # silently resolved against a same-named principal in the target domain (which would grant the
-    # wrong object). For a principal in another domain, pass its SID.
+    # A DOMAIN\ prefix is honoured only when it names the target domain itself; a mismatched prefix
+    # is rejected rather than silently resolved against a same-named principal in the target domain
+    # (which would grant the wrong object). For a principal in another domain, pass its SID.
     if ($id -match '\\') {
         $prefix = ($id -split '\\', 2)[0]
         $name   = ($id -split '\\', 2)[1]
@@ -842,24 +1090,55 @@ function Resolve-PrincipalSid {
     else {
         $name = $id
     }
+
+    # Is this a well-known token name? (Cheap string check; the SID - possibly a root-domain read for
+    # the enterprise tokens - is resolved only if the token is actually used, below.) A DOMAIN\-prefixed
+    # input never matches (the backslash survives normalization).
+    $knownTokens = 'authenticatedusers', 'everyone', 'enterprisedomaincontrollers', 'domaincontrollers',
+                   'domaincomputers', 'domainusers', 'domainadmins', 'enterpriseadmins',
+                   'enterprisereadonlydomaincontrollers', 'enterpriserodcs'
+    $norm = ($id -replace '[\s_\-]', '').ToLowerInvariant()
+    $isToken = $norm -in $knownTokens
+
+    # Directory lookup - sAMAccountName (unique within a domain), then UPN - both LDAP-escaped ('\'
+    # never goes into a filter). -ErrorAction Stop: a failed search must fail the run, not silently
+    # degrade into a token/not-found path that could resolve a different SID.
     $escName = ConvertTo-LdapFilterValue $name
+    $obj = @(Get-ADObject @ADParams -LDAPFilter "(sAMAccountName=$escName)" -Properties objectSid -ErrorAction Stop |
+            Where-Object { $_.objectSid })
 
-    $obj = @(Get-ADObject @ADParams -LDAPFilter "(sAMAccountName=$escName)" -Properties objectSid -ErrorAction SilentlyContinue |
-            Where-Object { $_.objectSid }) | Select-Object -First 1
-
-    if (-not $obj -and $id -match '@') {
+    if (-not $obj.Count -and $id -match '@') {
         $escUpn = ConvertTo-LdapFilterValue $id
-        $obj = @(Get-ADObject @ADParams -LDAPFilter "(userPrincipalName=$escUpn)" -Properties objectSid -ErrorAction SilentlyContinue |
-                Where-Object { $_.objectSid }) | Select-Object -First 1
+        $obj = @(Get-ADObject @ADParams -LDAPFilter "(userPrincipalName=$escUpn)" -Properties objectSid -ErrorAction Stop |
+                Where-Object { $_.objectSid })
+    }
+    if ($obj.Count -gt 1) {
+        throw "Principal '$Identity' is ambiguous: $($obj.Count) objects match ($(@($obj | ForEach-Object { $_.DistinguishedName }) -join '; ')). Use the intended principal's SID (S-1-5-...) instead."
+    }
+    if ($obj.Count -eq 1) {
+        $objSid = [System.Security.Principal.SecurityIdentifier]$obj[0].objectSid
+        if ($isToken) {
+            # The input is both a well-known token AND a real directory object. Same SID both ways
+            # (the built-in group's own sAMAccountName, e.g. 'Domain Admins' on an English forest):
+            # no ambiguity, accept. A DIFFERENT SID means a planted object trying to hijack the
+            # token, or the token shadowing a distinct real group - refuse rather than guess.
+            $tokenSid = Get-WellKnownTokenSid -Norm $norm -TargetDomain $TargetDomain -TargetForest $TargetForest -ADParams $ADParams
+            if (-not $tokenSid -or $tokenSid.Value -ne $objSid.Value) {
+                throw "Principal '$Identity' matches BOTH the well-known token and a DIFFERENT directory object ($($obj[0].DistinguishedName)). Disambiguate with a SID (S-1-5-...) for the exact principal, or a DOMAIN\ prefix to force the directory object."
+            }
+        }
+        return $objSid
     }
 
-    # Deliberately NO cn fallback: cn is not unique to security principals, and a domain-wide cn match
-    # could resolve to an object anyone with create rights planted under that name - silently granting
-    # template rights (which EJBCA enforces) to the wrong SID. Fail closed instead.
-    if (-not $obj -or -not $obj.objectSid) {
-        throw "Could not resolve principal '$Identity' by sAMAccountName or UPN in the target domain. Use its sAMAccountName, a SID (S-1-5-...), or a well-known token (DomainControllers, DomainComputers, DomainUsers, DomainAdmins, EnterpriseAdmins, EnterpriseRODCs, EnterpriseDomainControllers, AuthenticatedUsers, Everyone)."
+    # No directory object matched - resolve the well-known token if the name is one.
+    if ($isToken) {
+        $tokenSid = Get-WellKnownTokenSid -Norm $norm -TargetDomain $TargetDomain -TargetForest $TargetForest -ADParams $ADParams
+        if ($tokenSid) { return $tokenSid }
     }
-    return [System.Security.Principal.SecurityIdentifier]$obj.objectSid
+
+    # Deliberately NO cn fallback: cn is not unique to security principals, and a domain-wide cn
+    # match could resolve to an object anyone with create rights planted under that name. Fail closed.
+    throw "Could not resolve principal '$Identity' by sAMAccountName or UPN in the target domain. Use its sAMAccountName, a UPN (user@domain), a SID (S-1-5-...), or a well-known token (DomainControllers, DomainComputers, DomainUsers, DomainAdmins, EnterpriseAdmins, EnterpriseRODCs, EnterpriseDomainControllers, AuthenticatedUsers, Everyone)."
 }
 
 function Resolve-TemplateGrants {
@@ -870,43 +1149,20 @@ function Resolve-TemplateGrants {
     # @{ Sid; Rights = @(lowercased keywords); Label }.
     param([string]$AclBase, [hashtable]$EnrollPrincipals, [hashtable]$ADParams)
 
+    $havePrincipals = $EnrollPrincipals -and $EnrollPrincipals.Count -gt 0
+    if ($AclBase -eq 'PrincipalsOnly' -and -not $havePrincipals) {
+        throw "-AclBase PrincipalsOnly requires -EnrollPrincipals; otherwise the template would be given an empty ACL."
+    }
+    $includeStandard = $AclBase -in 'Standard', 'SchemaPlusStandard'
+    if (-not $includeStandard -and -not $havePrincipals) {
+        # -AclBase Schema with nothing to add: the grant list is empty and Set-TemplateAcl will
+        # leave the schema default untouched - no directory reads (and no root-SID resolution,
+        # which could even fail) are needed at all.
+        return @()
+    }
+
     $targetDomain = Get-ADDomain @ADParams -ErrorAction Stop
     $targetForest = Get-ADForest @ADParams -ErrorAction Stop
-    if ($targetDomain.DNSRoot -eq $targetForest.RootDomain) {
-        $rootDomainSID = $targetDomain.DomainSID.Value
-    }
-    else {
-        # The pinned -Server DC is in a child domain, and the forest-root domain SID (for the
-        # RID-498/519 grants) lives in a domain the caller never named. Prefer reading the root
-        # domain head's objectSid from the pinned DC's own Global Catalog (port 3268) - that keeps
-        # the explicitly-named-servers contract intact (no DNS/firewall dependency on an unnamed
-        # root-domain DC). Only if the pinned DC is not a GC fall back to locating a root-domain DC
-        # by domain name, carrying the credential (the fallback replaces the splat's -Server).
-        $rootDomainSID = $null
-        $rootNC = 'DC=' + (($targetForest.RootDomain -split '\.') -join ',DC=')
-        if ($ADParams.ContainsKey('Server')) {
-            $gcParams = @{} + $ADParams
-            $gcParams['Server'] = "$($ADParams['Server']):3268"
-            try {
-                $rootSid = (Get-ADObject @gcParams -Identity $rootNC -Properties objectSid -ErrorAction Stop).objectSid
-                if ($rootSid -is [byte[]]) { $rootSid = New-Object System.Security.Principal.SecurityIdentifier($rootSid, 0) }
-                if ($rootSid) { $rootDomainSID = $rootSid.Value }
-            }
-            catch {
-                Write-Verbose "Global Catalog read of '$rootNC' via $($gcParams['Server']) failed ($($_.Exception.Message)); falling back to a root-domain DC lookup."
-            }
-        }
-        if (-not $rootDomainSID) {
-            $rootParams = @{ Server = $targetForest.RootDomain; ErrorAction = 'Stop' }
-            if ($ADParams.ContainsKey('Credential')) { $rootParams['Credential'] = $ADParams['Credential'] }
-            try {
-                $rootDomainSID = (Get-ADDomain @rootParams).DomainSID.Value
-            }
-            catch {
-                throw "Could not determine the forest-root domain SID: the pinned DC's Global Catalog (port 3268) was not readable and no DC of root domain '$($targetForest.RootDomain)' could be reached by name. Point -Server at a DC in the forest root domain, or allow GC (3268) access to the pinned DC. Underlying error: $($_.Exception.Message)"
-            }
-        }
-    }
 
     $validRights = @('read', 'write', 'enroll', 'autoenroll', 'fullcontrol')
     $grants = @()
@@ -915,8 +1171,9 @@ function Resolve-TemplateGrants {
     # via Authenticated Users (every DC computer account is a member), so the DC / RODC / Enterprise-DC
     # groups only need enroll + autoenroll; admins get Read/Write/Enroll (not Full Control / Autoenroll);
     # SYSTEM is deliberately not granted.
-    if ($AclBase -in 'Standard', 'SchemaPlusStandard') {
-        $domSid = $targetDomain.DomainSID.Value
+    if ($includeStandard) {
+        $domSid        = $targetDomain.DomainSID.Value
+        $rootDomainSID = Get-RootDomainSid -TargetDomain $targetDomain -TargetForest $targetForest -ADParams $ADParams
         $grants += @{ Sid = (New-Object System.Security.Principal.SecurityIdentifier('S-1-5-11'));           Rights = @('read');                    Label = 'Authenticated Users' }
         $grants += @{ Sid = (New-Object System.Security.Principal.SecurityIdentifier("$rootDomainSID-498")); Rights = @('enroll', 'autoenroll');    Label = 'Enterprise Read-only Domain Controllers (RID 498)' }
         $grants += @{ Sid = (New-Object System.Security.Principal.SecurityIdentifier("$domSid-512"));        Rights = @('read', 'write', 'enroll'); Label = 'Domain Admins (RID 512)' }
@@ -925,7 +1182,7 @@ function Resolve-TemplateGrants {
         $grants += @{ Sid = (New-Object System.Security.Principal.SecurityIdentifier('S-1-5-9'));            Rights = @('enroll', 'autoenroll');    Label = 'Enterprise Domain Controllers (S-1-5-9)' }
     }
 
-    if ($EnrollPrincipals -and $EnrollPrincipals.Count -gt 0) {
+    if ($havePrincipals) {
         foreach ($key in $EnrollPrincipals.Keys) {
             $rights = @(@($EnrollPrincipals[$key]) | ForEach-Object { "$_".Trim().ToLowerInvariant() } | Where-Object { $_ })
             if (-not $rights.Count) {
@@ -935,13 +1192,9 @@ function Resolve-TemplateGrants {
             if ($bad.Count) {
                 throw "Unknown right(s) '$($bad -join ', ')' for principal '$key'. Valid rights: Read, Write, Enroll, Autoenroll, FullControl."
             }
-            $sid = Resolve-PrincipalSid -Identity $key -TargetDomain $targetDomain -RootDomainSID $rootDomainSID -ADParams $ADParams
+            $sid = Resolve-PrincipalSid -Identity $key -TargetDomain $targetDomain -TargetForest $targetForest -ADParams $ADParams
             $grants += @{ Sid = $sid; Rights = $rights; Label = $key }
         }
-    }
-
-    if ($AclBase -eq 'PrincipalsOnly' -and -not $grants.Count) {
-        throw "-AclBase PrincipalsOnly requires -EnrollPrincipals; otherwise the template would be given an empty ACL."
     }
 
     return $grants
@@ -962,9 +1215,8 @@ function Set-TemplateAcl {
 
     $exists = Get-ADObjectIfPresent -Identity $TemplateDN -ADParams $ADParams
     if (-not $exists) {
-        # Reached only when the template was not created (-WhatIf, or the create was declined at the
-        # -Confirm prompt). There is nothing to secure, so report and return rather than erroring.
         if ($WhatIfPreference) {
+            # -WhatIf: nothing was created; preview the planned grants and return.
             if (-not $ReplaceExisting -and -not $Grants.Count) {
                 Write-Host "What if: Would leave the schema-default ACL on $TemplateDN unchanged." -ForegroundColor Yellow
             }
@@ -973,11 +1225,14 @@ function Set-TemplateAcl {
                 Write-Host "What if: Would $verb these grants on ${TemplateDN}:" -ForegroundColor Yellow
                 foreach ($g in $Grants) { Write-Host "         - $($g.Label): $($g.Rights -join ', ')" -ForegroundColor Yellow }
             }
+            return
         }
-        else {
-            Write-Host "Template '$TemplateDN' was not created; skipping permissions." -ForegroundColor Yellow
-        }
-        return
+        # A real run reached the ACL step for a template that is not visible although its creation
+        # was reported (a declined -Confirm returns $null from Import-Template and never gets here).
+        # That is replication lag (a domain-name -Server hitting another replica) or external deletion: fail
+        # loudly instead of 'skipping permissions' with exit 0 - the template would silently keep
+        # the schema-default DACL (no Enroll rights) that a consumer like EJBCA then enforces.
+        throw "Template '$TemplateDN' is not visible on the targeted server although its creation was reported - replication lag (a domain-name -Server hitting another replica?) or external deletion. The ACL was NOT applied."
     }
 
     if (-not $ReplaceExisting -and -not $Grants.Count) {
@@ -1004,7 +1259,7 @@ function Set-TemplateAcl {
     if ($CallerCmdlet.ShouldProcess($TemplateDN, $action)) {
         # The security descriptor is read and written over ADWS (Get/Set-ADObject on
         # nTSecurityDescriptor), like every other operation in the script - one protocol (TCP 9389),
-        # one pinned server, and the splat's -Credential applies as-is. Statement-terminating errors
+        # the same -Server, and the splat's -Credential applies as-is. Statement-terminating errors
         # do NOT stop a function under the default ErrorActionPreference, hence -ErrorAction Stop +
         # try/catch so a failure cannot cascade into the green success line.
         try {
@@ -1056,30 +1311,43 @@ function Set-TemplateAcl {
 function Get-AttrCanonical {
     # Normalize an attribute value to a comparable string. Byte attributes are compared in order
     # (they encode fixed-layout values); everything else as an order-insensitive set of strings.
+    # Elements are escaped before joining so a literal '|' inside a value cannot make @('a|b') and
+    # @('a','b') collide, and the sort is case-sensitive so the -ceq comparison downstream stays
+    # deterministic for case-differing sets.
     param([string]$Name, $Value)
+    # $null and an EMPTY collection both mean "attribute not set" and must canonicalize identically:
+    # a raw ADObject materializes unset multi-valued attributes as empty collections, while a
+    # Select-Object view of the same object yields $null for them (enumeration collapse).
     if ($null -eq $Value) { return '<null>' }
-    if ($Name -in $script:ByteAttributes) {
+    $items = @($Value)
+    if (-not $items.Count) { return '<null>' }
+    # Ordered byte-wise for the known byte attributes AND any value that is actually a byte[] (a
+    # schema-typed octet-string attribute the static list doesn't name): both diff operands come
+    # from live -Properties * reads, so a real octet attribute is byte[] on both sides. Byte order
+    # is significant, so it must not fall through to the order-insensitive set path below.
+    if ($Name -in $script:ByteAttributes -or $Value -is [byte[]]) {
         return (([byte[]]$Value | ForEach-Object { $_.ToString('x2') }) -join '')
     }
-    return ((@($Value) | ForEach-Object { "$_" } | Sort-Object) -join '|')
+    return (($items | ForEach-Object { "$_" -replace '\\', '\\' -replace '\|', '\|' } | Sort-Object -CaseSensitive) -join '|')
 }
 
 function Compare-TemplateAttributes {
     param($Source, $Target)
-    # Diff the union of the import type lists AND every PKI attribute actually present on the SOURCE
-    # object. Building the set only from the import lists would let an attribute the import cannot
-    # write vanish from the diff entirely - a false PASS on a lossy round-trip. Identity and the OID
-    # are excluded deliberately (renamed / regenerated by design).
-    $sourcePkiAttrs = @($Source.PSObject.Properties.Name |
+    # Diff the union of the import type lists AND every PKI attribute present on EITHER object.
+    # Source-only attributes catch a lossy copy; target-only attributes catch the inverse (the copy
+    # carrying values the source never had). Identity and the OID are excluded deliberately
+    # (renamed / regenerated by design). The comparison is case-SENSITIVE - a case-only change is
+    # still a change.
+    $eitherPkiAttrs = @(@($Source.PSObject.Properties.Name) + @($Target.PSObject.Properties.Name) |
             Where-Object { $_ -match '^(msPKI-|pKI)' -and $_ -ne 'msPKI-Cert-Template-OID' })
-    $attrs = @($script:IntAttributes + $script:MultiValueAttributes + $script:ByteAttributes + $sourcePkiAttrs) |
+    $attrs = @($script:IntAttributes + $script:MultiValueAttributes + $script:ByteAttributes + $eitherPkiAttrs) |
         Sort-Object -Unique
     foreach ($a in $attrs) {
         $sc = Get-AttrCanonical -Name $a -Value $Source.$a
         $tc = Get-AttrCanonical -Name $a -Value $Target.$a
         [pscustomobject]@{
             Attribute = $a
-            Match     = ($sc -eq $tc)
+            Match     = ($sc -ceq $tc)
             Source    = $sc
             Target    = $tc
         }
@@ -1116,6 +1384,43 @@ function Show-RoundTripDiff {
     $mismatches.Count
 }
 
+function Invoke-OneRoundTrip {
+    # Runs ONE pipeline of the validation: import the given input under a throwaway identity, read
+    # the copy back, and diff it against the source view. Returns the mismatch count, or $null when
+    # the create was declined at a -Confirm prompt (the caller then aborts; its finally still
+    # cleans up). $CreatedDN is [ref] so the caller can clean up even if this function throws.
+    param(
+        [string]$PipelineName,
+        [string]$SourceName,
+        [psobject]$ImportInput,
+        [string]$Cn,
+        [string]$Display,
+        [string]$ExplicitOid,
+        [string]$ConfigNC,
+        [psobject]$Source,
+        [hashtable]$ADParams,
+        [System.Management.Automation.PSCmdlet]$CallerCmdlet,
+        [ref]$CreatedDN
+    )
+
+    $CreatedDN.Value = Import-Template -InputObject $ImportInput -NewTemplateName $Cn -NewDisplayName $Display `
+        -ExplicitOid $ExplicitOid -ConfigNC $ConfigNC -ADParams $ADParams -CallerCmdlet $CallerCmdlet
+    if (-not $CreatedDN.Value) {
+        # Declined at the -Confirm prompt (a genuine create failure throws inside Import-Template;
+        # -WhatIf never reaches this function). Nothing was created, nothing to diff.
+        Write-Warning "$PipelineName throwaway template was not created (declined at the -Confirm prompt); nothing to compare."
+        return $null
+    }
+
+    $created = Get-ADObjectIfPresent -Identity $CreatedDN.Value -ADParams $ADParams -Properties *
+    if (-not $created) {
+        Write-Warning "$PipelineName throwaway template could not be read back after creation (replication lag on a domain-name -Server?); nothing to compare."
+        return $null
+    }
+
+    Show-RoundTripDiff -Label "$PipelineName comparison: '$SourceName' -> '$Cn'" -Source $Source -Target $created
+}
+
 function Invoke-RoundTripValidation {
     param(
         [string]$TemplateName,
@@ -1125,22 +1430,11 @@ function Invoke-RoundTripValidation {
         [System.Management.Automation.PSCmdlet]$CallerCmdlet
     )
 
-    $configNC       = Get-ConfigNC -ADParams $ADParams
-    $templatesDN    = "CN=Certificate Templates,CN=Public Key Services,CN=Services,$configNC"
-    $oidContainerDN = "CN=OID,CN=Public Key Services,CN=Services,$configNC"
+    $configNC = Get-ConfigNC -ADParams $ADParams
 
-    # Read the live source object (this is the left-hand side of the diff). Escaped + single-match
-    # guarded, same as Get-SourceTemplate; -ErrorAction Stop so connectivity failures terminate as
-    # themselves instead of falling through to "not found".
-    $source = @(Get-ADObject @ADParams -SearchBase $templatesDN -ErrorAction Stop `
-        -LDAPFilter "(&(objectClass=pKICertificateTemplate)(cn=$(ConvertTo-LdapFilterValue $TemplateName)))" -Properties *)
-    if (-not $source.Count) {
-        throw "Source template cn '$TemplateName' was not found under $templatesDN."
-    }
-    if ($source.Count -gt 1) {
-        throw "The name '$TemplateName' matched $($source.Count) templates - refusing an ambiguous validation."
-    }
-    $source = $source[0]
+    # ONE source read serves everything: the diff left-hand side, the file export's input, and the
+    # direct-path import input (the latter being exactly what -Mode Sync feeds the import).
+    $source = Get-SourceTemplate -TemplateName $TemplateName -ADParams $ADParams -ConfigNC $configNC
 
     if ($WhatIfPreference) {
         # Short-circuit: Validate creates AND removes throwaway templates. Under -WhatIf we make no
@@ -1176,47 +1470,38 @@ function Invoke-RoundTripValidation {
     }
 
     try {
-        # Pipeline 1 - the FILE flow: export (serialize to JSON) -> import (deserialize + create).
-        Export-Template -TemplateName $TemplateName -Path $Path -ADParams $ADParams -CallerCmdlet $CallerCmdlet -NoImportHint
-        if (-not (Test-Path $Path)) {
-            # Export write declined at a -Confirm prompt: abort gracefully instead of a raw
-            # "file not found" from the import step.
+        # Pipeline 1 - the FILE flow: export (serialize to JSON) -> read back -> import. Use the
+        # written/not-written return, NOT Test-Path: a declined OVERWRITE of an explicit -Path leaves
+        # the STALE file, which Test-Path would accept and then diff against, producing a false FAIL.
+        $exported = Export-Template -InputObject $source -Path $Path -ADParams $ADParams -CallerCmdlet $CallerCmdlet -NoImportHint
+        if (-not $exported) {
             Write-Warning "Export file was not written (declined); validation aborted."
             return
         }
 
-        $tempDN = Import-Template -InputObject (Read-TemplateExport -Path $Path) -NewTemplateName $tempCn `
-            -NewDisplayName $tempDisplay -ExplicitOid (& $newThrowawayOid) -ConfigNC $configNC `
-            -ADParams $ADParams -CallerCmdlet $CallerCmdlet
-
-        $created = Get-ADObjectIfPresent -Identity $tempDN -ADParams $ADParams -Properties *
-        if (-not $created) {
-            # Not created - the create was declined at the -Confirm prompt (a genuine create failure
-            # throws inside Import-Template; -WhatIf returned earlier). Nothing to diff; the finally
-            # block still cleans up the temp file and any objects that exist.
-            Write-Warning "Round-trip template was not created (declined at the -Confirm prompt?); nothing to compare."
-            return
-        }
-
-        $fileMismatches = Show-RoundTripDiff -Label "File-pipeline comparison (Export/Import): '$TemplateName' -> '$tempCn'" `
-            -Source $source -Target $created
+        $fileMismatches = Invoke-OneRoundTrip -PipelineName 'File pipeline (Export/Import)' -SourceName $TemplateName `
+            -ImportInput (Read-TemplateExport -Path $Path) -Cn $tempCn -Display $tempDisplay `
+            -ExplicitOid (& $newThrowawayOid) -ConfigNC $configNC -Source $source `
+            -ADParams $ADParams -CallerCmdlet $CallerCmdlet -CreatedDN ([ref]$tempDN)
+        if ($null -eq $fileMismatches) { return }   # file-pipeline create declined; nothing validated
 
         # Pipeline 2 - the DIRECT flow: feed the live attribute view straight into the import,
         # exactly as -Mode Sync does. The file pipeline above cannot stand in for this one: live AD
         # values (ADPropertyValueCollection, byte[]) reach Import-Template's casts untouched by
         # JSON, so each pipeline needs its own round-trip proof.
-        $directDN = Import-Template -InputObject (Get-SourceTemplate -TemplateName $TemplateName -ADParams $ADParams -ConfigNC $configNC) `
-            -NewTemplateName $directCn -NewDisplayName $directDisplay -ExplicitOid (& $newThrowawayOid) -ConfigNC $configNC `
-            -ADParams $ADParams -CallerCmdlet $CallerCmdlet
-
-        $createdDirect = Get-ADObjectIfPresent -Identity $directDN -ADParams $ADParams -Properties *
-        if (-not $createdDirect) {
-            Write-Warning "Direct-path template was not created (declined at the -Confirm prompt?); nothing to compare for the Sync pipeline."
+        $directMismatches = Invoke-OneRoundTrip -PipelineName 'Direct pipeline (Sync)' -SourceName $TemplateName `
+            -ImportInput $source -Cn $directCn -Display $directDisplay `
+            -ExplicitOid (& $newThrowawayOid) -ConfigNC $configNC -Source $source `
+            -ADParams $ADParams -CallerCmdlet $CallerCmdlet -CreatedDN ([ref]$directDN)
+        if ($null -eq $directMismatches) {
+            # Direct-pipeline create was declined. Still fail if the file pipeline already found
+            # mismatches - a mismatch must never exit 0 (automation gates on that).
+            if ($fileMismatches -gt 0) {
+                throw "Round-trip validation FAILED: file pipeline $fileMismatches mismatch(es); the direct (Sync) pipeline was declined so could not be checked. See the diff output above."
+            }
+            Write-Warning "Direct (Sync) pipeline was declined; only the file pipeline was validated (it passed)."
             return
         }
-
-        $directMismatches = Show-RoundTripDiff -Label "Direct-pipeline comparison (Sync): '$TemplateName' -> '$directCn'" `
-            -Source $source -Target $createdDirect
 
         Write-Host ""
         if (($fileMismatches + $directMismatches) -eq 0) {
@@ -1224,18 +1509,22 @@ function Invoke-RoundTripValidation {
         }
         else {
             Write-Host "OVERALL FAIL: file pipeline $fileMismatches mismatch(es), direct pipeline $directMismatches mismatch(es) - see above." -ForegroundColor Red
+            # Fail as a real failure: automation gating on Validate must see a non-zero exit code,
+            # not have to scrape console colors. Cleanup still runs (finally below).
+            throw "Round-trip validation FAILED: file pipeline $fileMismatches mismatch(es), direct pipeline $directMismatches mismatch(es). The copy pipelines did not reproduce the source template faithfully - see the diff output above."
         }
     }
     finally {
         # Idempotent cleanup, safe on every exit path (early return, read-back failure after the
-        # objects were created, or a mid-run error). Re-query by DN so it never relies on $created.
+        # objects were created, a FAIL throw, or a mid-run error). Re-query by DN so it never relies
+        # on in-try state. Throwaways are created with -ExplicitOid, which never registers a
+        # companion OID display object, so only the templates themselves (and the temp file) need
+        # removing.
         $throwawayDNs = @($tempDN, $directDN) | Where-Object { $_ }
 
         if ($KeepArtifacts) {
             foreach ($dn in $throwawayDNs) {
-                if (Get-ADObjectIfPresent -Identity $dn -ADParams $ADParams) {
-                    Write-Host "-KeepArtifacts: left throwaway template '$dn' in place." -ForegroundColor Yellow
-                }
+                Write-Host "-KeepArtifacts: left throwaway template '$dn' in place (if created)." -ForegroundColor Yellow
             }
             if ($throwawayDNs.Count) {
                 Write-Host "-KeepArtifacts: left file '$Path' in place." -ForegroundColor Yellow
@@ -1244,36 +1533,23 @@ function Invoke-RoundTripValidation {
         else {
             $cleanupOk = $true
             foreach ($dn in $throwawayDNs) {
-                $tpl = Get-ADObjectIfPresent -Identity $dn -ADParams $ADParams -Properties 'msPKI-Cert-Template-OID'
-                if (-not $tpl) { continue }
-                $oidVal = $tpl.'msPKI-Cert-Template-OID'
+                # The whole cleanup runs in a finally that may be entered because the DC/network
+                # dropped mid-run: the existence probe (Get-ADObjectIfPresent) would then re-throw
+                # that connectivity error, aborting cleanup and MASKING the original failure. Wrap
+                # each DN so one unreachable object cannot leak the rest (or the temp file).
                 try {
+                    if (-not (Get-ADObjectIfPresent -Identity $dn -ADParams $ADParams)) { continue }
                     Remove-ADObject @ADParams -Identity $dn -Confirm:$false -ErrorAction Stop
                 }
                 catch {
                     $cleanupOk = $false
                     Write-Warning "Could not remove throwaway template '$dn': $($_.Exception.Message)"
                 }
-                if ($oidVal -and (Get-ADObjectIfPresent -Identity $oidContainerDN -ADParams $ADParams)) {
-                    # Guard the -SearchBase: a missing CN=OID container would otherwise throw here
-                    # (unsuppressed by SilentlyContinue) and abort the finally, leaking the temp file.
-                    $oidObj = Get-ADObject @ADParams -SearchBase $oidContainerDN `
-                        -LDAPFilter "(msPKI-Cert-Template-OID=$oidVal)" -ErrorAction SilentlyContinue
-                    if ($oidObj) {
-                        try {
-                            Remove-ADObject @ADParams -Identity $oidObj.DistinguishedName -Confirm:$false -ErrorAction Stop
-                        }
-                        catch {
-                            $cleanupOk = $false
-                            Write-Warning "Could not remove throwaway OID object '$($oidObj.DistinguishedName)': $($_.Exception.Message)"
-                        }
-                    }
-                }
             }
             if ($usingTempFile) {
                 # -Confirm:$false: Remove-Item would otherwise raise its own prompt under a -Confirm run.
-                Remove-Item -Path $Path -Force -Confirm:$false -ErrorAction SilentlyContinue
-                if (Test-Path $Path) {
+                Remove-Item -LiteralPath $Path -Force -Confirm:$false -ErrorAction SilentlyContinue
+                if (Test-Path -LiteralPath $Path) {
                     $cleanupOk = $false
                     Write-Warning "Could not remove the temp export file '$Path'."
                 }
@@ -1323,25 +1599,68 @@ if ($Credential -and -not $Server) {
 if ($SkipAcl -and $EnrollPrincipals -and $EnrollPrincipals.Count -gt 0) {
     throw "-SkipAcl and -EnrollPrincipals are mutually exclusive (-SkipAcl skips the very ACL that -EnrollPrincipals defines)."
 }
+if ($SkipAcl -and $PSBoundParameters.ContainsKey('AclBase')) {
+    throw "-SkipAcl and -AclBase are mutually exclusive (-SkipAcl skips the very ACL step that -AclBase configures)."
+}
+if ($OidRoot -and $OidHandling -ne 'GenerateFromRoot') {
+    throw "-OidRoot is only consumed by -OidHandling GenerateFromRoot; with '$OidHandling' it would be silently ignored. Add -OidHandling GenerateFromRoot, or drop -OidRoot."
+}
 
 $adParams = @{}
 if ($Server) { $adParams['Server'] = $Server }
 if ($Credential) { $adParams['Credential'] = $Credential }
 
-# Import, Sync and Validate write to the config partition and then read back / bind by DN. Pin a
-# concrete DC so those operations hit the same server (avoids read-after-write races on serverless
-# binding).
-if ($Mode -in 'Import', 'Sync', 'Validate' -and -not $adParams.ContainsKey('Server')) {
-    # -Writable: plain -Discover can return an RODC in an RODC-only site, and every config-partition
-    # write would then fail after the reads succeeded.
-    $dc = Get-ADDomainController -Discover -Writable -ErrorAction Stop
-    $adParams['Server'] = ($dc.HostName | Select-Object -First 1)
+# Import, Sync and Validate write to the config partition and then read back / bind by DN, so every
+# step must hit ONE server. With no -Server, discover a writable DC that runs ADWS.
+if ($Mode -in 'Import', 'Sync', 'Validate') {
+    if ($adParams.ContainsKey('Server')) {
+        # Whatever -Server names is used VERBATIM for every operation - this script never rewrites
+        # the operator's endpoint. (Auto-"pinning" a domain name to a member DC was implemented and
+        # deliberately abandoned: a client cannot safely pick a substitute server, because a
+        # bit-identical clone, split DNS, or a NetBIOS-layer redirect can make a DIFFERENT directory
+        # pass every health check a substitute could be given - so any rewrite risks silently
+        # sending writes somewhere the operator did not name.)
+        # What CAN be done safely is detection: a DOMAIN name (DNS - with or without the absolute
+        # trailing dot - or NetBIOS) locates a different DC per connection, so the create,
+        # read-back and ACL steps of one run may hit different replicas. Warn loudly and let the
+        # operator choose; a lagging read-back then FAILS the run (see Set-TemplateAcl) rather than
+        # mis-securing the template.
+        try {
+            $rootDSE = Get-ADRootDSE @adParams -ErrorAction Stop
+        }
+        catch {
+            throw "Could not read RootDSE from '$($adParams['Server'])' - is the server name correct and reachable (ADWS, TCP 9389)? Underlying error: $($_.Exception.Message)"
+        }
+        $suppliedHost = $adParams['Server']
+        if ($suppliedHost -notmatch ':.*:') { $suppliedHost = $suppliedHost -replace ':\d+$', '' }  # strip :port (never an IPv6 literal)
+        $suppliedHost = $suppliedHost.TrimEnd('.')   # absolute DNS form 'domain.' is the same domain name
+        $ncToDns = { param($nc) if ($nc) { (($nc -split ',') | ForEach-Object { $_ -replace '^DC=', '' }) -join '.' } }
+        $domainNames = @((& $ncToDns $rootDSE.defaultNamingContext), (& $ncToDns $rootDSE.rootDomainNamingContext))
+        if ($suppliedHost -notmatch '[.:]') {
+            # Dotless and not an IPv6 literal: could be the domain's NetBIOS name (a NetBIOS HOST
+            # name simply won't match it). Classification only - on any failure treat the value as
+            # a host name; never abort the run for this.
+            try { $domainNames += (Get-ADDomain @adParams -ErrorAction Stop).NetBIOSName }
+            catch { Write-Verbose "Could not read the domain's NetBIOS name for -Server classification ($($_.Exception.Message))." }
+        }
+        if ($suppliedHost -in $domainNames) {
+            Write-Warning "-Server '$($adParams['Server'])' is a DOMAIN name, which locates a different DC per connection: the create, read-back and ACL steps of this run may hit DIFFERENT replicas. Name one DC directly (e.g. '$($rootDSE.dnsHostName)') for a fully consistent run."
+        }
+    }
+    else {
+        # -Writable: plain -Discover can return an RODC in an RODC-only site, and every config-
+        # partition write would then fail after the reads succeeded. -Service ADWS: every call this
+        # script makes needs ADWS running on the selected DC.
+        $dc = Get-ADDomainController -Discover -Writable -Service ADWS -ErrorAction Stop
+        $adParams['Server'] = ($dc.HostName | Select-Object -First 1)
+    }
 }
 
 switch ($Mode) {
     "Export" {
-        Export-Template -TemplateName $TemplateName -Path $Path `
-            -StripIdentity:$StripIdentity -StripOid:$StripOid -ADParams $adParams -CallerCmdlet $PSCmdlet
+        # [void]: swallow the written/not-written boolean Export-Template returns (only Validate reads it).
+        [void](Export-Template -TemplateName $TemplateName -Path $Path `
+            -StripIdentity:$StripIdentity -StripOid:$StripOid -ADParams $adParams -CallerCmdlet $PSCmdlet)
     }
     { $_ -in 'Import', 'Sync' } {
         $importArgs = @{
@@ -1355,17 +1674,25 @@ switch ($Mode) {
         if ($Mode -eq 'Sync') {
             # Direct forest-to-forest: read the template from the source forest and feed it straight
             # into the same import pipeline the file-based flow uses (no JSON round-trip at all).
-            # The source is contacted FIRST, so the most error-prone inputs (a typo'd -SourceServer,
-            # a wrong -TemplateName) fail before any target-side work is spent.
+            # After the target-side -Server validation above, the SOURCE is contacted before any other
+            # target-side work, so the most error-prone inputs (a typo'd -SourceServer, a wrong
+            # -TemplateName) fail before grants are resolved or anything is created.
             $sourceParams = @{ Server = $SourceServer }
             if ($SourceCredential) { $sourceParams['Credential'] = $SourceCredential }
 
             # Both RootDSEs up front: a clear connectivity error on either side, and a guard against
             # the same-forest accident (-Server omitted on a machine joined to the SOURCE forest
-            # would otherwise silently make the source forest the write target).
+            # would otherwise silently make the source forest the write target). Same-forest is
+            # detected by the Configuration NC head's objectGUID - forest-unique even when two
+            # distinct forests share a DNS name (prod vs. its isolated clone) - with the DN string
+            # as fallback if a GUID is unreadable.
             $sourceConfigNC = Get-ConfigNC -ADParams $sourceParams
             $targetConfigNC = Get-ConfigNC -ADParams $adParams
-            if ($sourceConfigNC -eq $targetConfigNC) {
+            $sourceConfigGuid = (Get-ADObjectIfPresent -Identity $sourceConfigNC -ADParams $sourceParams).ObjectGUID
+            $targetConfigGuid = (Get-ADObjectIfPresent -Identity $targetConfigNC -ADParams $adParams).ObjectGUID
+            $sameForest = if ($sourceConfigGuid -and $targetConfigGuid) { $sourceConfigGuid -eq $targetConfigGuid }
+                          else { $sourceConfigNC -eq $targetConfigNC }
+            if ($sameForest) {
                 if (-not $PSBoundParameters.ContainsKey('Server')) {
                     throw "The discovered target DC '$($adParams['Server'])' is in the SAME forest as -SourceServer '$SourceServer' ($sourceConfigNC). Pass -Server naming a DC in the intended target forest - or, if a same-forest copy is intended, pass -Server explicitly to confirm."
                 }
@@ -1379,13 +1706,32 @@ switch ($Mode) {
             $importArgs['InputObject'] = Read-TemplateExport -Path $Path
         }
 
+        # The default -AclBase Standard writes the stock KERBEROS AUTHENTICATION ACL (DC-oriented:
+        # Domain Controllers / Enterprise DCs / ERODCs get Enroll+Autoenroll, replacing the schema
+        # default). Applied to an arbitrary template that is rarely what is wanted - and an external
+        # CA (EJBCA) reads exactly this ACL as its authorization source - so say so whenever the
+        # default was not an explicit choice and the template does not look like a Kerberos copy.
+        if (-not $SkipAcl -and $AclBase -eq 'Standard' -and -not $PSBoundParameters.ContainsKey('AclBase')) {
+            $intendedCn = if ($NewTemplateName) { $NewTemplateName } elseif ($importArgs['InputObject'].name) { "$($importArgs['InputObject'].name)" } else { '' }
+            # Normalize away the spaces/hyphens the widened cn allowlist permits, so 'Kerberos
+            # Authentication' / 'Kerberos-Authentication' are recognized as Kerberos copies. Skip the
+            # warning entirely when no name is known yet (Import-Template raises the real error).
+            if ($intendedCn -and (($intendedCn -replace '[\s_\-]', '') -notmatch 'KerberosAuthentication')) {
+                Write-Warning "-AclBase defaulted to 'Standard', which writes the stock Kerberos Authentication ACL (domain controllers get Enroll+Autoenroll; schema default replaced) - but template '$intendedCn' does not look like a Kerberos Authentication copy. Pass -AclBase (and/or -EnrollPrincipals) explicitly if different permissions are intended."
+            }
+        }
+
         # Validate keywords and resolve every principal to a SID BEFORE creating anything, so bad ACL
         # input aborts with nothing created (and -WhatIf still exercises the resolution).
         $grants = if (-not $SkipAcl) { @(Resolve-TemplateGrants -AclBase $AclBase -EnrollPrincipals $EnrollPrincipals -ADParams $adParams) } else { $null }
 
         $templateDN = Import-Template @importArgs
 
-        if (-not $SkipAcl) {
+        if (-not $templateDN) {
+            # Declined at the -Confirm prompt: nothing was created, so there is nothing to secure.
+            Write-Warning "Template creation was declined at the -Confirm prompt; nothing was created."
+        }
+        elseif (-not $SkipAcl) {
             # Standard/PrincipalsOnly replace the schema-default DACL; Schema/SchemaPlusStandard add to it.
             $replaceAcl = $AclBase -in 'Standard', 'PrincipalsOnly'
             try {

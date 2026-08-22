@@ -6,7 +6,7 @@ Currently includes:
 
 - **Bulk certificate template validity updates** — useful for rolling out the CA/Browser Forum **SC-081** validity reductions (200 days from March 2026, 100 days from March 2027, 47 days from March 2029) across many templates at once.
 - **Batch CSR submission to an Enterprise CA** via `certreq.exe`, with resume-safe CSV tracking of request IDs and automated retrieval of issued certificates.
-- **Cross-forest certificate template sync** — copy a template between forests via LDAP, either through a JSON export/import or **directly forest-to-forest in one run** (`-Mode Sync`, with optional explicit credentials per side, so no trust is required). Optional rename, controlled OID handling, and a composable enrollment ACL. Works even when the target forest has **no AD CS installed** — e.g. to publish a template that an external CA such as **EJBCA** reads for enrollment authorization.
+- **Cross-forest certificate template sync** — copy a template between forests at the directory level (all access over ADWS), either through a JSON export/import or **directly forest-to-forest in one run** (`-Mode Sync`, with optional explicit credentials per side, so no trust is required). Optional rename, controlled OID handling, and a composable enrollment ACL. Works even when the target forest has **no AD CS installed** — e.g. to publish a template that an external CA such as **EJBCA** reads for enrollment authorization.
 
 Works on Windows PowerShell 5.1 and PowerShell 7+. `Set-ADCSTemplateValidity` and `Submit-CertificateRequests` have no AD PowerShell module dependency; `Sync-KerberosAuthTemplate` requires the RSAT ActiveDirectory module (see its requirements).
 
@@ -16,7 +16,7 @@ Works on Windows PowerShell 5.1 and PowerShell 7+. `Set-ADCSTemplateValidity` an
 | --- | --- |
 | [`Set-ADCSTemplateValidity.ps1`](./Set-ADCSTemplateValidity.ps1) | Bulk-update the validity period (and optionally the renewal overlap period) on one or more certificate templates, with wildcard name matching. |
 | [`Submit-CertificateRequests.ps1`](./Submit-CertificateRequests.ps1) | Batch-submit `.req`/`.csr`/`.txt` files to an ADCS CA via `certreq.exe`, track request IDs in a CSV, and later retrieve the issued certificates. |
-| [`Sync-KerberosAuthTemplate.ps1`](./Sync-KerberosAuthTemplate.ps1) | Copy the Kerberos Authentication (or any v2+) certificate template between forests via LDAP — through a JSON file or directly forest-to-forest in one run — with optional rename, four OID-handling modes, per-side credentials, a composable enrollment ACL, and a round-trip validation mode. Target forest does not need AD CS. |
+| [`Sync-KerberosAuthTemplate.ps1`](./Sync-KerberosAuthTemplate.ps1) | Copy the Kerberos Authentication (or any v2+) certificate template between forests — through a JSON file or directly forest-to-forest in one run — with optional rename, four OID-handling modes, per-side credentials, a composable enrollment ACL, and a round-trip validation mode. Target forest does not need AD CS. |
 
 ---
 
@@ -308,7 +308,7 @@ There is no supported UI path for moving a template definition between forests, 
 - **Target forest without AD CS.** The template objects live in the (CA-independent) `Certificate Templates` container that every forest has, so you can publish a template into a forest that never had AD CS — e.g. so an external CA such as **EJBCA** (Microsoft auto-enrollment / MSAE) can read the template and its ACL as the enrollment-authorization source.
 - **Renamed copies with controlled identity.** Import under a new cn/display name, and choose whether the OID is carried over or freshly minted.
 
-The ACL is the part EJBCA actually consumes, so it gets first-class treatment: bases (`-AclBase`) that either replace or extend the schema-default DACL, plus per-principal additions (`-EnrollPrincipals`) for enrollees and template admins. Principals are resolved by well-known SID/RID (not by group name), so the script also works on **non-English forests** where group names are localized.
+The ACL is the part EJBCA actually consumes, so it gets first-class treatment: bases (`-AclBase`) that either replace or extend the schema-default DACL, plus per-principal additions (`-EnrollPrincipals`) for enrollees and template admins. Principal resolution is fail-closed: a name matching BOTH a well-known token and a directory object with a *different* SID, or matching more than one object, is refused rather than guessed (disambiguate with a SID or `DOMAIN\` prefix); built-in groups' own names like `Domain Admins` resolve normally, since both readings give the same SID. Well-known SID/RID tokens are language-invariant, so the script also works on **non-English forests** where group names are localized.
 
 ### Features
 
@@ -319,7 +319,7 @@ The ACL is the part EJBCA actually consumes, so it gets first-class treatment: b
 - **Rename on import** (`-NewTemplateName` / `-NewDisplayName`)
 - **Four OID modes** (`-OidHandling`): `Preserve` (default; carry source OID), `Generate` (mint under the target forest's real OID root), `GenerateFromRoot` (mint under a base you supply), `GenerateRandom` (mint under a synthesized base) — every mode registers the companion OID "display" object so Windows resolves the OID to the template name
 - **Composable ACL**: `-AclBase Standard | Schema | SchemaPlusStandard | PrincipalsOnly` plus additive `-EnrollPrincipals` (principal → Read/Write/Enroll/Autoenroll/FullControl)
-- **`-Mode Validate`**: proves round-trip fidelity of **both** pipelines — the JSON file flow *and* the direct in-memory flow Sync uses — by importing a throwaway copy per pipeline and diffing every PKI attribute of the source (byte-array attributes included), then cleaning up
+- **`-Mode Validate`**: proves round-trip fidelity of **both** pipelines — the JSON file flow *and* the direct in-memory flow Sync uses — by importing a throwaway copy per pipeline and diffing every PKI attribute of the source (byte-array attributes included), then cleaning up. A mismatch fails the run with a non-zero exit code, so Validate can gate automation
 - **Fail-fast pre-flights**: refuses duplicate cn, duplicate template OID, missing containers, unresolvable principals — all before anything is created
 - **`-WhatIf` / `-Confirm`** support end to end; UTF-8 BOM file format safe across PowerShell 5.1 ↔ 7
 
@@ -329,8 +329,8 @@ The ACL is the part EJBCA actually consumes, so it gets first-class treatment: b
 - **RSAT ActiveDirectory PowerShell module** (this script is the exception to the repo's otherwise module-free approach — the module is what makes typed attribute writes, `-Server` pinning, and clean rollback practical)
 - No CA role, no RSAT AD CS Tools, and no reachable CA in either forest
 - **Export** (and the read side of Sync): read access to the template (Authenticated Users has this by default)
-- **Import/Validate** (and the write side of Sync): Enterprise Admin, or delegated write access to the `CN=Certificate Templates` (and, for the Generate modes, `CN=OID`) containers in the Configuration naming context
-- **Sync**: ADWS (TCP 9389) reachability to a DC in *each* forest from the machine it runs on; a trust between the forests **or** explicit `-SourceCredential`/`-Credential`. All modes use ADWS only — no LDAP (389) access is needed — and `-Server`/`-SourceServer` should name a single DC so every step hits the same server
+- **Import/Validate** (and the write side of Sync): Enterprise Admin, or delegated write access to the `CN=Certificate Templates` **and** `CN=OID` containers in the Configuration naming context (every OID mode - including the default `Preserve` - registers a companion OID display object when the carried OID has none yet; only a forest without the `CN=OID` container skips it)
+- **Sync**: ADWS (TCP 9389) reachability to a DC in *each* forest from the machine it runs on; a trust between the forests **or** explicit `-SourceCredential`/`-Credential`. All modes use ADWS only — no LDAP (389) access is needed. `-Server`/`-SourceServer` values are always used **verbatim** — the script never substitutes an endpoint you did not type. Name **one DC**: a domain name (DNS or NetBIOS) locates a different DC per connection and draws a loud warning, since the create/read-back/ACL steps could hit different replicas (a lagging read-back fails the run rather than leaving a template mis-secured)
 
 ### Parameters
 
@@ -339,16 +339,16 @@ The ACL is the part EJBCA actually consumes, so it gets first-class treatment: b
 | `-Mode` | `Export` / `Import` / `Sync` / `Validate` | Yes | | `Export` writes the JSON (source forest); `Import` recreates the template + ACL (target forest); `Sync` does both directly forest-to-forest with no file; `Validate` round-trips a template into a throwaway copy and diffs it. |
 | `-Path` | `string` | Export/Import | | JSON file to write (Export) or read (Import). Optional for Validate (temp file used); not used by Sync. |
 | `-TemplateName` | `string` | No | `KerberosAuthentication` | Export/Validate/Sync: the cn (internal name) of the source template. |
-| `-NewTemplateName` | `string` | No | source's `name` | Import/Sync: new cn in the target forest (letters, digits, `._-` only). |
+| `-NewTemplateName` | `string` | No | source's `name` | Import/Sync: new cn in the target forest (letters incl. non-ASCII, digits, non-edge spaces and `._-()` allowed; DN metacharacters `, + = " \ ; < >`, the LDAP wildcard `*`, and `/ #` rejected). |
 | `-NewDisplayName` | `string` | No | source's `displayName` | Import/Sync: new display name in the target forest. |
 | `-StripIdentity` | switch | No | | Export: omit `name`/`displayName` from the file, forcing explicit naming on import. |
 | `-StripOid` | switch | No | | Export: omit the source OID (then import needs a Generate mode). |
 | `-OidHandling` | `Preserve` / `Generate` / `GenerateFromRoot` / `GenerateRandom` | No | `Preserve` | Import/Sync: how the template OID is chosen (see Features). |
-| `-OidRoot` | `string` | With `GenerateFromRoot` | | Base OID to mint under, e.g. `1.3.6.1.4.1.311.21.8.<arcs>`. |
-| `-AclBase` | `Standard` / `Schema` / `SchemaPlusStandard` / `PrincipalsOnly` | No | `Standard` | ACL foundation. `Standard` writes the stock Kerberos Authentication ACL, replacing the schema default; `Schema` keeps the schema default; `SchemaPlusStandard` keeps it and adds the standard set; `PrincipalsOnly` writes exactly `-EnrollPrincipals`. |
-| `-EnrollPrincipals` | `hashtable` | With `PrincipalsOnly` | | Principal → rights map added on top of the base, e.g. `@{ 'DomainControllers'='Enroll','Autoenroll'; 'PKI-Admins'='FullControl' }`. Keys: SID, sAMAccountName, or well-known token. |
-| `-SkipAcl` | switch | No | | Import/Sync: skip the permission step entirely. |
-| `-KeepArtifacts` | switch | No | | Validate: keep the throwaway template/OID object/file for inspection. |
+| `-OidRoot` | `string` | With `GenerateFromRoot` | | Base OID to mint under, e.g. `1.3.6.1.4.1.311.21.8.<arcs>`. Rejected with any other `-OidHandling` (never silently ignored). |
+| `-AclBase` | `Standard` / `Schema` / `SchemaPlusStandard` / `PrincipalsOnly` | No | `Standard` | ACL foundation. `Standard` writes the stock Kerberos Authentication ACL, replacing the schema default; `Schema` keeps the schema default; `SchemaPlusStandard` keeps it and adds the standard set; `PrincipalsOnly` writes exactly `-EnrollPrincipals`. The default (`Standard`) is Kerberos-Authentication-specific and DC-oriented — the script warns when it applies only by default to a template not named like a Kerberos Authentication copy. |
+| `-EnrollPrincipals` | `hashtable` | With `PrincipalsOnly` | | Principal → rights map added on top of the base, e.g. `@{ 'DomainControllers'='Enroll','Autoenroll'; 'PKI-Admins'='FullControl' }`. Keys: SID, sAMAccountName, UPN (user@domain), or well-known token; a bare string matching both a token and an object with a different SID, or more than one object, is refused (disambiguate with a SID or DOMAIN\ prefix). |
+| `-SkipAcl` | switch | No | | Import/Sync: skip the permission step entirely. Mutually exclusive with `-EnrollPrincipals` and an explicit `-AclBase`. |
+| `-KeepArtifacts` | switch | No | | Validate: keep the two throwaway templates and the export file for inspection (no companion OID object is ever created for them). |
 | `-Server` | `string` | No | auto-discover | Pin all (target-side, for Sync) operations to a specific writable DC — point it at another forest's DC to operate there. Required together with `-Credential`. |
 | `-Credential` | `pscredential` | No | current identity | Credentials used against `-Server` — the target side for Import/Sync/Validate, the *source* side for Export. With `-Server`, enables operating on a forest you are not logged on to — no trust needed. |
 | `-SourceServer` | `string` | Sync | | Sync: DC (or domain name) in the **source** forest to read the template from. |
@@ -413,7 +413,9 @@ The ACL is the part EJBCA actually consumes, so it gets first-class treatment: b
 - Import does **not** publish the template to any CA; with a Microsoft CA that remains a separate "Certificate Templates to Issue" step, and with EJBCA you configure the template mapping there.
 - The JSON is written with a UTF-8 BOM so localized/accented display names survive a PowerShell 7 → 5.1 round-trip.
 - Run `-Mode Validate` in a lab or the source forest before the first production import or sync — it exercises both the export→import file pipeline and the direct in-memory pipeline Sync uses, and diffs every PKI attribute the source carries for each.
-- Parameters a mode does not consume are rejected up front (e.g. `-StripOid` with `-Mode Import`) instead of being silently ignored.
+- Parameters a mode does not consume are rejected up front (e.g. `-StripOid` with `-Mode Import`, `-OidRoot` without `GenerateFromRoot`, `-AclBase` with `-SkipAcl`) instead of being silently ignored.
+- PKI attributes the built-in type lists don't know (a genuine schema extension linked to the template class) are typed automatically from the *target* forest's schema; an attribute is dropped with a warning when the schema cannot type it, does not permit it on the template class, or types it single-valued while the source value is empty or multi-valued. (v3/v4 CNG algorithm settings are not separate attributes — they travel packed inside `msPKI-RA-Application-Policies`.)
+- v3/v4 templates can carry a **private-key SDDL** (`msPKI-Key-Security-Descriptor`) packed inside `msPKI-RA-Application-Policies`; it copies verbatim, and any domain SIDs in it are source-forest SIDs — the script warns so you can review the key ACL in the target forest.
 
 ---
 
