@@ -219,67 +219,67 @@
 
 .EXAMPLE
     # Source forest - export the built-in Kerberos Authentication template:
-    .\Sync-KerberosAuthTemplate.ps1 -Mode Export -Path .\KerberosAuth.json
+    .\Sync-ADCSTemplate.ps1 -Mode Export -Path .\KerberosAuth.json
 
 .EXAMPLE
     # Source forest - export a custom template as a name-neutral copy (identity stripped; the OID
     # stays in the file so the default -OidHandling Preserve works on import - add -StripOid only
     # when the import will mint a new OID with one of the Generate modes):
-    .\Sync-KerberosAuthTemplate.ps1 -Mode Export -TemplateName "XX-KerberosAuthentication" `
+    .\Sync-ADCSTemplate.ps1 -Mode Export -TemplateName "XX-KerberosAuthentication" `
         -Path .\XX.json -StripIdentity
 
 .EXAMPLE
     # Target forest with NO AD CS (default) - import under a new name, carrying the source OID:
-    .\Sync-KerberosAuthTemplate.ps1 -Mode Import -Path .\XX.json `
+    .\Sync-ADCSTemplate.ps1 -Mode Import -Path .\XX.json `
         -NewTemplateName "YY-KerberosAuthentication" -NewDisplayName "YY-Kerberos Authentication"
 
 .EXAMPLE
     # Target forest that HAS its own PKI - mint a fresh target-forest OID instead of carrying it:
-    .\Sync-KerberosAuthTemplate.ps1 -Mode Import -Path .\XX.json -OidHandling Generate `
+    .\Sync-ADCSTemplate.ps1 -Mode Import -Path .\XX.json -OidHandling Generate `
         -NewTemplateName "YY-KerberosAuthentication" -NewDisplayName "YY-Kerberos Authentication"
 
 .EXAMPLE
     # No AD CS in the target, but you want a fresh (synthetic) OID with a Windows-resolvable name:
-    .\Sync-KerberosAuthTemplate.ps1 -Mode Import -Path .\XX.json -OidHandling GenerateRandom `
+    .\Sync-ADCSTemplate.ps1 -Mode Import -Path .\XX.json -OidHandling GenerateRandom `
         -NewTemplateName "YY-KerberosAuthentication" -NewDisplayName "YY-Kerberos Authentication"
 
 .EXAMPLE
-    .\Sync-KerberosAuthTemplate.ps1 -Mode Import -Path .\XX.json -NewTemplateName "YY-KerberosAuthentication" -NewDisplayName "YY-Kerberos Authentication" -WhatIf
+    .\Sync-ADCSTemplate.ps1 -Mode Import -Path .\XX.json -NewTemplateName "YY-KerberosAuthentication" -NewDisplayName "YY-Kerberos Authentication" -WhatIf
 
 .EXAMPLE
     # Standard Kerberos Auth ACL (default) PLUS a template-admin group that EJBCA will read:
-    .\Sync-KerberosAuthTemplate.ps1 -Mode Import -Path .\KerberosAuth.json -EnrollPrincipals @{
+    .\Sync-ADCSTemplate.ps1 -Mode Import -Path .\KerberosAuth.json -EnrollPrincipals @{
         'NOREFJELL\PKI-Admins' = 'FullControl'
     }
 
 .EXAMPLE
     # Take exactly the ACL you specify (no standard set, no schema default):
-    .\Sync-KerberosAuthTemplate.ps1 -Mode Import -Path .\KerberosAuth.json -AclBase PrincipalsOnly -EnrollPrincipals @{
+    .\Sync-ADCSTemplate.ps1 -Mode Import -Path .\KerberosAuth.json -AclBase PrincipalsOnly -EnrollPrincipals @{
         'DomainControllers'  = 'Enroll','Autoenroll'
         'AuthenticatedUsers' = 'Read'
     }
 
 .EXAMPLE
     # Direct sync, no file - run in the TARGET forest and pull from the source forest over the trust:
-    .\Sync-KerberosAuthTemplate.ps1 -Mode Sync -SourceServer dc01.source.example `
+    .\Sync-ADCSTemplate.ps1 -Mode Sync -SourceServer dc01.source.example `
         -TemplateName "XX-KerberosAuthentication" `
         -NewTemplateName "YY-KerberosAuthentication" -NewDisplayName "YY-Kerberos Authentication"
 
 .EXAMPLE
     # Direct sync from a third machine, explicit credentials on both sides (no trust needed):
-    .\Sync-KerberosAuthTemplate.ps1 -Mode Sync `
+    .\Sync-ADCSTemplate.ps1 -Mode Sync `
         -SourceServer dc01.a.example -SourceCredential (Get-Credential A\template.reader) `
         -Server dc01.b.example -Credential (Get-Credential B\ent.admin)
 
 .EXAMPLE
     # Mixed flow: import a previously exported JSON straight into another forest, no logon there:
-    .\Sync-KerberosAuthTemplate.ps1 -Mode Import -Path .\KerberosAuth.json `
+    .\Sync-ADCSTemplate.ps1 -Mode Import -Path .\KerberosAuth.json `
         -Server dc01.b.example -Credential (Get-Credential B\ent.admin)
 
 .EXAMPLE
     # Prove both copy pipelines (file and direct/Sync) preserve every functional attribute
     # (creates and removes one throwaway copy per pipeline):
-    .\Sync-KerberosAuthTemplate.ps1 -Mode Validate -TemplateName "KerberosAuthentication"
+    .\Sync-ADCSTemplate.ps1 -Mode Validate -TemplateName "KerberosAuthentication"
 
 .NOTES
     - Requires the ActiveDirectory PowerShell module (RSAT) for all modes. certutil and the
@@ -320,7 +320,12 @@
       copied. If you use AMA, recreate the link in the target forest manually (policy OID object ->
       a local universal group with no static members); until then, certificates from the synced
       template grant no AMA group membership there.
-    - Only version 2+ templates can be meaningfully recreated (built-in v1 templates cannot).
+    - v1 templates copy too (the export warns): the object round-trips faithfully, but Windows
+      fixes v1 semantics in code - v1 consumers match by NAME, and the definition is not editable
+      and never autoenrolls. Import a v1 template under its ORIGINAL name (a renamed copy is
+      invisible to Windows v1 consumers); for non-Windows consumers such as EJBCA, which read the
+      object and its ACL directly, a v1 copy works like any other. To get editable/autoenroll
+      behavior, duplicate it as v2+ in the source forest first.
 #>
 
 [CmdletBinding(SupportsShouldProcess)]

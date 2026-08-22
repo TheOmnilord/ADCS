@@ -8,7 +8,7 @@ Currently includes:
 - **Batch CSR submission to an Enterprise CA** via `certreq.exe`, with resume-safe CSV tracking of request IDs and automated retrieval of issued certificates.
 - **Cross-forest certificate template sync** — copy a template between forests at the directory level (all access over ADWS), either through a JSON export/import or **directly forest-to-forest in one run** (`-Mode Sync`, with optional explicit credentials per side, so no trust is required). Optional rename, controlled OID handling, and a composable enrollment ACL. Works even when the target forest has **no AD CS installed** — e.g. to publish a template that an external CA such as **EJBCA** reads for enrollment authorization.
 
-Works on Windows PowerShell 5.1 and PowerShell 7+. `Set-ADCSTemplateValidity` and `Submit-CertificateRequests` have no AD PowerShell module dependency; `Sync-KerberosAuthTemplate` requires the RSAT ActiveDirectory module (see its requirements).
+Works on Windows PowerShell 5.1 and PowerShell 7+. `Set-ADCSTemplateValidity` and `Submit-CertificateRequests` have no AD PowerShell module dependency; `Sync-ADCSTemplate` requires the RSAT ActiveDirectory module (see its requirements).
 
 ## Scripts
 
@@ -16,7 +16,7 @@ Works on Windows PowerShell 5.1 and PowerShell 7+. `Set-ADCSTemplateValidity` an
 | --- | --- |
 | [`Set-ADCSTemplateValidity.ps1`](./Set-ADCSTemplateValidity.ps1) | Bulk-update the validity period (and optionally the renewal overlap period) on one or more certificate templates, with wildcard name matching. |
 | [`Submit-CertificateRequests.ps1`](./Submit-CertificateRequests.ps1) | Batch-submit `.req`/`.csr`/`.txt` files to an ADCS CA via `certreq.exe`, track request IDs in a CSV, and later retrieve the issued certificates. |
-| [`Sync-KerberosAuthTemplate.ps1`](./Sync-KerberosAuthTemplate.ps1) | Copy the Kerberos Authentication (or any v2+) certificate template between forests — through a JSON file or directly forest-to-forest in one run — with optional rename, four OID-handling modes, per-side credentials, a composable enrollment ACL, and a round-trip validation mode. Target forest does not need AD CS. |
+| [`Sync-ADCSTemplate.ps1`](./Sync-ADCSTemplate.ps1) | Copy the Kerberos Authentication (or any other) certificate template between forests — through a JSON file or directly forest-to-forest in one run — with optional rename, four OID-handling modes, per-side credentials, a composable enrollment ACL, and a round-trip validation mode. Target forest does not need AD CS. |
 
 ---
 
@@ -292,7 +292,9 @@ In this example the lone `Error: 1` is a historical row from an earlier session,
 
 ---
 
-## Sync-KerberosAuthTemplate.ps1
+## Sync-ADCSTemplate.ps1
+
+*(Formerly `Sync-KerberosAuthTemplate.ps1` — renamed because it copies **any** certificate template; the Kerberos Authentication template merely remains its default.)*
 
 Copies a certificate template (by default the built-in **Kerberos Authentication** template) between AD forests. It reads the template's functional attributes from the source forest and recreates the template in the target forest with `New-ADObject` (all directory access over ADWS) — deriving the container DN, `objectCategory`, and (optionally) a fresh template OID from the **target** forest, then applying a composable enrollment ACL. Two interchangeable flows share the same pipeline:
 
@@ -359,57 +361,57 @@ The ACL is the part EJBCA actually consumes, so it gets first-class treatment: b
 
 **Source forest — export:**
 ```powershell
-.\Sync-KerberosAuthTemplate.ps1 -Mode Export -Path .\KerberosAuth.json
+.\Sync-ADCSTemplate.ps1 -Mode Export -Path .\KerberosAuth.json
 ```
 
 **Target forest (no AD CS needed) — import with the standard ACL:**
 ```powershell
-.\Sync-KerberosAuthTemplate.ps1 -Mode Import -Path .\KerberosAuth.json
+.\Sync-ADCSTemplate.ps1 -Mode Import -Path .\KerberosAuth.json
 ```
 
 **Import as a renamed copy with a freshly minted (forest-independent) OID:**
 ```powershell
-.\Sync-KerberosAuthTemplate.ps1 -Mode Import -Path .\KerberosAuth.json -OidHandling GenerateRandom `
+.\Sync-ADCSTemplate.ps1 -Mode Import -Path .\KerberosAuth.json -OidHandling GenerateRandom `
     -NewTemplateName "YY-KerberosAuthentication" -NewDisplayName "YY-Kerberos Authentication"
 ```
 
 **Standard ACL plus a template-admin group (what an external CA like EJBCA will read):**
 ```powershell
-.\Sync-KerberosAuthTemplate.ps1 -Mode Import -Path .\KerberosAuth.json -EnrollPrincipals @{
+.\Sync-ADCSTemplate.ps1 -Mode Import -Path .\KerberosAuth.json -EnrollPrincipals @{
     'CONTOSO\PKI-Admins' = 'FullControl'
 }
 ```
 
 **Direct sync — run in the target forest, pull from the source forest over the trust (no file):**
 ```powershell
-.\Sync-KerberosAuthTemplate.ps1 -Mode Sync -SourceServer dc01.source.example `
+.\Sync-ADCSTemplate.ps1 -Mode Sync -SourceServer dc01.source.example `
     -NewTemplateName "YY-KerberosAuthentication" -NewDisplayName "YY-Kerberos Authentication"
 ```
 
 **Direct sync from a third machine with explicit credentials on both sides (no trust needed):**
 ```powershell
-.\Sync-KerberosAuthTemplate.ps1 -Mode Sync `
+.\Sync-ADCSTemplate.ps1 -Mode Sync `
     -SourceServer dc01.a.example -SourceCredential (Get-Credential A\template.reader) `
     -Server dc01.b.example -Credential (Get-Credential B\ent.admin)
 ```
 
 **Mixed flow — import a previously exported JSON straight into another forest:**
 ```powershell
-.\Sync-KerberosAuthTemplate.ps1 -Mode Import -Path .\KerberosAuth.json `
+.\Sync-ADCSTemplate.ps1 -Mode Import -Path .\KerberosAuth.json `
     -Server dc01.b.example -Credential (Get-Credential B\ent.admin)
 ```
 
 **Prove round-trip fidelity in the source forest first (creates and removes throwaway copies — checks both the file pipeline and the direct Sync pipeline):**
 ```powershell
-.\Sync-KerberosAuthTemplate.ps1 -Mode Validate -TemplateName "KerberosAuthentication"
+.\Sync-ADCSTemplate.ps1 -Mode Validate -TemplateName "KerberosAuthentication"
 ```
 
 ### Notes
 
 - Import/Sync **refuse** to overwrite an existing template (same cn) or to duplicate an existing template OID — delete or rename instead of clobbering.
 - The companion `msPKI-Enterprise-Oid` "display" object is the only OID-container object involved, and Import/Sync register it automatically; the source forest's own OID object is deliberately **not** copied verbatim (its other attributes are forest-specific).
-- **Authentication Mechanism Assurance (AMA) links are not carried over** — `msDS-OIDToGroupLink` points at a group DN in the *source* forest. If you use AMA, recreate the link in the target forest against a local universal group, or certificates from the synced template grant no AMA group membership there. The full guidance lives in one place: `Get-Help .\Sync-KerberosAuthTemplate.ps1 -Full` (Notes).
-- Only v2+ templates can be recreated (v1 built-ins cannot); the ACL is intentionally not exported — it is forest-specific and is rebuilt from `-AclBase`/`-EnrollPrincipals` on import.
+- **Authentication Mechanism Assurance (AMA) links are not carried over** — `msDS-OIDToGroupLink` points at a group DN in the *source* forest. If you use AMA, recreate the link in the target forest against a local universal group, or certificates from the synced template grant no AMA group membership there. The full guidance lives in one place: `Get-Help .\Sync-ADCSTemplate.ps1 -Full` (Notes).
+- v1 templates copy too (with an advisory warning): the object round-trips faithfully — live-verified — but Windows fixes v1 semantics in code (name-matched, not editable, no autoenrollment), so import a v1 copy under its **original** name; non-Windows consumers like EJBCA read the object/ACL directly and are unaffected. The ACL is intentionally not exported — it is forest-specific and is rebuilt from `-AclBase`/`-EnrollPrincipals` on import.
 - Import does **not** publish the template to any CA; with a Microsoft CA that remains a separate "Certificate Templates to Issue" step, and with EJBCA you configure the template mapping there.
 - The JSON is written with a UTF-8 BOM so localized/accented display names survive a PowerShell 7 → 5.1 round-trip.
 - Run `-Mode Validate` in a lab or the source forest before the first production import or sync — it exercises both the export→import file pipeline and the direct in-memory pipeline Sync uses, and diffs every PKI attribute the source carries for each.
