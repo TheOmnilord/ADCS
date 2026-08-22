@@ -419,6 +419,33 @@ The ACL is the part EJBCA actually consumes, so it gets first-class treatment: b
 - PKI attributes the built-in type lists don't know (a genuine schema extension linked to the template class) are typed automatically from the *target* forest's schema; an attribute is dropped with a warning when the schema cannot type it, does not permit it on the template class, or types it single-valued while the source value is empty or multi-valued. (v3/v4 CNG algorithm settings are not separate attributes — they travel packed inside `msPKI-RA-Application-Policies`.)
 - v3/v4 templates can carry a **private-key SDDL** (`msPKI-Key-Security-Descriptor`) packed inside `msPKI-RA-Application-Policies`; it copies verbatim, and any domain SIDs in it are source-forest SIDs — the script warns so you can review the key ACL in the target forest.
 
+### Tests
+
+A Pester suite ([`Tests/Sync-ADCSTemplate.Tests.ps1`](./Tests/Sync-ADCSTemplate.Tests.ps1)) covers the script in four tiers (Pester **5+**; `Install-Module Pester -MinimumVersion 5.0 -Scope CurrentUser`):
+
+| Tier (`-Tag`) | Needs | Changes anything? |
+| --- | --- | --- |
+| `Unit` | nothing (pure helpers, extracted from the script by AST so the real code runs) | no |
+| `Static` | nothing (parse + comment-based help) | no |
+| `Guard` | RSAT ActiveDirectory module (no reachable DC needed) | no |
+| `Lab` | a lab forest — opt-in via `-RunLab` | **creates and removes AD objects** |
+
+```powershell
+# Safe tiers only — no changes (Unit + Static + Guard):
+Invoke-Pester -Path .\Tests\Sync-ADCSTemplate.Tests.ps1 -ExcludeTag Lab
+
+# Full run against a lab (targets are configurable; child/cross-forest are optional):
+$cfg = New-PesterContainer -Path .\Tests\Sync-ADCSTemplate.Tests.ps1 -Data @{
+    RunLab          = $true
+    AronsServer     = 'dc1.lab.example'          # target DC (a single DC)
+    ChildServer     = 'childdc.child.lab.example' # optional: child-domain root-SID path
+    NorefjellServer = '10.0.0.9'                  # optional: a SEPARATE forest without AD CS
+}
+Invoke-Pester -Container $cfg
+```
+
+The `Lab` tier is surgical: every object it creates carries a unique per-run `PESTER-<hex>` prefix, is tracked by exact DN, and is removed in teardown (with a prefix-scoped safety-net sweep as backstop); pre-existing objects are never touched. Read-backs poll with retry so a target forest that lags briefly over ADWS after a write does not cause false failures.
+
 ---
 
 ## License
