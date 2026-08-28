@@ -1,3 +1,5 @@
+<a id="top"></a>
+
 # ADCS — Active Directory Certificate Services PowerShell Tools
 
 [![CI](https://github.com/TheOmnilord/ADCS/actions/workflows/ci.yml/badge.svg)](https://github.com/TheOmnilord/ADCS/actions/workflows/ci.yml)
@@ -14,11 +16,17 @@ Works on Windows PowerShell 5.1 and PowerShell 7+. `Set-ADCSTemplateValidity` an
 
 ## Scripts
 
-| Script | Description |
-| --- | --- |
-| [`Set-ADCSTemplateValidity.ps1`](./Set-ADCSTemplateValidity.ps1) | Bulk-update the validity period (and optionally the renewal overlap period) on one or more certificate templates, with wildcard name matching. |
-| [`Submit-CertificateRequests.ps1`](./Submit-CertificateRequests.ps1) | Batch-submit `.req`/`.csr`/`.txt` files to an ADCS CA via `certreq.exe`, track request IDs in a CSV, and later retrieve the issued certificates. |
-| [`Sync-ADCSTemplate.ps1`](./Sync-ADCSTemplate.ps1) | Copy the Kerberos Authentication (or any other) certificate template between forests — through a JSON file or directly forest-to-forest in one run — with optional rename, four OID-handling modes, per-side credentials, a composable enrollment ACL, and a round-trip validation mode. Target forest does not need AD CS. |
+Jump to a script — or straight to a section within it. Each script title links to its full documentation; the source file is linked alongside.
+
+- **[Set-ADCSTemplateValidity.ps1](#set-adcstemplatevalidityps1)** &nbsp;·&nbsp; [source](./Set-ADCSTemplateValidity.ps1)
+  Bulk-update the validity period (and optionally the renewal overlap period) on one or more certificate templates, with wildcard name matching.
+  <br>↳ [Why you need this](#why-you-need-this) · [Features](#features) · [Requirements](#requirements) · [Parameters](#parameters) · [Usage](#usage) · [Output](#output) · [Notes](#notes) · [How It Works](#how-it-works)
+- **[Submit-CertificateRequests.ps1](#submit-certificaterequestsps1)** &nbsp;·&nbsp; [source](./Submit-CertificateRequests.ps1)
+  Batch-submit `.req`/`.csr`/`.txt` files to an ADCS CA via `certreq.exe`, track request IDs in a CSV, and later retrieve the issued certificates.
+  <br>↳ [Features](#features-1) · [Requirements](#requirements-1) · [Parameters](#parameters-1) · [Usage](#usage-1) · [Friendly Error Hints](#friendly-error-hints) · [Run Summary](#run-summary) · [Tracking CSV Schema](#tracking-csv-schema) · [Notes](#notes-1)
+- **[Sync-ADCSTemplate.ps1](#sync-adcstemplateps1)** &nbsp;·&nbsp; [source](./Sync-ADCSTemplate.ps1)
+  Copy the Kerberos Authentication (or any other) certificate template between forests — through a JSON file or directly forest-to-forest in one run — with optional rename, four OID-handling modes, per-side credentials, a composable enrollment ACL, and a round-trip validation mode. Target forest does not need AD CS.
+  <br>↳ [Why you need this](#why-you-need-this-1) · [Features](#features-2) · [Requirements](#requirements-2) · [Parameters](#parameters-2) · [Usage](#usage-2) · [Notes](#notes-2) · [Tests](#tests)
 
 ---
 
@@ -156,6 +164,8 @@ A color-coded summary is printed at the end:
 4. Compares against the requested value; skips if already equal.
 5. Writes the new byte array via `DirectoryEntry.InvokeSet()` and calls `SetInfo()` to commit.
 
+<sub>[↑ Back to top](#top)</sub>
+
 ---
 
 ## Submit-CertificateRequests.ps1
@@ -291,6 +301,8 @@ In this example the lone `Error: 1` is a historical row from an earlier session,
 - Issued `.cer` files are named after the source request file (e.g. `server1.req` -> `server1.cer`).
 - Empty request files are skipped with a warning.
 - A timestamped log file is created in the working directory for each run.
+
+<sub>[↑ Back to top](#top)</sub>
 
 ---
 
@@ -447,6 +459,8 @@ Invoke-Pester -Container $cfg
 ```
 
 The `Lab` tier is surgical: every object it creates carries a unique per-run `PESTER-<hex>` prefix, is tracked by exact DN, and is removed in teardown (with a prefix-scoped safety-net sweep as backstop); pre-existing objects are never touched. Read-backs poll with retry so a target forest that lags briefly over ADWS after a write does not cause false failures.
+
+<sub>[↑ Back to top](#top)</sub>
 
 ---
 
