@@ -159,7 +159,11 @@
     Clients pick changes up at the next GP refresh; force with gpupdate, then trigger
     enrollment with "certutil -pulse" (machine) / "certutil -user -pulse" (user).
 #>
-#Requires -Modules GroupPolicy
+# NOTE: deliberately NO '#Requires -Modules GroupPolicy'. On PowerShell 7 the GroupPolicy
+# module is not visible to Get-Module -ListAvailable (it lives only in the Windows PowerShell
+# module path), so #Requires would refuse to run the script even though the module loads fine
+# through the WinPSCompatSession shim. The explicit Import-Module below runs under
+# $ErrorActionPreference = 'Stop' and fails just as cleanly when the module truly is absent.
 [CmdletBinding(SupportsShouldProcess = $true, DefaultParameterSetName = 'Add')]
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingPositionalParameters', '',
     Justification = 'The script''s own small internal helpers (Get-PolValue, Test-PolDeletionOrder) are intentionally called positionally for readability; no external cmdlet is called positionally.')]

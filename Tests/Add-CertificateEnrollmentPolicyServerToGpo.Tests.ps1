@@ -12,8 +12,9 @@
       -Tag Static  The script parses and its comment-based help binds. No module, no GPO.
       -Tag Guard   Parameter-conflict validation. These invocations throw BEFORE the script
                    resolves the GPO (Get-GPO), so they contact no GPO/AD and change nothing - but
-                   the script's own '#Requires -Modules GroupPolicy' means it only loads where that
-                   module is present, so the tier is skipped when GroupPolicy is unavailable.
+                   the script imports the GroupPolicy module up front, so the tier is skipped when
+                   the module is unavailable (detection dual-probes ListAvailable AND the Windows
+                   PowerShell module path, since PowerShell 7 loads it via the WinPSCompat shim).
       -Tag Lab     Live GPO round-trips. Skipped unless -RunLab is passed; needs the GroupPolicy
                    module, a domain-joined machine, and permission to create GPOs. Surgical by
                    construction: it creates ONE throwaway GPO named PESTER-<hex> and NEVER links
@@ -48,7 +49,11 @@ param(
 BeforeDiscovery {
     # -Skip is evaluated during discovery, so the gates must be set here. The domain check runs
     # only when -RunLab is passed (short-circuit), keeping ordinary runs free of CIM calls.
-    $script:HasGP = [bool](Get-Module -ListAvailable GroupPolicy)
+    # GroupPolicy detection must dual-probe: on PowerShell 7, Get-Module -ListAvailable does NOT
+    # see the module (it lives only in the Windows PowerShell module path), yet Import-Module
+    # loads it there via the WinPSCompatSession shim - so also probe that path directly.
+    $script:HasGP = [bool](Get-Module -ListAvailable GroupPolicy) -or
+                    (Test-Path "$env:windir\System32\WindowsPowerShell\v1.0\Modules\GroupPolicy")
     $script:GpoLabReady = $RunLab -and $script:HasGP -and (Get-CimInstance Win32_ComputerSystem).PartOfDomain
 }
 

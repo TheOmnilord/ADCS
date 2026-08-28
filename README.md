@@ -596,7 +596,7 @@ Configuring CEP through Group Policy normally means the same server round-trip i
 
 ### Requirements
 
-- Windows PowerShell 5.1 or PowerShell 7+
+- Windows PowerShell 5.1 or PowerShell 7+ (on 7 the GroupPolicy module loads through the WinPSCompat shim — expect its one-time compatibility warning; the script deliberately avoids `#Requires -Modules`, which would refuse to run there)
 - The **GroupPolicy module** (GPMC / RSAT) and permission to edit the target GPO
 - An existing, linked GPO to write into (create one first, e.g. `New-GPO -Name 'PKI - Enrollment Policy' | New-GPLink -Target 'OU=...,DC=...'`)
 - Domain connectivity (the script targets the PDC emulator by default, or the DC you pass to `-Server`)
