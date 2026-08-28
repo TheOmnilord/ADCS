@@ -26,7 +26,7 @@ Jump to a script — or straight to a section within it. Each script title links
   <br>↳ [Features](#features-1) · [Requirements](#requirements-1) · [Parameters](#parameters-1) · [Usage](#usage-1) · [Friendly Error Hints](#friendly-error-hints) · [Run Summary](#run-summary) · [Tracking CSV Schema](#tracking-csv-schema) · [Notes](#notes-1)
 - **[Sync-ADCSTemplate.ps1](#sync-adcstemplateps1)** &nbsp;·&nbsp; [source](./Sync-ADCSTemplate.ps1)
   Copy the Kerberos Authentication (or any other) certificate template between forests — through a JSON file or directly forest-to-forest in one run — with optional rename, four OID-handling modes, per-side credentials, a composable enrollment ACL, and a round-trip validation mode. Target forest does not need AD CS.
-  <br>↳ [Why you need this](#why-you-need-this-1) · [Features](#features-2) · [Requirements](#requirements-2) · [Parameters](#parameters-2) · [Usage](#usage-2) · [Notes](#notes-2) · [Tests](#tests)
+  <br>↳ [Why you need this](#why-you-need-this-1) · [Features](#features-2) · [Requirements](#requirements-2) · [Parameters](#parameters-2) · [Usage](#usage-2) · [Using with EJBCA](#using-the-template-with-ejbca) · [Notes](#notes-2) · [Tests](#tests)
 
 ---
 
@@ -419,6 +419,13 @@ The ACL is the part EJBCA actually consumes, so it gets first-class treatment: b
 ```powershell
 .\Sync-ADCSTemplate.ps1 -Mode Validate -TemplateName "KerberosAuthentication"
 ```
+
+### Using the template with EJBCA
+
+EJBCA (via Microsoft auto-enrollment / MSAE) reads the template object and its ACL straight from AD as its enrollment-authorization source, so a forest that never had AD CS can still host the template. Two EJBCA-specific things to get right:
+
+- **The Subject must carry the full DN — turn it on *before* you export.** The built-in **Kerberos Authentication** template issues certificates with an **empty Subject**: the identity lives entirely in the SAN as DNS entries. EJBCA needs the **Subject** populated with the **full distinguished name**. In the source forest, edit the template (Certificate Templates MMC → *Properties* → **Subject Name** → *Build from this Active Directory information* → **Subject name format: Fully distinguished name**), which sets the `CT_FLAG_SUBJECT_REQUIRE_DIRECTORY_PATH` bit (`0x80000000`) in `msPKI-Certificate-Name-Flag`. The script copies that attribute verbatim, so the flag rides along into the synced copy — but only if it is set on the source template first.
+- **The ACL is what EJBCA consumes** for enrollment authorization — build it with `-AclBase` / `-EnrollPrincipals` (see [Features](#features-2) and [Parameters](#parameters-2)). Import/Sync does **not** publish the template to any CA; you configure the template mapping in EJBCA itself.
 
 ### Notes
 
