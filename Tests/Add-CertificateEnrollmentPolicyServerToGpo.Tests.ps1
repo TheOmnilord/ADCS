@@ -3,7 +3,7 @@
     Pester suite for Add-CertificateEnrollmentPolicyServerToGpo.ps1. Requires Pester 5+.
 
 .DESCRIPTION
-    Three tiers (no Lab tier - writing to a real GPO is out of scope for CI):
+    Three always-on tiers plus one opt-in tier:
 
       -Tag Unit    Pure helpers extracted from the script by AST (so the REAL code runs, never a
                    copy) and exercised in-process: the registry.pol binary parser (against a
@@ -14,23 +14,42 @@
                    resolves the GPO (Get-GPO), so they contact no GPO/AD and change nothing - but
                    the script's own '#Requires -Modules GroupPolicy' means it only loads where that
                    module is present, so the tier is skipped when GroupPolicy is unavailable.
+      -Tag Lab     Live GPO round-trips. Skipped unless -RunLab is passed; needs the GroupPolicy
+                   module, a domain-joined machine, and permission to create GPOs. Surgical by
+                   construction: it creates ONE throwaway GPO named PESTER-<hex> and NEVER links
+                   it (an unlinked GPO applies to zero clients), authors and removes CEP entries
+                   only inside that GPO, and deletes it in teardown by its exact tracked GUID
+                   (with a run-prefix-scoped Get-GPO sweep as backstop). Pre-existing GPOs are
+                   never touched. As a bonus, the tier re-reads the GPO's REAL registry.pol with
+                   the suite's extracted parser - validating the parser against a genuine
+                   Set-GPRegistryValue-authored file, not only the hand-built one.
 
 .EXAMPLE
-    Invoke-Pester -Path .\Tests\Add-CertificateEnrollmentPolicyServerToGpo.Tests.ps1
+    Invoke-Pester -Path .\Tests\Add-CertificateEnrollmentPolicyServerToGpo.Tests.ps1 -ExcludeTag Lab
 
 .EXAMPLE
     # Parser/extractor unit tests + parse/help only - runs without the GroupPolicy module:
     Invoke-Pester -Path .\Tests\Add-CertificateEnrollmentPolicyServerToGpo.Tests.ps1 -Tag Unit,Static
+
+.EXAMPLE
+    # Full run including the live GPO round-trip (throwaway unlinked GPO, removed afterwards):
+    $cfg = New-PesterContainer -Path .\Tests\Add-CertificateEnrollmentPolicyServerToGpo.Tests.ps1 -Data @{ RunLab = $true }
+    Invoke-Pester -Container $cfg
 #>
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', '',
-    Justification = 'the container parameter is consumed inside Pester Describe/BeforeAll scriptblocks, which the analyzer cannot see through')]
+    Justification = 'container parameters are consumed inside Pester Describe/BeforeAll scriptblocks, which the analyzer cannot see through')]
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingEmptyCatchBlock', '',
+    Justification = 'best-effort teardown paths (AfterAll GPO removal and backstop sweep) deliberately swallow per-item errors')]
 param(
+    [bool]   $RunLab     = $false,
     [string] $ScriptPath = (Join-Path (Split-Path $PSScriptRoot -Parent) 'Add-CertificateEnrollmentPolicyServerToGpo.ps1')
 )
 
 BeforeDiscovery {
-    # -Skip is evaluated during discovery, so the gate must be set here.
+    # -Skip is evaluated during discovery, so the gates must be set here. The domain check runs
+    # only when -RunLab is passed (short-circuit), keeping ordinary runs free of CIM calls.
     $script:HasGP = [bool](Get-Module -ListAvailable GroupPolicy)
+    $script:GpoLabReady = $RunLab -and $script:HasGP -and (Get-CimInstance Win32_ComputerSystem).PartOfDomain
 }
 
 Describe 'Add-CertificateEnrollmentPolicyServerToGpo' {
@@ -161,6 +180,164 @@ Describe 'Add-CertificateEnrollmentPolicyServerToGpo' {
         It 'rejects an Auto-Enrollment tuning switch without -EnableAutoEnrollmentPolicy' {
             { & $script:Gpo -GpoName 'x' -Url 'https://y/' -PolicyName 'z' -AEPolicy 5 } |
                 Should -Throw -ExpectedMessage '*only has effect together with -EnableAutoEnrollmentPolicy*'
+        }
+    }
+
+    # -------------------------------------------------------------------------------------------
+    # Lab tier: live round-trip inside ONE throwaway, never-linked GPO. Opt-in (-RunLab).
+    # Tests are SEQUENTIAL: add -> verify -> default+AE -> replace-sibling -> remove, mirroring
+    # a real rollout and teardown inside the same GPO.
+    # -------------------------------------------------------------------------------------------
+    Context 'Lab: live GPO round-trip (throwaway unlinked GPO)' -Tag 'Lab' -Skip:(-not $script:GpoLabReady) {
+
+        BeforeAll {
+            # Prefix FIRST - before anything that can throw. AfterAll runs even when BeforeAll
+            # dies, and its backstop sweep must never see an unset (= match-everything) prefix.
+            $script:Prefix = "PESTER-$([guid]::NewGuid().ToString('N').Substring(0,8))"
+            Import-Module GroupPolicy -ErrorAction Stop
+
+            # ONE throwaway GPO, created UNLINKED (New-GPO without New-GPLink): it applies to zero
+            # computers/users, so nothing this tier authors can reach a client. Tracked by GUID.
+            $script:LabGpo = New-GPO -Name "$script:Prefix CEP" -Comment 'Pester throwaway - safe to delete'
+            $script:LabGpo | Should -Not -BeNullOrEmpty
+
+            # .invalid is RFC 2606-reserved - the URL can never reach a real endpoint.
+            $script:UrlBase = "https://$($script:Prefix.ToLower()).lab.invalid/ejbca/msae/CEPService"
+            $script:LabUrl  = "$script:UrlBase`?alias"
+            $script:LabName = "$script:Prefix Policy"
+
+            # Independent oracles (reference implementations, not the script's code).
+            $sha1 = [System.Security.Cryptography.SHA1]::Create()
+            $script:ExpectedKey = -join ($sha1.ComputeHash([System.Text.Encoding]::Unicode.GetBytes($script:LabUrl.ToLowerInvariant())) |
+                                         ForEach-Object { $_.ToString('x2') })
+            $h = [int64]0
+            foreach ($c in $script:LabName.ToCharArray()) { $h = ($h * 31 + [int64]$c) -band 4294967295 }
+            if ($h -ge 2147483648) { $h -= 4294967296 }
+            $script:ExpectedPid = "$h"
+
+            # Expected AD-row PolicyID: the domain object's objectGUID, as the script formats it.
+            $dn = ([ADSI]'LDAP://RootDSE').defaultNamingContext.Value
+            $script:ExpectedAdPid = '{' + (New-Object Guid (, ([byte[]]([ADSI]"LDAP://$dn").Properties['objectGUID'][0]))).ToString().ToUpper() + '}'
+
+            $script:AdKey     = '37c9dc30f207f27f61a2f7c3aed598a6e2920b54'
+            $script:GpoParams = @{ GpoName = "$script:Prefix CEP" }
+            $sysvol = "\\$($script:LabGpo.DomainName)\SYSVOL\$($script:LabGpo.DomainName)\Policies\{$($script:LabGpo.Id)}"
+            $script:PolMachine = "$sysvol\Machine\registry.pol"
+            $script:PolUser    = "$sysvol\User\registry.pol"
+
+            # Read this GPO's REAL registry.pol with the extracted parser, with a short retry in
+            # case SYSVOL is a beat behind the GroupPolicy cmdlets (same-box PDC: normally instant).
+            function script:Read-LabPol {
+                param([string]$Path, [int]$MinRecords = 1, [int]$TimeoutSec = 10)
+                $deadline = (Get-Date).AddSeconds($TimeoutSec)
+                do {
+                    $recs = @(Read-PolRecords -Path $Path)
+                    if ($recs.Count -ge $MinRecords) { return $recs }
+                    Start-Sleep -Milliseconds 500
+                } while ((Get-Date) -lt $deadline)
+                return @(Read-PolRecords -Path $Path)
+            }
+        }
+
+        AfterAll {
+            # Surgical: delete ONLY the throwaway GPO, by its exact tracked GUID.
+            if ($script:LabGpo) {
+                try { Remove-GPO -Guid $script:LabGpo.Id -Confirm:$false } catch { Write-Warning "Failed to remove lab GPO $($script:LabGpo.Id): $_" }
+            }
+            # Backstop, scoped to THIS run's fresh-GUID prefix (cannot match a pre-existing GPO).
+            # STRUCTURAL GUARD: the sweep runs only when the prefix has its full PESTER-<hex8>
+            # shape - an unset/empty prefix would otherwise degenerate the filter to -like "*"
+            # and delete every GPO in the domain. Never widen this.
+            if ($script:Prefix -match '^PESTER-[0-9a-f]{8}$') {
+                foreach ($g in @(Get-GPO -All | Where-Object { $_.DisplayName -like "$script:Prefix*" })) {
+                    try { Remove-GPO -Guid $g.Id -Confirm:$false } catch { }
+                    Write-Warning "AfterAll backstop removed an untracked test GPO: $($g.DisplayName)"
+                }
+            } else {
+                Write-Warning "Backstop sweep skipped: run prefix is unset or malformed ('$script:Prefix')."
+            }
+        }
+
+        It 'Add authors the CEP entry and the AD policy row into the GPO' {
+            $o = & $script:Gpo @script:GpoParams -Url $script:LabUrl -PolicyName $script:LabName -Confirm:$false 3>$null
+            $o.EntryApplied | Should -BeTrue
+            $o.ADPolicyRow  | Should -BeExactly 'applied'
+            $o.GpoId        | Should -Be $script:LabGpo.Id
+            $o.Key          | Should -BeExactly "HKLM\SOFTWARE\Policies\Microsoft\Cryptography\PolicyServers\$script:ExpectedKey"
+        }
+
+        It 'the GPMC API (Get-GPRegistryValue) sees every authored value' {
+            $vals = Get-GPRegistryValue -Guid $script:LabGpo.Id -Key "HKLM\SOFTWARE\Policies\Microsoft\Cryptography\PolicyServers\$script:ExpectedKey"
+            $map = @{}; foreach ($v in $vals) { $map[$v.ValueName] = $v.Value }
+            $map['URL']          | Should -BeExactly $script:LabUrl
+            $map['PolicyID']     | Should -BeExactly $script:ExpectedPid
+            $map['FriendlyName'] | Should -BeExactly $script:LabName
+            [int]$map['Flags']     | Should -Be 0x14
+            [int]$map['AuthFlags'] | Should -Be 0x2
+        }
+
+        It 'the REAL registry.pol parses with the extracted parser: entry, AD row, and Cost round-trip' {
+            $recs = script:Read-LabPol -Path $script:PolMachine -MinRecords 12   # 2 entries x 6 values
+            $entries = @(Get-PolEntries $recs)
+            $entries.Count | Should -Be 2
+            ($entries | Where-Object Key -eq $script:ExpectedKey).PolicyID | Should -BeExactly $script:ExpectedPid
+            $ad = $entries | Where-Object Key -eq $script:AdKey
+            $ad.URL      | Should -BeExactly 'LDAP:'
+            $ad.PolicyID | Should -BeExactly $script:ExpectedAdPid
+            # Cost survives as full-range unsigned DWORDs in the .pol data.
+            [uint32](Get-PolValue $recs "$script:relBase\$script:ExpectedKey" 'Cost') | Should -Be ([uint32]0x7FFFFFFD)
+            [uint32](Get-PolValue $recs "$script:relBase\$script:AdKey" 'Cost')       | Should -Be ([uint32]4294967295)
+        }
+
+        It '-SetAsDefault and -EnableAutoEnrollmentPolicy author the marker and AE values' {
+            $o = & $script:Gpo @script:GpoParams -Url $script:LabUrl -PolicyName $script:LabName `
+                     -SetAsDefault -EnableAutoEnrollmentPolicy -Confirm:$false 3>$null
+            $o.DefaultChanged | Should -BeTrue
+            $recs = script:Read-LabPol -Path $script:PolMachine -MinRecords 16
+            (Get-PolValue $recs $script:relBase '') | Should -BeExactly $script:ExpectedPid
+            $ae = Get-GPRegistryValue -Guid $script:LabGpo.Id -Key 'HKLM\SOFTWARE\Policies\Microsoft\Cryptography\AutoEnrollment'
+            $map = @{}; foreach ($v in $ae) { $map[$v.ValueName] = $v.Value }
+            [int]$map['AEPolicy']                 | Should -Be 7
+            [int]$map['OfflineExpirationPercent'] | Should -Be 10
+            $map['OfflineExpirationStoreNames']   | Should -BeExactly 'MY'
+        }
+
+        It '-ReplaceExisting removes a same-PolicyID sibling but never the AD row' {
+            $sibUrl = "$script:UrlBase`?stale"
+            $null = & $script:Gpo @script:GpoParams -Url $sibUrl -PolicyName $script:LabName -PolicyId $script:ExpectedPid -Confirm:$false 3>$null
+            $sha1 = [System.Security.Cryptography.SHA1]::Create()
+            $sibKey = -join ($sha1.ComputeHash([System.Text.Encoding]::Unicode.GetBytes($sibUrl.ToLowerInvariant())) |
+                             ForEach-Object { $_.ToString('x2') })
+            (Get-PolEntries (script:Read-LabPol -Path $script:PolMachine)).Key | Should -Contain $sibKey
+
+            $o = & $script:Gpo @script:GpoParams -Url $script:LabUrl -PolicyName $script:LabName -ReplaceExisting -Confirm:$false 3>$null
+            @($o.DuplicatesRemoved) | Should -Contain $sibUrl
+            $keysNow = @((Get-PolEntries (script:Read-LabPol -Path $script:PolMachine)).Key)
+            $keysNow | Should -Not -Contain $sibKey
+            $keysNow | Should -Contain $script:AdKey
+        }
+
+        It '-Remove deletes the entry, clears the orphaned marker, and reports what remains' {
+            $o = & $script:Gpo @script:GpoParams -Url $script:LabUrl -Remove -Confirm:$false 3>$null
+            $o.RemovedEntry   | Should -BeTrue
+            $o.DefaultCleared | Should -BeTrue
+            $recs = script:Read-LabPol -Path $script:PolMachine
+            $keysNow = @((Get-PolEntries $recs).Key)
+            $keysNow | Should -Not -Contain $script:ExpectedKey
+            $keysNow | Should -Contain $script:AdKey                            # AD row is left alone
+            (Get-PolValue $recs $script:relBase '') | Should -BeNullOrEmpty     # marker cleared
+            @($o.Notes) -match 'Auto-Enrollment' | Should -Not -BeNullOrEmpty   # AE flagged as remaining
+        }
+
+        It 'User scope: add and remove round-trip in the User half of the GPO' {
+            $o = & $script:Gpo @script:GpoParams -Url $script:LabUrl -PolicyName $script:LabName -Scope User -Confirm:$false 3>$null
+            $o.EntryApplied | Should -BeTrue
+            $o.Key | Should -BeExactly "HKCU\SOFTWARE\Policies\Microsoft\Cryptography\PolicyServers\$script:ExpectedKey"
+            (Get-PolEntries (script:Read-LabPol -Path $script:PolUser)).Key | Should -Contain $script:ExpectedKey
+
+            $o = & $script:Gpo @script:GpoParams -Url $script:LabUrl -Scope User -Remove -Confirm:$false 3>$null
+            $o.RemovedEntry | Should -BeTrue
+            @((Get-PolEntries (Read-PolRecords -Path $script:PolUser)).Key) | Should -Not -Contain $script:ExpectedKey
         }
     }
 }

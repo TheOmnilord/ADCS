@@ -559,10 +559,17 @@ It also handles the parts the dialog hides: on the Group Policy hives it preserv
 
 ### Tests
 
-The Pester suite ([`Tests/Add-CertificateEnrollmentPolicyServerOffline.Tests.ps1`](./Tests/Add-CertificateEnrollmentPolicyServerOffline.Tests.ps1)) runs three always-safe tiers — **Unit** (the real subkey/PolicyID/flag derivations, exercised through `-WhatIf` so nothing is written), **Static** (parse + comment-based help), and **Guard** (parameter-conflict validation). No module, no AD, no elevation, no changes:
+The Pester suite ([`Tests/Add-CertificateEnrollmentPolicyServerOffline.Tests.ps1`](./Tests/Add-CertificateEnrollmentPolicyServerOffline.Tests.ps1)) runs three always-safe tiers — **Unit** (the real subkey/PolicyID/flag derivations, exercised through `-WhatIf` so nothing is written), **Static** (parse + comment-based help), and **Guard** (parameter-conflict validation) — plus an opt-in **Lab** tier of live registry round-trips (add → idempotent update → default marker → replace-sibling → remove, all verified against independent oracles). The safe tiers need no module, no AD, no elevation, and change nothing:
 
 ```powershell
-Invoke-Pester -Path .\Tests\Add-CertificateEnrollmentPolicyServerOffline.Tests.ps1
+Invoke-Pester -Path .\Tests\Add-CertificateEnrollmentPolicyServerOffline.Tests.ps1 -ExcludeTag Lab
+```
+
+The Lab tier **writes to this machine's registry** — only to the user-configured stores (`LocalUser` always, `LocalMachine` when elevated), never to the GP hives (on a domain member those tattoo pseudo-policy; the GPO suite covers Group Policy delivery instead). It is surgical: entries carry a per-run `PESTER-<hex>` name and a URL under the RFC-reserved `.invalid` TLD, every created key is tracked by exact path and removed in teardown, a pre-existing `(Default)` marker is snapshotted and restored, and a `PolicyServers` base key is removed only if the run created it and it ends the run empty:
+
+```powershell
+$cfg = New-PesterContainer -Path .\Tests\Add-CertificateEnrollmentPolicyServerOffline.Tests.ps1 -Data @{ RunLab = $true }
+Invoke-Pester -Container $cfg
 ```
 
 <sub>[↑ Back to top](#top)</sub>
@@ -647,10 +654,17 @@ Configuring CEP through Group Policy normally means the same server round-trip i
 
 ### Tests
 
-The Pester suite ([`Tests/Add-CertificateEnrollmentPolicyServerToGpo.Tests.ps1`](./Tests/Add-CertificateEnrollmentPolicyServerToGpo.Tests.ps1)) runs three tiers — **Unit** (the real `Registry.pol` binary parser and entry/value extractors, exercised against a hand-built `.pol` stream; no module needed), **Static** (parse + help), and **Guard** (parameter-conflict validation that throws before any GPO is touched; needs the GroupPolicy module, self-skips without it). No GPO is written:
+The Pester suite ([`Tests/Add-CertificateEnrollmentPolicyServerToGpo.Tests.ps1`](./Tests/Add-CertificateEnrollmentPolicyServerToGpo.Tests.ps1)) runs three always-safe tiers — **Unit** (the real `Registry.pol` binary parser and entry/value extractors, exercised against a hand-built `.pol` stream; no module needed), **Static** (parse + help), and **Guard** (parameter-conflict validation that throws before any GPO is touched; needs the GroupPolicy module, self-skips without it) — plus an opt-in **Lab** tier that runs the full lifecycle (author → verify via GPMC *and* the real `registry.pol` → default marker + Auto-Enrollment → replace-sibling → remove, Machine and User scope) inside **one throwaway, never-linked GPO** that applies to zero clients and is deleted afterwards by its exact tracked GUID. The safe tiers write no GPO:
 
 ```powershell
-Invoke-Pester -Path .\Tests\Add-CertificateEnrollmentPolicyServerToGpo.Tests.ps1
+Invoke-Pester -Path .\Tests\Add-CertificateEnrollmentPolicyServerToGpo.Tests.ps1 -ExcludeTag Lab
+```
+
+The Lab tier needs a domain-joined machine, the GroupPolicy module, and permission to create GPOs (a lab DC is ideal); pre-existing GPOs are never touched:
+
+```powershell
+$cfg = New-PesterContainer -Path .\Tests\Add-CertificateEnrollmentPolicyServerToGpo.Tests.ps1 -Data @{ RunLab = $true }
+Invoke-Pester -Container $cfg
 ```
 
 <sub>[↑ Back to top](#top)</sub>
