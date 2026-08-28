@@ -10,7 +10,7 @@ Currently includes:
 
 - **Bulk certificate template validity updates** — useful for rolling out the CA/Browser Forum **SC-081** validity reductions (200 days from March 2026, 100 days from March 2027, 47 days from March 2029) across many templates at once.
 - **Batch CSR submission to an Enterprise CA** via `certreq.exe`, with resume-safe CSV tracking of request IDs and automated retrieval of issued certificates.
-- **Cross-forest certificate template sync** — copy a template between forests at the directory level (all access over ADWS), either through a JSON export/import or **directly forest-to-forest in one run** (`-Mode Sync`, with optional explicit credentials per side, so no trust is required). Optional rename, controlled OID handling, and a composable enrollment ACL. Works even when the target forest has **no AD CS installed** — e.g. to publish a template that an external CA such as **EJBCA** reads for enrollment authorization.
+- **Cross-forest certificate template sync** — copy a template between forests at the directory level (all access over ADWS), either through a JSON export/import or **directly forest-to-forest in one run** (`-Mode Sync`, with optional explicit credentials per side, so no trust is required). Optional rename, controlled OID handling, and a composable enrollment ACL. Works even when the target forest has **no AD CS installed** — e.g. to publish a template that an external CA reads for enrollment authorization.
 
 Works on Windows PowerShell 5.1 and PowerShell 7+. `Set-ADCSTemplateValidity` and `Submit-CertificateRequests` have no AD PowerShell module dependency; `Sync-ADCSTemplate` requires the RSAT ActiveDirectory module (see its requirements).
 
@@ -321,10 +321,10 @@ The flows mix freely: a JSON exported earlier imports into a remote forest with 
 
 There is no supported UI path for moving a template definition between forests, and the classic `certutil -dsTemplate` / `-dsAddTemplate` round-trip cannot rename the template, always carries the source OID, and leaves the ACL to you. This script does the whole job, including two scenarios the certutil approach cannot handle:
 
-- **Target forest without AD CS.** The template objects live in the (CA-independent) `Certificate Templates` container that every forest has, so you can publish a template into a forest that never had AD CS — e.g. so an external CA such as **EJBCA** (Microsoft auto-enrollment / MSAE) can read the template and its ACL as the enrollment-authorization source.
+- **Target forest without AD CS.** The template objects live in the (CA-independent) `Certificate Templates` container that every forest has, so you can publish a template into a forest that never had AD CS — e.g. so an external CA can read the template and its ACL as the enrollment-authorization source. (Using this with **EJBCA** has a few specifics of its own — see [Using with EJBCA](#using-the-template-with-ejbca).)
 - **Renamed copies with controlled identity.** Import under a new cn/display name, and choose whether the OID is carried over or freshly minted.
 
-The ACL is the part EJBCA actually consumes, so it gets first-class treatment: bases (`-AclBase`) that either replace or extend the schema-default DACL, plus per-principal additions (`-EnrollPrincipals`) for enrollees and template admins. Principal resolution is fail-closed: a name matching BOTH a well-known token and a directory object with a *different* SID, or matching more than one object, is refused rather than guessed (disambiguate with a SID or `DOMAIN\` prefix); built-in groups' own names like `Domain Admins` resolve normally, since both readings give the same SID. Well-known SID/RID tokens are language-invariant, so the script also works on **non-English forests** where group names are localized.
+The ACL is the part an external CA actually consumes, so it gets first-class treatment: bases (`-AclBase`) that either replace or extend the schema-default DACL, plus per-principal additions (`-EnrollPrincipals`) for enrollees and template admins. Principal resolution is fail-closed: a name matching BOTH a well-known token and a directory object with a *different* SID, or matching more than one object, is refused rather than guessed (disambiguate with a SID or `DOMAIN\` prefix); built-in groups' own names like `Domain Admins` resolve normally, since both readings give the same SID. Well-known SID/RID tokens are language-invariant, so the script also works on **non-English forests** where group names are localized.
 
 ### Features
 
@@ -389,7 +389,7 @@ The ACL is the part EJBCA actually consumes, so it gets first-class treatment: b
     -NewTemplateName "YY-KerberosAuthentication" -NewDisplayName "YY-Kerberos Authentication"
 ```
 
-**Standard ACL plus a template-admin group (what an external CA like EJBCA will read):**
+**Standard ACL plus a template-admin group (what an external CA will read):**
 ```powershell
 .\Sync-ADCSTemplate.ps1 -Mode Import -Path .\KerberosAuth.json -EnrollPrincipals @{
     'CONTOSO\PKI-Admins' = 'FullControl'
@@ -422,18 +422,22 @@ The ACL is the part EJBCA actually consumes, so it gets first-class treatment: b
 
 ### Using the template with EJBCA
 
-EJBCA (via Microsoft auto-enrollment / MSAE) reads the template object and its ACL straight from AD as its enrollment-authorization source, so a forest that never had AD CS can still host the template. Two EJBCA-specific things to get right:
+**EJBCA** can use an AD certificate template as its enrollment-authorization source through Microsoft auto-enrollment (**MSAE**): it reads the template object and its ACL straight from AD, so a forest that never had AD CS can still host the template. The general cross-forest mechanics are covered above; the points below are what's specific to EJBCA.
 
-- **The Subject must carry the full DN — turn it on *before* you export.** The built-in **Kerberos Authentication** template issues certificates with an **empty Subject**: the identity lives entirely in the SAN as DNS entries. EJBCA needs the **Subject** populated with the **full distinguished name**. In the source forest, edit the template (Certificate Templates MMC → *Properties* → **Subject Name** → *Build from this Active Directory information* → **Subject name format: Fully distinguished name**), which sets the `CT_FLAG_SUBJECT_REQUIRE_DIRECTORY_PATH` bit (`0x80000000`) in `msPKI-Certificate-Name-Flag`. The script copies that attribute verbatim, so the flag rides along into the synced copy — but only if it is set on the source template first.
-- **The ACL is what EJBCA consumes** for enrollment authorization — build it with `-AclBase` / `-EnrollPrincipals` (see [Features](#features-2) and [Parameters](#parameters-2)). Import/Sync does **not** publish the template to any CA; you configure the template mapping in EJBCA itself.
+- **The Subject cannot be empty.** The built-in **Kerberos Authentication** template issues certificates with an **empty Subject** — the identity lives entirely in the SAN as DNS entries — and EJBCA cannot use a template that produces no Subject. Fix it on the **source** template, **before** you export/sync: Certificate Templates MMC → *Properties* → **Subject Name** → *Build from this Active Directory information* → set **Subject name format** to **Fully distinguished name**. That sets the `CT_FLAG_SUBJECT_REQUIRE_DIRECTORY_PATH` bit (`0x80000000`) in `msPKI-Certificate-Name-Flag`; the script copies that attribute verbatim, so the setting rides into the synced copy — but only if it is on the source template first.
+  - **This is not unique to Kerberos Authentication.** Any template that would otherwise issue an **empty** Subject needs the same treatment before EJBCA can use it.
+  - **Full DN vs. common name:** the hard rule is only that the Subject must not be empty. Whether a bare **Common Name** is enough — or the **full distinguished name** is specifically required — depends on your EJBCA end-entity profile; "Fully distinguished name" is the safe choice that always populates the Subject.
+- **The ACL is what EJBCA consumes** for enrollment authorization — build it with `-AclBase` / `-EnrollPrincipals` (see [Features](#features-2) and [Parameters](#parameters-2)).
+- **Publishing is separate.** Import/Sync does **not** publish the template to any CA; you configure the template mapping in EJBCA itself.
+- **No default templates to export from?** The default templates (Kerberos Authentication included) normally arrive in AD when the first Enterprise CA is installed, so a forest that never had a CA won't have them — and the template objects are plain AD objects, so no running CA is needed to hold them. `certutil -InstallDefaultTemplates` writes the standard set into AD; run it as an **Enterprise Admin** (add `-dc <DCName>` to target a specific DC). That gives you a stock template to edit (turn on the full-DN Subject above) and then export or sync.
 
 ### Notes
 
 - Import/Sync **refuse** to overwrite an existing template (same cn) or to duplicate an existing template OID — delete or rename instead of clobbering.
 - The companion `msPKI-Enterprise-Oid` "display" object is the only OID-container object involved, and Import/Sync register it automatically; the source forest's own OID object is deliberately **not** copied verbatim (its other attributes are forest-specific).
 - **Authentication Mechanism Assurance (AMA) links are not carried over** — `msDS-OIDToGroupLink` points at a group DN in the *source* forest. If you use AMA, recreate the link in the target forest against a local universal group, or certificates from the synced template grant no AMA group membership there. The full guidance lives in one place: `Get-Help .\Sync-ADCSTemplate.ps1 -Full` (Notes).
-- v1 templates copy too (with an advisory warning): the object round-trips faithfully — live-verified — but Windows fixes v1 semantics in code (name-matched, not editable, no autoenrollment), so import a v1 copy under its **original** name; non-Windows consumers like EJBCA read the object/ACL directly and are unaffected. The ACL is intentionally not exported — it is forest-specific and is rebuilt from `-AclBase`/`-EnrollPrincipals` on import.
-- Import does **not** publish the template to any CA; with a Microsoft CA that remains a separate "Certificate Templates to Issue" step, and with EJBCA you configure the template mapping there.
+- v1 templates copy too (with an advisory warning): the object round-trips faithfully — live-verified — but Windows fixes v1 semantics in code (name-matched, not editable, no autoenrollment), so import a v1 copy under its **original** name; non-Windows consumers that read the object/ACL directly are unaffected. The ACL is intentionally not exported — it is forest-specific and is rebuilt from `-AclBase`/`-EnrollPrincipals` on import.
+- Import does **not** publish the template to any CA; with a Microsoft CA that remains a separate "Certificate Templates to Issue" step. (For EJBCA, template mapping is configured there — see [Using with EJBCA](#using-the-template-with-ejbca).)
 - The JSON is written with a UTF-8 BOM so localized/accented display names survive a PowerShell 7 → 5.1 round-trip.
 - Run `-Mode Validate` in a lab or the source forest before the first production import or sync — it exercises both the export→import file pipeline and the direct in-memory pipeline Sync uses, and diffs every PKI attribute the source carries for each.
 - Parameters a mode does not consume are rejected up front (e.g. `-StripOid` with `-Mode Import`, `-OidRoot` without `GenerateFromRoot`, `-AclBase` with `-SkipAcl`) instead of being silently ignored.
