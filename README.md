@@ -4,15 +4,16 @@
 
 [![CI](https://github.com/TheOmnilord/ADCS/actions/workflows/ci.yml/badge.svg)](https://github.com/TheOmnilord/ADCS/actions/workflows/ci.yml)
 
-A set of PowerShell scripts for administering **Active Directory Certificate Services** (AD CS / ADCS) from the command line. Built for Windows PKI administrators who need to manage certificate templates and process certificate requests at scale, without clicking through the Certificate Templates MMC snap-in or the Certification Authority console.
+A set of PowerShell scripts for administering **Active Directory Certificate Services** (AD CS / ADCS) from the command line. Built for Windows PKI administrators who need to manage certificate templates, process certificate requests, and configure enrollment clients at scale — without clicking through the Certificate Templates MMC snap-in, the Certification Authority console, or the per-machine "Certificate Enrollment Policy" dialog.
 
 Currently includes:
 
 - **Bulk certificate template validity updates** — useful for rolling out the CA/Browser Forum **SC-081** validity reductions (200 days from March 2026, 100 days from March 2027, 47 days from March 2029) across many templates at once.
 - **Batch CSR submission to an Enterprise CA** via `certreq.exe`, with resume-safe CSV tracking of request IDs and automated retrieval of issued certificates.
 - **Cross-forest certificate template sync** — copy a template between forests at the directory level (all access over ADWS), either through a JSON export/import or **directly forest-to-forest in one run** (`-Mode Sync`, with optional explicit credentials per side, so no trust is required). Optional rename, controlled OID handling, and a composable enrollment ACL. Works even when the target forest has **no AD CS installed** — e.g. to publish a template that an external CA reads for enrollment authorization.
+- **Client enrollment-policy (CEP) configuration** — point Windows enrollment clients at an **EJBCA** (or other MS-XCEP) policy server so they enroll against the synced template, computing every registry value **offline** (no "Validate Server" round-trip). Apply it to a single machine or a local GP hive, or fleet-wide by authoring the setting straight into a domain **GPO** (with optional Auto-Enrollment). This is the client half of the template-sync story above.
 
-Works on Windows PowerShell 5.1 and PowerShell 7+. `Set-ADCSTemplateValidity` and `Submit-CertificateRequests` have no AD PowerShell module dependency; `Sync-ADCSTemplate` requires the RSAT ActiveDirectory module (see its requirements).
+Works on Windows PowerShell 5.1 and PowerShell 7+. `Set-ADCSTemplateValidity` and `Submit-CertificateRequests` have no AD PowerShell module dependency; `Sync-ADCSTemplate` requires the RSAT ActiveDirectory module and `Add-CertificateEnrollmentPolicyServerToGpo` the GroupPolicy module (see each script's requirements); `Add-CertificateEnrollmentPolicyServerOffline` needs no module.
 
 ## Scripts
 
@@ -27,6 +28,12 @@ Jump to a script — or straight to a section within it. Each script title links
 - **[Sync-ADCSTemplate.ps1](#sync-adcstemplateps1)** &nbsp;·&nbsp; [source](./Sync-ADCSTemplate.ps1)
   Copy the Kerberos Authentication (or any other) certificate template between forests — through a JSON file or directly forest-to-forest in one run — with optional rename, four OID-handling modes, per-side credentials, a composable enrollment ACL, and a round-trip validation mode. Target forest does not need AD CS.
   <br>↳ [Why you need this](#why-you-need-this-1) · [Features](#features-2) · [Requirements](#requirements-2) · [Parameters](#parameters-2) · [Usage](#usage-2) · [Using with EJBCA](#using-the-template-with-ejbca) · [Notes](#notes-2) · [Tests](#tests)
+- **[Add-CertificateEnrollmentPolicyServerOffline.ps1](#add-certificateenrollmentpolicyserverofflineps1)** &nbsp;·&nbsp; [source](./Add-CertificateEnrollmentPolicyServerOffline.ps1)
+  Register (or remove) an EJBCA/MSAE enrollment-policy server on one machine — in the user-configured store or a Group Policy hive — writing the exact registry values the CEP dialog produces, computed entirely offline.
+  <br>↳ [Why you need this](#why-you-need-this-2) · [Features](#features-3) · [Requirements](#requirements-3) · [Parameters](#parameters-3) · [Usage](#usage-3) · [Notes](#notes-3) · [Tests](#tests-1)
+- **[Add-CertificateEnrollmentPolicyServerToGpo.ps1](#add-certificateenrollmentpolicyservertogpops1)** &nbsp;·&nbsp; [source](./Add-CertificateEnrollmentPolicyServerToGpo.ps1)
+  Author (or remove) the same enrollment-policy setting directly in a domain **GPO** via `Set-GPRegistryValue`, for fleet-wide rollout — with optional Auto-Enrollment, AD-policy-row preservation, and Registry.pol safety checks.
+  <br>↳ [Why you need this](#why-you-need-this-3) · [Features](#features-4) · [Requirements](#requirements-4) · [Parameters](#parameters-4) · [Usage](#usage-4) · [Notes](#notes-4) · [Tests](#tests-2)
 
 ---
 
@@ -430,6 +437,7 @@ The ACL is the part an external CA actually consumes, so it gets first-class tre
 - **The ACL is what EJBCA consumes** for enrollment authorization — build it with `-AclBase` / `-EnrollPrincipals` (see [Features](#features-2) and [Parameters](#parameters-2)).
 - **Publishing is separate.** Import/Sync does **not** publish the template to any CA; you configure the template mapping in EJBCA itself.
 - **No default templates to export from?** The default templates (Kerberos Authentication included) normally arrive in AD when the first Enterprise CA is installed, so a forest that never had a CA won't have them — but they are plain AD objects, so no CA is needed to hold them. `certutil -InstallDefaultTemplates` writes the standard set into AD and **works with no AD CS role installed at all** (verified) — run it as an **Enterprise Admin** (add `-dc <DCName>` to target a specific DC). That gives you a stock template to edit (turn on the full-DN Subject above) and then export or sync.
+- **Then point the clients at EJBCA.** Publishing the template is only half the job — Windows clients still need to be told to enroll against the EJBCA policy server. That is what [`Add-CertificateEnrollmentPolicyServerOffline`](#add-certificateenrollmentpolicyserverofflineps1) (per machine) and [`Add-CertificateEnrollmentPolicyServerToGpo`](#add-certificateenrollmentpolicyservertogpops1) (fleet-wide via GPO) do, computing the CEP registry values offline from the same EJBCA alias.
 
 ### Notes
 
@@ -470,6 +478,180 @@ Invoke-Pester -Container $cfg
 ```
 
 The `Lab` tier is surgical: every object it creates carries a unique per-run `PESTER-<hex>` prefix, is tracked by exact DN, and is removed in teardown (with a prefix-scoped safety-net sweep as backstop); pre-existing objects are never touched. Read-backs poll with retry so a target forest that lags briefly over ADWS after a write does not cause false failures.
+
+<sub>[↑ Back to top](#top)</sub>
+
+---
+
+## Add-CertificateEnrollmentPolicyServerOffline.ps1
+
+Registers (or removes) a **Certificate Enrollment Policy (CEP)** server in the registry entirely **offline** — no "Validate Server" round-trip, no contact with the policy server at all. It writes the same values the *"Certificate Services Client – Certificate Enrollment Policy"* dialog produces, but computes everything locally: the SHA-1 subkey name from the URL, and (for EJBCA/MSAE) the PolicyID from the alias's Policy Name.
+
+### Why you need this
+
+The built-in dialog (and the `X509Enrollment` COM path behind it) insists on reaching the policy server's MS-XCEP `GetPolicies` endpoint before it will save anything. That is exactly what you cannot do when you are staging a machine before the PKI is reachable, building a golden image, working in an air-gapped or change-controlled environment, or scripting an identical config across many machines. This script derives every value locally and writes it directly, so enrollment-policy configuration becomes a repeatable, unattended step.
+
+It also handles the parts the dialog hides: on the Group Policy hives it preserves the built-in **AD enrollment policy row** (without it, enabling GP-based CEP silently removes the Active Directory enrollment policy and autoenrollment against AD-published templates stops), and it manages the `PolicyServers` root **Flags** DISABLE bits.
+
+### Features
+
+- **Fully offline derivation** — SHA-1 over the UTF-16LE bytes of the invariant-lowercased URL for the subkey; EJBCA MSAE PolicyID = Java `String.hashCode()` of the Policy Name (or pass `-PolicyId` for a GUID-returning CEP such as Microsoft's)
+- **Four target locations** — `LocalMachine` / `LocalUser` (the user-configured store `certlm.msc` / `certmgr.msc` manages) and `GPMachine` / `GPUser` (the Group Policy hives)
+- **AD enrollment policy row preserved** on the GP locations (opt out with `-SkipADPolicy`), so GP-based CEP does not knock out the AD default policy
+- **Root Flags handled as DISABLE bits** — clears the "ignore GP list" bit (`0x2`) if present; `-DisableUserConfigured` / `-EnableUserConfigured` toggle the "ignore user-configured servers" bit (`0x4`); existing bits are preserved across runs
+- **Read-back verification** of every value written (missing values detected); the summary reports the *actual* registry state and per-gate outcomes
+- **`-SetAsDefault` / `-ClearDefault`** for the unnamed `(Default)` interactive-enrollment marker, and **`-ReplaceExisting`** to clean up stale same-PolicyID siblings from a superseded URL
+- **`-Remove`** mode, **`-WhatIf` / `-Confirm`** support, and structured `PSCustomObject` output
+
+### Requirements
+
+- Windows PowerShell 5.1 or PowerShell 7+ — **no PowerShell module required**
+- An **elevated** session for `-Location LocalMachine`, `GPMachine`, or `GPUser` (`LocalUser` needs no elevation)
+- Domain connectivity only for the GP-location AD policy row (on a workgroup machine that lookup is skipped with a warning)
+- **Tattooing caveat:** writing directly into the GP hives (`GPMachine` / `GPUser`) on a **domain member** produces pseudo-policy backed by no GPO — invisible to RSoP/`gpresult`, not reverted by `gpupdate`, read-only in the certificate MMC. On domain members use [`Add-CertificateEnrollmentPolicyServerToGpo`](#add-certificateenrollmentpolicyservertogpops1) instead; the GP locations here are for standalone/workgroup machines and lab work.
+
+### Parameters
+
+| Parameter | Type | Required | Default | Description |
+| --- | --- | --- | --- | --- |
+| `-Url` | `string` | Yes | | Full CEP URI, e.g. `https://pki.example.net/ejbca/msae/CEPService?alias`. Used verbatim for the SHA-1 subkey and by clients' `GetPolicies` calls; must be an absolute http/https URI. |
+| `-PolicyName` | `string` | Add only | | EJBCA MSAE alias "Policy Name". Becomes `FriendlyName` and (unless `-PolicyId` is set) is hashed **verbatim** to the PolicyID — keep it identical to EJBCA. |
+| `-PolicyId` | `string` | No | hash of `-PolicyName` | Explicit PolicyID for non-EJBCA servers (must match the server's `GetPolicies` response). |
+| `-Location` | `LocalMachine` / `LocalUser` / `GPMachine` / `GPUser` | No | `LocalMachine` | Which store to write. See the tattooing caveat for the GP hives. |
+| `-Authentication` | `Anonymous` / `Kerberos` / `UsernamePassword` / `Certificate` | No | `Kerberos` | Client authentication type for the endpoint (`Kerberos` = "Windows integrated"). |
+| `-Cost` | `long` (1–4294967295) | No | `0x7FFFFFFD` | Priority; lower = preferred among endpoints sharing a PolicyID. Pass large values in decimal. |
+| `-NoAutoEnroll` | switch | No | | Leave "Enable for automatic enrollment and renewal" off (clears Flags bit `0x10`). |
+| `-AllowUntrustedIssuer` | switch | No | | Uncheck "Require strong validation during enrollment" (sets Flags bit `0x20`). |
+| `-NoClientId` | switch | No | | Do not send the ClientId attribute (clears Flags bit `0x4`; default `0x14` matches the GPO editor). |
+| `-SetAsDefault` / `-ClearDefault` | switch | No | | Set / clear the unnamed `(Default)` marker (interactive-enrollment preselection only). |
+| `-SkipADPolicy` | switch | No | | GP locations: do **not** write the AD enrollment policy row (only when that removal is intended). |
+| `-ReplaceExisting` | switch | No | | Remove sibling entries with the same PolicyID but a different URL (stale/typo). The AD row is never removed. |
+| `-DisableUserConfigured` / `-EnableUserConfigured` | switch | No | | GP locations: set / clear root Flags bit `0x4` (ignore user-configured servers). |
+| `-Remove` | switch | Remove mode | | Delete the entry for `-Url` from the chosen location and clear a now-orphaned `(Default)` marker. |
+| `-WhatIf` / `-Confirm` | switch | No | | Preview / prompt. `-WhatIf` shows the computed subkey and PolicyID and writes nothing. |
+
+### Usage
+
+**Preview everything (computed subkey + PolicyID), no writes:**
+```powershell
+.\Add-CertificateEnrollmentPolicyServerOffline.ps1 `
+    -Url 'https://pki.example.net/ejbca/msae/CEPService?alias' -PolicyName 'Example PKI Service' -WhatIf
+```
+
+**Configure the per-user store and mark it the default enrollment policy:**
+```powershell
+.\Add-CertificateEnrollmentPolicyServerOffline.ps1 `
+    -Url 'https://pki.example.net/ejbca/msae/CEPService?alias' -PolicyName 'Example PKI Service' `
+    -Location LocalUser -SetAsDefault
+```
+
+**Remove that entry again:**
+```powershell
+.\Add-CertificateEnrollmentPolicyServerOffline.ps1 `
+    -Url 'https://pki.example.net/ejbca/msae/CEPService?alias' -Location LocalUser -Remove
+```
+
+### Notes
+
+- `-PolicyName` is hashed **verbatim** — renaming the alias in EJBCA changes the PolicyID and orphans already-deployed entries.
+- Rerunning with a **different** URL does not remove the old entry (multiple URLs per PolicyID is also the legitimate redundant-endpoint pattern); use `-ReplaceExisting` to clean up a superseded one.
+- `-Remove` handles a single entry and its `(Default)` marker; shared/root configuration (root Flags, the AD row, autoenrollment) is left in place — full manual teardown is documented in the script's `.NOTES`.
+
+### Tests
+
+The Pester suite ([`Tests/Add-CertificateEnrollmentPolicyServerOffline.Tests.ps1`](./Tests/Add-CertificateEnrollmentPolicyServerOffline.Tests.ps1)) runs three always-safe tiers — **Unit** (the real subkey/PolicyID/flag derivations, exercised through `-WhatIf` so nothing is written), **Static** (parse + comment-based help), and **Guard** (parameter-conflict validation). No module, no AD, no elevation, no changes:
+
+```powershell
+Invoke-Pester -Path .\Tests\Add-CertificateEnrollmentPolicyServerOffline.Tests.ps1
+```
+
+<sub>[↑ Back to top](#top)</sub>
+
+---
+
+## Add-CertificateEnrollmentPolicyServerToGpo.ps1
+
+Writes (or removes) the same **Certificate Enrollment Policy** setting directly in a domain **GPO** — still offline with respect to the policy server (no "Validate Server" round-trip, ever) — for fleet-wide rollout. It authors the values with `Set-GPRegistryValue`, which also does what hand-editing SYSVOL gets wrong: the AD + `GPT.INI` version bumps and Registry CSE registration. The result appears in the GPME *Public Key Policies* dialog exactly as if clicked in.
+
+### Why you need this
+
+Configuring CEP through Group Policy normally means the same server round-trip in the GPME dialog, one GPO at a time, by hand. This script authors the policy directly and correctly for a fleet, and it defends against three sharp edges: it preserves the built-in **AD enrollment policy row** (a GPO carrying only your CEP entry would otherwise silently *remove* the AD enrollment policy from every client in scope), it writes each value individually to avoid the `Set-GPRegistryValue` list-form **`**delVals.`** deletion record that makes clients delete the whole entry, and it reads state from the **PDC emulator** (or `-Server`) so reads and writes see the same replica.
+
+### Features
+
+- **Authored straight into the GPO** with `Set-GPRegistryValue` — AD/`GPT.INI` version bumps and Registry CSE registration handled; shows up normally in GPME
+- **Same offline derivations** as the per-machine script (SHA-1 subkey, EJBCA `String.hashCode()` PolicyID, or `-PolicyId`)
+- **AD enrollment policy row preserved** by default so the GPO does not take away the AD default policy fleet-wide (opt out with `-SkipADPolicy`)
+- **Deletion-record-safe** — individual value writes avoid the `**delVals.` trap, and the script **detects and warns** about mis-ordered deletion records already in the GPO
+- **Optional Auto-Enrollment** (`-EnableAutoEnrollmentPolicy`) in the same GPO scope (AEPolicy / expiration percent / store), warning before it changes existing values
+- **Same-replica state reads** from the PDC emulator (or `-Server`), retry on transient SYSVOL/`registry.pol` contention, and **read-back verification** of every entry
+- **Machine or User scope**, root Flags DISABLE-bit handling, `-SetAsDefault` / `-ClearDefault`, `-ReplaceExisting`, a `-Remove` mode, `-WhatIf` / `-Confirm`, and structured output
+
+### Requirements
+
+- Windows PowerShell 5.1 or PowerShell 7+
+- The **GroupPolicy module** (GPMC / RSAT) and permission to edit the target GPO
+- An existing, linked GPO to write into (create one first, e.g. `New-GPO -Name 'PKI - Enrollment Policy' | New-GPLink -Target 'OU=...,DC=...'`)
+- Domain connectivity (the script targets the PDC emulator by default, or the DC you pass to `-Server`)
+- Do **not** edit the same GPO concurrently from another session or GPME — `Set-GPRegistryValue` is an unlocked read-modify-write; the read-back detects loss of this script's own entry
+
+### Parameters
+
+| Parameter | Type | Required | Default | Description |
+| --- | --- | --- | --- | --- |
+| `-GpoName` | `string` | Yes | | Display name of an existing GPO, or its GUID (display name is tried first). |
+| `-Url` | `string` | Yes | | Full CEP URI (verbatim; absolute http/https). |
+| `-PolicyName` | `string` | Add only | | EJBCA MSAE alias "Policy Name" — `FriendlyName` and (unless `-PolicyId`) the PolicyID hash input, hashed **verbatim**. |
+| `-PolicyId` | `string` | No | hash of `-PolicyName` | Explicit PolicyID for a GUID-returning CEP server. |
+| `-Scope` | `Machine` / `User` | No | `Machine` | Computer Configuration (HKLM) or User Configuration (HKCU). |
+| `-Authentication` | `Anonymous` / `Kerberos` / `UsernamePassword` / `Certificate` | No | `Kerberos` | Endpoint client authentication type. |
+| `-Cost` | `long` (1–4294967295) | No | `0x7FFFFFFD` | Priority; lower preferred among endpoints sharing a PolicyID. |
+| `-NoAutoEnroll` / `-AllowUntrustedIssuer` / `-NoClientId` | switch | No | | Entry Flags tweaks (clear `0x10` / set `0x20` / clear `0x4`); default `0x14` matches GPME. |
+| `-SetAsDefault` / `-ClearDefault` | switch | No | | Set / clear the `(Default)` marker (interactive preselection only). |
+| `-SkipADPolicy` | switch | No | | Do **not** write the AD enrollment policy row (only when that removal is intended). |
+| `-ReplaceExisting` | switch | No | | Remove same-PolicyID sibling entries under a different URL (the AD row is never removed). |
+| `-DisableUserConfigured` / `-EnableUserConfigured` | switch | No | | Set / clear root Flags bit `0x4` (ignore user-configured servers). |
+| `-EnableAutoEnrollmentPolicy` | switch | No | | Also write the "Auto-Enrollment" setting into the same scope. |
+| `-AEPolicy` / `-AEExpirationPercent` / `-AEStore` | `int` / `int` / `string` | No | `7` / `10` / `MY` | Auto-Enrollment values (only with `-EnableAutoEnrollmentPolicy`). |
+| `-Domain` / `-Server` | `string` | No | current / PDC emulator | Domain and DC for the GroupPolicy cmdlets and the `registry.pol` state reads (kept on one replica). |
+| `-Remove` | switch | Remove mode | | Delete the entry for `-Url` from the GPO scope and clear a now-orphaned `(Default)` marker. |
+| `-WhatIf` / `-Confirm` | switch | No | | Preview / prompt. |
+
+### Usage
+
+**Preview a fleet rollout with Auto-Enrollment enabled:**
+```powershell
+.\Add-CertificateEnrollmentPolicyServerToGpo.ps1 -GpoName 'PKI - Enrollment Policy' `
+    -Url 'https://pki.example.net/ejbca/msae/CEPService?alias' -PolicyName 'Example PKI Service' `
+    -EnableAutoEnrollmentPolicy -WhatIf
+```
+
+**Author it for real into the Computer configuration:**
+```powershell
+.\Add-CertificateEnrollmentPolicyServerToGpo.ps1 -GpoName 'PKI - Enrollment Policy' `
+    -Url 'https://pki.example.net/ejbca/msae/CEPService?alias' -PolicyName 'Example PKI Service' `
+    -EnableAutoEnrollmentPolicy
+```
+
+**Remove it from the User scope again:**
+```powershell
+.\Add-CertificateEnrollmentPolicyServerToGpo.ps1 -GpoName 'PKI - Enrollment Policy' `
+    -Url 'https://pki.example.net/ejbca/msae/CEPService?alias' -Scope User -Remove
+```
+
+### Notes
+
+- After a change, clients pick it up at the next GP refresh — force with `gpupdate`, then trigger enrollment with `certutil -pulse` (machine) or `certutil -user -pulse` (user).
+- `-PolicyName` is hashed **verbatim**; keep it identical to the EJBCA alias or deployed entries orphan.
+- `-Remove` clears one entry and its `(Default)` marker; shared configuration (root Flags, the AD row, Auto-Enrollment) is left in place — full teardown via `Remove-GPRegistryValue` is listed in the script's `.NOTES`.
+
+### Tests
+
+The Pester suite ([`Tests/Add-CertificateEnrollmentPolicyServerToGpo.Tests.ps1`](./Tests/Add-CertificateEnrollmentPolicyServerToGpo.Tests.ps1)) runs three tiers — **Unit** (the real `Registry.pol` binary parser and entry/value extractors, exercised against a hand-built `.pol` stream; no module needed), **Static** (parse + help), and **Guard** (parameter-conflict validation that throws before any GPO is touched; needs the GroupPolicy module, self-skips without it). No GPO is written:
+
+```powershell
+Invoke-Pester -Path .\Tests\Add-CertificateEnrollmentPolicyServerToGpo.Tests.ps1
+```
 
 <sub>[↑ Back to top](#top)</sub>
 

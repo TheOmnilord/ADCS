@@ -34,12 +34,14 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      # The Guard tier invokes the script, which does Import-Module ActiveDirectory up front.
-      # Its validation throws fire BEFORE any domain controller is contacted, so the module is
-      # required but no domain/DC is - the RSAT feature on the Server-based runner suffices.
-      - name: Install RSAT ActiveDirectory module
+      # The Guard tiers invoke each script, which imports its module up front (ActiveDirectory
+      # for Sync-ADCSTemplate; GroupPolicy for Add-CertificateEnrollmentPolicyServerToGpo). Their
+      # validation throws fire BEFORE any DC/GPO is contacted, so the modules are required but no
+      # domain/DC is - the RSAT/GPMC features on the Server-based runner supply both. (GPMC brings
+      # the GroupPolicy module; without it the GPO Guard tier self-skips rather than failing.)
+      - name: Install RSAT ActiveDirectory module and GPMC (GroupPolicy module)
         shell: pwsh
-        run: Install-WindowsFeature RSAT-AD-PowerShell | Out-Null
+        run: Install-WindowsFeature RSAT-AD-PowerShell, GPMC | Out-Null
 
       # The two engines keep separate CurrentUser module paths, so Pester 5+ is installed per
       # engine. Encoding/typing semantics differ between 5.1 and 7 - the safe tiers run under
@@ -52,7 +54,7 @@ jobs:
           Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Scope CurrentUser | Out-Null
           Install-Module Pester -MinimumVersion 5.5.0 -Force -SkipPublisherCheck -Scope CurrentUser
           Import-Module Pester -MinimumVersion 5.0
-          $result = Invoke-Pester -Path ./Tests/Sync-ADCSTemplate.Tests.ps1 -ExcludeTag Lab -Output Detailed -PassThru
+          $result = Invoke-Pester -Path ./Tests -ExcludeTag Lab -Output Detailed -PassThru
           if ($result.FailedCount -gt 0) { throw "$($result.FailedCount) test(s) failed." }
 
       - name: Run Unit + Static + Guard tiers (PowerShell 7)
@@ -64,5 +66,5 @@ jobs:
         run: |
           Install-Module Pester -MinimumVersion 5.5.0 -Force -SkipPublisherCheck -Scope CurrentUser
           Import-Module Pester -MinimumVersion 5.0
-          $result = Invoke-Pester -Path ./Tests/Sync-ADCSTemplate.Tests.ps1 -ExcludeTag Lab -Output Detailed -PassThru
+          $result = Invoke-Pester -Path ./Tests -ExcludeTag Lab -Output Detailed -PassThru
           if ($result.FailedCount -gt 0) { throw "$($result.FailedCount) test(s) failed." }
