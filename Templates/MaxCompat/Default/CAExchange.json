@@ -1,0 +1,53 @@
+﻿{
+    "name":  "CAExchange",
+    "displayName":  "CA Exchange",
+    "objectClass":  "pKICertificateTemplate",
+    "flags":  131136,
+    "revision":  106,
+    "msPKI-Certificate-Application-Policy":  [
+                                                 "1.3.6.1.4.1.311.21.5"
+                                             ],
+    "msPKI-Certificate-Name-Flag":  1,
+    "msPKI-Enrollment-Flag":  1,
+    "msPKI-Minimal-Key-Size":  2048,
+    "msPKI-Private-Key-Flag":  101056768,
+    "msPKI-RA-Signature":  0,
+    "msPKI-Template-Minor-Revision":  1,
+    "msPKI-Template-Schema-Version":  4,
+    "pKICriticalExtensions":  [
+                                  "2.5.29.15"
+                              ],
+    "pKIDefaultCSPs":  [
+                           "2,Microsoft Base Cryptographic Provider v1.0",
+                           "1,Microsoft Enhanced Cryptographic Provider v1.0"
+                       ],
+    "pKIDefaultKeySpec":  1,
+    "pKIExpirationPeriod":  [
+                                0,
+                                192,
+                                27,
+                                215,
+                                127,
+                                250,
+                                255,
+                                255
+                            ],
+    "pKIExtendedKeyUsage":  [
+                                "1.3.6.1.4.1.311.21.5"
+                            ],
+    "pKIKeyUsage":  [
+                        32,
+                        0
+                    ],
+    "pKIMaxIssuingDepth":  0,
+    "pKIOverlapPeriod":  [
+                             0,
+                             64,
+                             150,
+                             213,
+                             54,
+                             255,
+                             255,
+                             255
+                         ]
+}

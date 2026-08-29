@@ -4,15 +4,19 @@ Ready-to-import JSON exports of the **certutil default certificate templates**, 
 [`Sync-ADCSTemplate.ps1`](../Sync-ADCSTemplate.ps1) — plus **EJBCA-ready variants** of the
 templates that need one.
 
-- **`Default/`** — all 33 default templates, exported **as-is** from a
-  `certutil -InstallDefaultTemplates` set (Windows Server 2025 schema, exported 2026-08-29).
-  > **Provenance caveat:** the source was a working lab forest, presumed stock but not
-  > guaranteed pristine — a re-export from a freshly seeded, never-touched forest is planned
-  > (`certutil -InstallDefaultTemplates` needs no AD CS role, so any clean forest will do).
-  > Until then, diff against your own environment before relying on exact values.
+- **`Default/`** — all 33 default templates, exported **as-is** at their stock compatibility.
 - **`EJBCA/`** — variants of the templates whose Subject is **empty at creation** (Subject
   name format *None*), with the **Fully distinguished name** Subject enabled — the one change
   EJBCA/MSAE requires (see [Using the template with EJBCA](../README.md#using-the-template-with-ejbca)).
+- **`MaxCompat/Default/`** and **`MaxCompat/EJBCA/`** — the same two sets with every
+  **upgradable** template moved to the **latest compatibility** (Certification Authority:
+  *Windows Server 2016*, Certificate recipient: *Windows 10 / Windows Server 2016*). See
+  [Compatibility variants](#compatibility-latest-vs-stock) below.
+
+All four sets were produced **clean-room**: seeded into a never-used forest with
+`certutil -InstallDefaultTemplates` (no AD CS role required) and exported from there
+(Windows Server 2025 schema, 2026-08-29). The `Default/` set was cross-checked to be
+**byte-identical** to an independent export from a second forest, so the values are stock.
 
 ## What was deliberately changed or left out
 
@@ -70,6 +74,29 @@ in the request, or built as CN/DN/DNS/e-mail) need no variant.
 example of the main README's [EJBCA section](../README.md#using-the-template-with-ejbca), and
 the full-DN variant of it has already been field-validated end to end against EJBCA.
 
+## Compatibility: latest vs. stock
+
+`Default/` and `EJBCA/` carry each template's **stock** compatibility. `MaxCompat/` carries the
+same templates with compatibility moved to the newest setting — **CA: Windows Server 2016**,
+**recipient: Windows 10 / Windows Server 2016** — for the templates where that is possible.
+
+- **Only the 9 schema v2/v3 templates are upgraded** (CAExchange, CrossCA,
+  DirectoryEmailReplication, DomainControllerAuthentication, KerberosAuthentication,
+  KeyRecoveryAgent, OCSPResponseSigning, RASAndIASServer, Workstation). The 24 **schema v1**
+  built-ins are read-only in the Certificate Templates MMC — their compatibility can't be
+  raised in place — so in `MaxCompat/` they are byte-identical to `Default/`. `MaxCompat/` is
+  therefore a complete, self-contained set: import from it and you get the newest compatibility
+  everywhere it's available.
+- **What "latest compatibility" changes** (nothing else is touched): `msPKI-Template-Schema-Version`
+  → `4`; `msPKI-Private-Key-Flag` gains `0x06060000` (CA = Server 2016, recipient = Win10/2016)
+  plus `0x100` (`CT_FLAG_USE_LEGACY_PROVIDER`) for CSP-based templates — **not** for the one
+  CNG/KSP template (OCSPResponseSigning → `0x06060000`); the `flags` `IS_DEFAULT` bit becomes
+  `IS_MODIFIED`; and the minor revision is bumped. The private-key-flag encoding was verified
+  against real MMC-made v4 templates (`0x06060100` for CSP), and **every** upgraded file was
+  round-tripped through a live domain controller that accepted it as a valid v4 template.
+- The three EJBCA variants are all v2, so `MaxCompat/EJBCA/` carries them at **v4 + full-DN
+  Subject** together.
+
 ## The full set
 
 Subject-at-creation and supersedence below are read from the objects themselves
@@ -117,9 +144,16 @@ legacy `DomainController` (v1) and `DomainControllerAuthentication` templates.
 
 ## Verification performed
 
-Every file in this folder was validated on a live lab forest before publishing: all 36 passed
-the import pre-flight (`-Mode Import -WhatIf` with a throwaway name), and a representative
-EJBCA variant was imported for real — the full-DN Subject flag persisted verbatim in AD, a
-fresh OID was minted, and the throwaway was removed.
+- **Provenance:** the `Default/` set is byte-identical to an independent from-scratch export
+  from a second forest — the stock values are confirmed, not assumed.
+- **Import pre-flight:** every `Default/` and `EJBCA/` file passed `-Mode Import -WhatIf` with a
+  throwaway name (zero residue).
+- **Live round-trip:** every `MaxCompat/` upgraded template (the 9 defaults + 3 EJBCA variants)
+  was imported for real into a live domain controller, which accepted each as a valid **v4**
+  object with the intended `msPKI-Template-Schema-Version`, `msPKI-Private-Key-Flag`, and
+  `msPKI-Certificate-Name-Flag`; the throwaways and their companion OID objects were then
+  removed by exact identity.
+
+No file carries a domain SID; every file has its template OID stripped and is UTF-8 with a BOM.
 
 <sub>[↑ Back to repo README](../README.md)</sub>

@@ -1,0 +1,52 @@
+﻿{
+    "name":  "KeyRecoveryAgent",
+    "displayName":  "Key Recovery Agent",
+    "objectClass":  "pKICertificateTemplate",
+    "flags":  131104,
+    "revision":  105,
+    "msPKI-Certificate-Application-Policy":  [
+                                                 "1.3.6.1.4.1.311.21.6"
+                                             ],
+    "msPKI-Certificate-Name-Flag":  -2113929216,
+    "msPKI-Enrollment-Flag":  39,
+    "msPKI-Minimal-Key-Size":  2048,
+    "msPKI-Private-Key-Flag":  101056784,
+    "msPKI-RA-Signature":  0,
+    "msPKI-Template-Minor-Revision":  1,
+    "msPKI-Template-Schema-Version":  4,
+    "pKICriticalExtensions":  [
+                                  "2.5.29.15"
+                              ],
+    "pKIDefaultCSPs":  [
+                           "1,Microsoft Enhanced Cryptographic Provider v1.0"
+                       ],
+    "pKIDefaultKeySpec":  1,
+    "pKIExpirationPeriod":  [
+                                0,
+                                128,
+                                114,
+                                14,
+                                93,
+                                194,
+                                253,
+                                255
+                            ],
+    "pKIExtendedKeyUsage":  [
+                                "1.3.6.1.4.1.311.21.6"
+                            ],
+    "pKIKeyUsage":  [
+                        32,
+                        0
+                    ],
+    "pKIMaxIssuingDepth":  0,
+    "pKIOverlapPeriod":  [
+                             0,
+                             128,
+                             166,
+                             10,
+                             255,
+                             222,
+                             255,
+                             255
+                         ]
+}
