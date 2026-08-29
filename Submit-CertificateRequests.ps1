@@ -1,4 +1,3 @@
-#Requires -Version 5.1
 <#
 .SYNOPSIS
     Batch submission and retrieval of certificates via ADCS (certreq.exe).
@@ -54,6 +53,10 @@
         -CAConfig "CA01.domain.com\Contoso Issuing CA 1" `
         -CertificateTemplate "WebServer" -Mode Submit -WhatIf
 #>
+
+# NOTE: '#Requires' deliberately sits AFTER the help comment - placed before it, Get-Help
+# fails to bind the comment-based help and shows only auto-generated syntax (verified).
+#Requires -Version 5.1
 
 [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'Medium')]
 param(
@@ -278,8 +281,10 @@ function Submit-SingleRequest {
     $stderrFile = [System.IO.Path]::GetTempFileName()
 
     try {
+        # -q is load-bearing: without it certreq may pop a MODAL GUI dialog on some error paths
+        # (observed live: an unsupported-template denial), hanging a batch/headless run forever.
         $proc = Start-Process -FilePath 'certreq.exe' -ArgumentList @(
-            '-submit', '-f',
+            '-submit', '-q', '-f',
             '-config', "`"$CAConfig`"",
             '-attrib', "`"CertificateTemplate:$CertificateTemplate`"",
             "`"$($RequestFile.FullName)`"",
@@ -350,8 +355,9 @@ function Get-IssuedCertificate {
     $stderrFile = [System.IO.Path]::GetTempFileName()
 
     try {
+        # -q for the same reason as in Submit-SingleRequest: never let certreq raise UI.
         $null = Start-Process -FilePath 'certreq.exe' -ArgumentList @(
-            '-retrieve', '-f',
+            '-retrieve', '-q', '-f',
             '-config', "`"$CAConfig`"",
             "$($Record.RequestID)",
             "`"$($Record.OutputCertFile)`""
