@@ -221,8 +221,10 @@ Describe 'Sync-ADCSTemplate' {
     Context 'Lab: live operations' -Tag 'Lab' -Skip:(-not $script:LabReady) {
 
         BeforeAll {
-            Import-Module ActiveDirectory -ErrorAction Stop
+            # Prefix FIRST - before anything that can throw. AfterAll runs even when BeforeAll
+            # dies, and its safety-net sweep must never see an unset (= unscoped) prefix.
             $script:Prefix   = "PESTER-$([guid]::NewGuid().ToString('N').Substring(0,8))"
+            Import-Module ActiveDirectory -ErrorAction Stop
             $script:TmpDir   = Join-Path $env:TEMP $script:Prefix
             New-Item -ItemType Directory -Force $script:TmpDir | Out-Null
             $script:AP       = @{ Server = $AronsServer }
@@ -293,28 +295,36 @@ Describe 'Sync-ADCSTemplate' {
             # Safety net: sweep every configured server for anything carrying THIS run's unique
             # prefix (a fresh GUID - it cannot match a pre-existing object), in case a test threw
             # before its object was tracked. Prefix-scoped, never a broad wildcard.
-            foreach ($srv in @($AronsServer, $ChildServer, $NorefjellServer | Where-Object { $_ } | Select-Object -Unique)) {
-                try {
-                    $cfg = (Get-ADRootDSE -Server $srv).configurationNamingContext
-                    $tpls = "CN=Certificate Templates,CN=Public Key Services,CN=Services,$cfg"
-                    $oidC = "CN=OID,CN=Public Key Services,CN=Services,$cfg"
-                    foreach ($t in @(Get-ADObject -Server $srv -SearchBase $tpls -LDAPFilter "(cn=$script:Prefix-*)" -Properties 'msPKI-Cert-Template-OID' -ErrorAction SilentlyContinue)) {
-                        $oid = $t.'msPKI-Cert-Template-OID'
-                        Remove-ADObject -Server $srv -Identity $t.DistinguishedName -Confirm:$false -ErrorAction SilentlyContinue
-                        if ($oid) {
-                            $c = Get-ADObject -Server $srv -SearchBase $oidC -LDAPFilter "(msPKI-Cert-Template-OID=$oid)" -ErrorAction SilentlyContinue
-                            if ($c) { Remove-ADObject -Server $srv -Identity $c.DistinguishedName -Confirm:$false -ErrorAction SilentlyContinue }
+            # STRUCTURAL GUARD: the sweep runs only when the prefix has its full PESTER-<hex8>
+            # shape - an unset/empty prefix would otherwise widen the LDAP filters to unscoped
+            # patterns like (cn=-*) against the very container that holds real templates. AfterAll
+            # runs even when BeforeAll throws, so never assume the prefix is set. Never widen this.
+            if ($script:Prefix -match '^PESTER-[0-9a-f]{8}$') {
+                foreach ($srv in @($AronsServer, $ChildServer, $NorefjellServer | Where-Object { $_ } | Select-Object -Unique)) {
+                    try {
+                        $cfg = (Get-ADRootDSE -Server $srv).configurationNamingContext
+                        $tpls = "CN=Certificate Templates,CN=Public Key Services,CN=Services,$cfg"
+                        $oidC = "CN=OID,CN=Public Key Services,CN=Services,$cfg"
+                        foreach ($t in @(Get-ADObject -Server $srv -SearchBase $tpls -LDAPFilter "(cn=$script:Prefix-*)" -Properties 'msPKI-Cert-Template-OID' -ErrorAction SilentlyContinue)) {
+                            $oid = $t.'msPKI-Cert-Template-OID'
+                            Remove-ADObject -Server $srv -Identity $t.DistinguishedName -Confirm:$false -ErrorAction SilentlyContinue
+                            if ($oid) {
+                                $c = Get-ADObject -Server $srv -SearchBase $oidC -LDAPFilter "(msPKI-Cert-Template-OID=$oid)" -ErrorAction SilentlyContinue
+                                if ($c) { Remove-ADObject -Server $srv -Identity $c.DistinguishedName -Confirm:$false -ErrorAction SilentlyContinue }
+                            }
+                            Write-Warning "AfterAll safety-net removed an untracked test object: $($t.DistinguishedName)"
                         }
-                        Write-Warning "AfterAll safety-net removed an untracked test object: $($t.DistinguishedName)"
+                        # Companion OID objects whose display name carries the prefix but whose template was already removed.
+                        foreach ($c in @(Get-ADObject -Server $srv -SearchBase $oidC -LDAPFilter "(DisplayName=$script:Prefix-*)" -ErrorAction SilentlyContinue)) {
+                            Remove-ADObject -Server $srv -Identity $c.DistinguishedName -Confirm:$false -ErrorAction SilentlyContinue
+                        }
                     }
-                    # Companion OID objects whose display name carries the prefix but whose template was already removed.
-                    foreach ($c in @(Get-ADObject -Server $srv -SearchBase $oidC -LDAPFilter "(DisplayName=$script:Prefix-*)" -ErrorAction SilentlyContinue)) {
-                        Remove-ADObject -Server $srv -Identity $c.DistinguishedName -Confirm:$false -ErrorAction SilentlyContinue
-                    }
+                    catch { }
                 }
-                catch { }
+            } else {
+                Write-Warning "Safety-net sweep skipped: run prefix is unset or malformed ('$script:Prefix')."
             }
-            Remove-Item -LiteralPath $script:TmpDir -Recurse -Force -ErrorAction SilentlyContinue
+            if ($script:TmpDir) { Remove-Item -LiteralPath $script:TmpDir -Recurse -Force -ErrorAction SilentlyContinue }
         }
 
         It 'Export writes a BOM-marked JSON with identity, OID, and no ACL attribute' {
