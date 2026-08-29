@@ -1,0 +1,52 @@
+﻿{
+    "name":  "OCSPResponseSigning",
+    "displayName":  "OCSP Response Signing",
+    "objectClass":  "pKICertificateTemplate",
+    "flags":  66112,
+    "revision":  101,
+    "msPKI-Certificate-Application-Policy":  [
+                                                 "1.3.6.1.5.5.7.3.9"
+                                             ],
+    "msPKI-Certificate-Name-Flag":  402653184,
+    "msPKI-Enrollment-Flag":  20480,
+    "msPKI-Minimal-Key-Size":  2048,
+    "msPKI-Private-Key-Flag":  0,
+    "msPKI-RA-Application-Policies":  [
+                                          "msPKI-Asymmetric-Algorithm`PZPWSTR`RSA`msPKI-Hash-Algorithm`PZPWSTR`SHA1`msPKI-Key-Security-Descriptor`PZPWSTR`D:P(A;;FA;;;BA)(A;;FA;;;SY)(A;;GR;;;S-1-5-80-3804348527-3718992918-2141599610-3686422417-2726379419)`msPKI-Key-Usage`DWORD`2`"
+                                      ],
+    "msPKI-RA-Signature":  0,
+    "msPKI-Template-Minor-Revision":  0,
+    "msPKI-Template-Schema-Version":  3,
+    "pKICriticalExtensions":  [
+                                  "2.5.29.15"
+                              ],
+    "pKIDefaultKeySpec":  2,
+    "pKIExpirationPeriod":  [
+                                0,
+                                128,
+                                55,
+                                174,
+                                255,
+                                244,
+                                255,
+                                255
+                            ],
+    "pKIExtendedKeyUsage":  [
+                                "1.3.6.1.5.5.7.3.9"
+                            ],
+    "pKIKeyUsage":  [
+                        128,
+                        0
+                    ],
+    "pKIMaxIssuingDepth":  0,
+    "pKIOverlapPeriod":  [
+                             0,
+                             128,
+                             44,
+                             171,
+                             109,
+                             254,
+                             255,
+                             255
+                         ]
+}

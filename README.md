@@ -12,6 +12,7 @@ Currently includes:
 - **Batch CSR submission to an Enterprise CA** via `certreq.exe`, with resume-safe CSV tracking of request IDs and automated retrieval of issued certificates.
 - **Cross-forest certificate template sync** — copy a template between forests at the directory level (all access over ADWS), either through a JSON export/import or **directly forest-to-forest in one run** (`-Mode Sync`, with optional explicit credentials per side, so no trust is required). Optional rename, controlled OID handling, and a composable enrollment ACL. Works even when the target forest has **no AD CS installed** — e.g. to publish a template that an external CA reads for enrollment authorization.
 - **Client enrollment-policy (CEP) configuration** — point Windows enrollment clients at an **EJBCA** (or other MS-XCEP) policy server so they enroll against the synced template, computing every registry value **offline** (no "Validate Server" round-trip). Apply it to a single machine or a local GP hive, or fleet-wide by authoring the setting straight into a domain **GPO** (with optional Auto-Enrollment). This is the client half of the template-sync story above.
+- **A ready-to-import template library** ([`Templates/`](./Templates/README.md)) — every certutil default template as JSON (template OIDs stripped, so nothing fingerprints a forest and importers mint their own), plus **EJBCA-ready variants** of the templates whose Subject is empty at creation.
 
 Works on Windows PowerShell 5.1 and PowerShell 7+. `Set-ADCSTemplateValidity` and `Submit-CertificateRequests` have no AD PowerShell module dependency; `Sync-ADCSTemplate` requires the RSAT ActiveDirectory module and `Add-CertificateEnrollmentPolicyServerToGpo` the GroupPolicy module (see each script's requirements); `Add-CertificateEnrollmentPolicyServerOffline` needs no module.
 
@@ -34,6 +35,8 @@ Jump to a script — or straight to a section within it. Each script title links
 - **[Add-CertificateEnrollmentPolicyServerToGpo.ps1](#add-certificateenrollmentpolicyservertogpops1)** &nbsp;·&nbsp; [source](./Add-CertificateEnrollmentPolicyServerToGpo.ps1)
   Author (or remove) the same enrollment-policy setting directly in a domain **GPO** via `Set-GPRegistryValue`, for fleet-wide rollout — with optional Auto-Enrollment, AD-policy-row preservation, and Registry.pol safety checks.
   <br>↳ [Why you need this](#why-you-need-this-3) · [Features](#features-4) · [Requirements](#requirements-4) · [Parameters](#parameters-4) · [Usage](#usage-4) · [Notes](#notes-4) · [Tests](#tests-2)
+
+Also in the repo: the **[Template library](#template-library)** ([`Templates/`](./Templates/README.md)) — importable JSON exports of all default templates, plus EJBCA-ready variants.
 
 ---
 
@@ -668,6 +671,14 @@ The Lab tier needs a domain-joined machine, the GroupPolicy module, and permissi
 $cfg = New-PesterContainer -Path .\Tests\Add-CertificateEnrollmentPolicyServerToGpo.Tests.ps1 -Data @{ RunLab = $true }
 Invoke-Pester -Container $cfg
 ```
+
+<sub>[↑ Back to top](#top)</sub>
+
+---
+
+## Template library
+
+[`Templates/`](./Templates/README.md) ships importable JSON exports of **all 33 certutil default certificate templates** (`Templates/Default/`) and **EJBCA-ready variants** (`Templates/EJBCA/`) of the three defaults whose Subject is empty at creation (`DirectoryEmailReplication`, `DomainControllerAuthentication`, `Workstation`) — the same one-bit full-DN-Subject change the [EJBCA section](#using-the-template-with-ejbca) describes, pre-applied. Template OIDs are stripped from every file (they would fingerprint the source forest; importers mint their own with `-OidHandling Generate` / `GenerateRandom`), names are kept, no file carries a domain SID, and every file passed a live import validation. Details, criteria, and the full per-template table live in the folder's [README](./Templates/README.md).
 
 <sub>[↑ Back to top](#top)</sub>
 
