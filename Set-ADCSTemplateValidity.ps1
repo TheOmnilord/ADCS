@@ -1,5 +1,4 @@
-﻿#Requires -Version 5.1
-<#
+﻿<#
 .SYNOPSIS
     Sets the validity period (and optionally the renewal overlap period) on one or more ADCS certificate templates.
 
@@ -45,6 +44,11 @@
     .\Set-ADCSTemplateValidity.ps1 -TemplateName "ExactTemplate" -ValidityPeriod 365 -ValidityPeriodUnit Days -Server dc01.domain.com -Confirm:$false
     Set validity on a specific DC without confirmation prompt.
 #>
+
+# NOTE: '#Requires' deliberately sits AFTER the help comment - placed before it, Get-Help
+# fails to bind the comment-based help and shows only auto-generated syntax (verified).
+#Requires -Version 5.1
+
 [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
 param(
     [Parameter(Mandatory, Position = 0)]
@@ -206,9 +210,12 @@ process {
                 $cn = $result.Properties['cn'][0]
                 $displayName = if ($result.Properties['displayname'].Count -gt 0) { $result.Properties['displayname'][0] } else { $cn }
 
-                # Deduplication
+                # Deduplication. The duplicate still counts toward this pattern's match tally -
+                # the pattern DID match; without this, a pattern whose every hit was already
+                # processed by an earlier pattern would emit a false "no templates found" warning.
                 if (-not $processedDNs.Add($dn)) {
                     Write-Verbose "Skipping duplicate: $cn"
+                    $matchCount++
                     continue
                 }
 
@@ -277,7 +284,10 @@ process {
                         }
                         $entry.Properties['msPKI-Template-Minor-Revision'].Value = $currentRevision + 1
 
-                        $entry.SetInfo()
+                        # $null-assign: through the ADSI COM adapter, SetInfo() emits a $null
+                        # onto the pipeline (verified on 5.1), which would corrupt this script's
+                        # structured output with a null row per modified template.
+                        $null = $entry.SetInfo()
                         $modifiedCount++
 
                         [PSCustomObject]@{
