@@ -4,8 +4,12 @@ Ready-to-import JSON exports of the **certutil default certificate templates**, 
 [`Sync-ADCSTemplate.ps1`](../Sync-ADCSTemplate.ps1) — plus **EJBCA-ready variants** of the
 templates that need one.
 
-- **`Default/`** — all 33 default templates, exported **as-is** from a stock
+- **`Default/`** — all 33 default templates, exported **as-is** from a
   `certutil -InstallDefaultTemplates` set (Windows Server 2025 schema, exported 2026-08-29).
+  > **Provenance caveat:** the source was a working lab forest, presumed stock but not
+  > guaranteed pristine — a re-export from a freshly seeded, never-touched forest is planned
+  > (`certutil -InstallDefaultTemplates` needs no AD CS role, so any clean forest will do).
+  > Until then, diff against your own environment before relying on exact values.
 - **`EJBCA/`** — variants of the templates whose Subject is **empty at creation** (Subject
   name format *None*), with the **Fully distinguished name** Subject enabled — the one change
   EJBCA/MSAE requires (see [Using the template with EJBCA](../README.md#using-the-template-with-ejbca)).
