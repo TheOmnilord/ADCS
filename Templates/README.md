@@ -68,11 +68,13 @@ in the request, or built as CN/DN/DNS/e-mail) need no variant.
 | --- | --- |
 | `DirectoryEmailReplication-EJBCA.json` | `0x09000000` → `0x89000000` |
 | `DomainControllerAuthentication-EJBCA.json` | `0x08000000` → `0x88000000` |
+| `KerberosAuthentication-EJBCA.json` | `0x08400000` → `0x88400000` |
 | `Workstation-EJBCA.json` | `0x08000000` → `0x88000000` |
 
-**`KerberosAuthentication` also qualifies but is deliberately not shipped** — it is the worked
-example of the main README's [EJBCA section](../README.md#using-the-template-with-ejbca), and
-the full-DN variant of it has already been field-validated end to end against EJBCA.
+All **four** defaults whose Subject is empty at creation ship an EJBCA variant.
+`KerberosAuthentication-EJBCA.json` is the one the main README's
+[EJBCA section](../README.md#using-the-template-with-ejbca) uses as its worked, field-validated
+example — Microsoft's modern DC template, ready to import.
 
 ## Compatibility: latest vs. stock
 
@@ -94,7 +96,7 @@ same templates with compatibility moved to the newest setting — **CA: Windows 
   `IS_MODIFIED`; and the minor revision is bumped. The private-key-flag encoding was verified
   against real MMC-made v4 templates (`0x06060100` for CSP), and **every** upgraded file was
   round-tripped through a live domain controller that accepted it as a valid v4 template.
-- The three EJBCA variants are all v2, so `MaxCompat/EJBCA/` carries them at **v4 + full-DN
+- The four EJBCA variants are all v2, so `MaxCompat/EJBCA/` carries them at **v4 + full-DN
   Subject** together.
 - **Reproducible on import:** the same upgrade is available as a first-class option on the sync
   script, so you can import from `Default/` and get the `MaxCompat/` result directly. From the repo
@@ -129,7 +131,7 @@ Subject-at-creation and supersedence below are read from the objects themselves
 | ExchangeUserSignature | 1 | Supplied in request | — | |
 | IPSECIntermediateOffline | 1 | Supplied in request | — | |
 | IPSECIntermediateOnline | 1 | Built: DNS as CN | — | |
-| KerberosAuthentication | 2 | **None (empty)** | deliberate omit | modern DC template |
+| KerberosAuthentication | 2 | **None (empty)** | ✔ | modern DC template; worked EJBCA example |
 | KeyRecoveryAgent | 2 | Built: full DN | — | |
 | Machine | 1 | Built: DNS as CN | — | |
 | MachineEnrollmentAgent | 1 | Built: DNS as CN | — | |
