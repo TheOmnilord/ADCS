@@ -97,9 +97,11 @@ same templates with compatibility moved to the newest setting — **CA: Windows 
 - The three EJBCA variants are all v2, so `MaxCompat/EJBCA/` carries them at **v4 + full-DN
   Subject** together.
 - **Reproducible on import:** the same upgrade is available as a first-class option on the sync
-  script — `Sync-ADCSTemplate.ps1 -Mode Import -Path .\Default\Workstation.json -OidHandling
-  GenerateRandom -UpgradeCompatibility` raises the copy to the latest compatibility as it is
-  created, so you can import from `Default/` and get the `MaxCompat/` result directly.
+  script, so you can import from `Default/` and get the `MaxCompat/` result directly. From the repo
+  root:
+  ```powershell
+  .\Sync-ADCSTemplate.ps1 -Mode Import -Path .\Templates\Default\Workstation.json -OidHandling GenerateRandom -UpgradeCompatibility
+  ```
 
 ## The full set
 

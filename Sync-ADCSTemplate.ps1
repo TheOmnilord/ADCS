@@ -427,7 +427,12 @@ function Convert-ToLatestCompatibility {
     if ($ver -ge 4) { return [pscustomobject]@{ Upgraded = $false; FromVersion = $ver; Reason = 'already at the latest compatibility (schema v4)' } }
 
     $pkf = if ($Attributes.ContainsKey('msPKI-Private-Key-Flag')) { [BitConverter]::ToUInt32([BitConverter]::GetBytes([int]$Attributes['msPKI-Private-Key-Flag']), 0) } else { [uint32]0 }
-    $pkf = $pkf -bor 0x06060000
+    # The two compatibility levels are VERSION NIBBLES, not independent bits: CA min-version at
+    # bits 16-19, recipient min-version at bits 24-27. REPLACE them (clear both nibbles, then set
+    # 6/6 = Windows Server 2016 / Windows 10) - a plain -bor would ACCUMULATE, so a source already
+    # at e.g. 2008R2/Win7 (nibble 3) would become 3|6 = 7, an invalid level. 0xF0F0FFFF clears only
+    # the two version nibbles and preserves every other flag (0x100 legacy provider, 0x200000, ...).
+    $pkf = ($pkf -band 0xF0F0FFFF) -bor 0x06060000
     # @($null).Count is 1, so test the value explicitly - do NOT rely on the count alone.
     $isCsp = $Attributes.ContainsKey('pKIDefaultCSPs') -and $null -ne $Attributes['pKIDefaultCSPs'] -and @($Attributes['pKIDefaultCSPs']).Count -gt 0
     if ($isCsp) { $pkf = $pkf -bor 0x100 }

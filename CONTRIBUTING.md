@@ -13,8 +13,11 @@ existing code.
 - **Match the house style.** Comment-based help with `.PARAMETER`/`.EXAMPLE` for every
   parameter; structured `PSCustomObject` output where a caller might consume it; clear,
   actionable error messages.
-  - Put `#Requires` **after** the comment-based help block, not before it — before it, `Get-Help`
-    silently fails to bind (a real bug this repo has already hit).
+  - Keep a **blank line between a `#Requires` statement and the comment-based help block**. If
+    `#Requires` sits immediately adjacent to the opening `<#` with no blank line, `Get-Help`
+    silently fails to bind and shows only auto-generated syntax (a real bug this repo has hit).
+    Either placement works with the blank line — the scripts here use both (`Sync-ADCSTemplate`
+    keeps `#Requires` before the help with a blank line; the others put it after).
 
 ## Before you open a PR
 

@@ -162,6 +162,23 @@ Describe 'Sync-ADCSTemplate' {
             [BitConverter]::ToUInt32([BitConverter]::GetBytes([int]$a['msPKI-Private-Key-Flag']), 0) | Should -Be ([uint32]0x06060000)
         }
 
+        It 'Convert-ToLatestCompatibility: REPLACES an existing compatibility level, never OR-accumulates the version nibbles' {
+            # A v3 source already at "Windows Server 2008 R2 / Windows 7" (both nibbles = 3, 0x03030000).
+            # A plain -bor would give 3|6 = 7 (an invalid level); the transform must land on exactly 6/6.
+            $cng = @{ 'msPKI-Template-Schema-Version' = [int]3
+                      'msPKI-Private-Key-Flag' = [BitConverter]::ToInt32([BitConverter]::GetBytes([uint32]0x03030000), 0) }
+            $null = Convert-ToLatestCompatibility -Attributes $cng
+            [BitConverter]::ToUInt32([BitConverter]::GetBytes([int]$cng['msPKI-Private-Key-Flag']), 0) | Should -Be ([uint32]0x06060000)
+
+            # Same, CSP-based and with an unrelated high-nibble flag (0x00200000) that must survive.
+            $csp = @{ 'msPKI-Template-Schema-Version' = [int]2
+                      'msPKI-Private-Key-Flag' = [BitConverter]::ToInt32([BitConverter]::GetBytes([uint32]0x05250010), 0)
+                      'pKIDefaultCSPs' = @('1,Microsoft RSA SChannel Cryptographic Provider') }
+            $null = Convert-ToLatestCompatibility -Attributes $csp
+            # nibbles 5/5 -> 6/6; 0x00200000 and 0x10 preserved; CSP adds 0x100.
+            [BitConverter]::ToUInt32([BitConverter]::GetBytes([int]$csp['msPKI-Private-Key-Flag']), 0) | Should -Be ([uint32]0x06260110)
+        }
+
         It 'Convert-ToLatestCompatibility: an empty/absent CSP list does not fool the @($null).Count trap' {
             foreach ($csp in @($null, @())) {
                 $a = @{ 'msPKI-Template-Schema-Version' = [int]2; 'msPKI-Private-Key-Flag' = [int]0; 'pKIDefaultCSPs' = $csp }

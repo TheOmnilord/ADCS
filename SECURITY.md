@@ -21,9 +21,14 @@ program; this is a best-effort, community-maintained project.
   are written to make previews side-effect-free.
 - **No secrets are handled in plaintext.** Cross-forest operations take a `[pscredential]`
   (`-Credential` / `-SourceCredential`); nothing is written to disk in clear.
-- **Exported template JSON never contains ACLs or security descriptors** — permissions are
-  rebuilt on import from `-AclBase` / `-EnrollPrincipals`. Template OIDs are stripped from the
-  files shipped under [`Templates/`](./Templates/README.md) so they cannot fingerprint a forest.
+- **Exported template JSON never carries the template's own ACL** (`nTSecurityDescriptor`) — the
+  enrollment permissions are rebuilt on import from `-AclBase` / `-EnrollPrincipals`, and no file
+  contains a domain (`S-1-5-21-…`) SID. The one exception is a private-key SDDL that a couple of
+  templates pack inside `msPKI-RA-Application-Policies` (e.g. `OCSPResponseSigning`); it copies
+  verbatim and the shipped library's only instance grants solely machine-independent principals
+  (Administrators, SYSTEM, the OCSP responder's `S-1-5-80-…` service SID). Template OIDs are
+  stripped from the files under [`Templates/`](./Templates/README.md) so they cannot fingerprint a
+  forest.
 - **Destructive operations are exact-scoped.** The test suites, when run against a lab
   (`-RunLab`), create and remove only objects carrying a unique per-run `PESTER-<hex>` prefix and
   never touch pre-existing objects; see the per-suite notes under [`Tests/`](./Tests).
