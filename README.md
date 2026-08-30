@@ -3,6 +3,7 @@
 # ADCS — Active Directory Certificate Services PowerShell Tools
 
 [![CI](https://github.com/TheOmnilord/ADCS/actions/workflows/ci.yml/badge.svg)](https://github.com/TheOmnilord/ADCS/actions/workflows/ci.yml)
+[![Latest release](https://img.shields.io/github/v/release/TheOmnilord/ADCS?sort=semver&label=release)](https://github.com/TheOmnilord/ADCS/releases/latest)
 
 A set of PowerShell scripts for administering **Active Directory Certificate Services** (AD CS / ADCS) from the command line. Built for Windows PKI administrators who need to manage certificate templates, process certificate requests, and configure enrollment clients at scale — without clicking through the Certificate Templates MMC snap-in, the Certification Authority console, or the per-machine "Certificate Enrollment Policy" dialog.
 
