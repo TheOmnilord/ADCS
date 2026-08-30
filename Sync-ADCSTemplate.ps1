@@ -212,6 +212,15 @@
             'NOREFJELL\PKI-Admins' = 'FullControl'
         }
 
+.PARAMETER UpgradeCompatibility
+    Import/Sync. Raises the imported template to the newest compatibility the Certificate Templates
+    MMC offers - Certification Authority: Windows Server 2016, Certificate recipient:
+    Windows 10 / Windows Server 2016 - as it is created in the target forest (schema version 4 plus
+    the matching private-key-flag bits). Only schema v2/v3 templates can be upgraded in place; a
+    schema v1 template is imported unchanged with a warning (v1 built-ins are read-only in the MMC),
+    and a template already at v4 is left as-is. The source template/export is not modified; only the
+    copy written to the target is upgraded.
+
 .PARAMETER KeepArtifacts
     Validate only. Leaves the throwaway templates and the export file in place after the diff
     (default is to remove them). No companion OID object is ever created for the throwaways (they use
@@ -242,6 +251,10 @@
     # No AD CS in the target, but you want a fresh (synthetic) OID with a Windows-resolvable name:
     .\Sync-ADCSTemplate.ps1 -Mode Import -Path .\XX.json -OidHandling GenerateRandom `
         -NewTemplateName "YY-KerberosAuthentication" -NewDisplayName "YY-Kerberos Authentication"
+
+.EXAMPLE
+    # Import and raise the copy to the latest compatibility (Windows Server 2016 / Windows 10):
+    .\Sync-ADCSTemplate.ps1 -Mode Import -Path .\Workstation.json -OidHandling GenerateRandom -UpgradeCompatibility
 
 .EXAMPLE
     .\Sync-ADCSTemplate.ps1 -Mode Import -Path .\XX.json -NewTemplateName "YY-KerberosAuthentication" -NewDisplayName "YY-Kerberos Authentication" -WhatIf
@@ -366,6 +379,8 @@ param(
 
     [hashtable]$EnrollPrincipals,
 
+    [switch]$UpgradeCompatibility,
+
     [switch]$KeepArtifacts
 )
 
@@ -390,6 +405,44 @@ $script:ByteAttributes = @('pKIExpirationPeriod', 'pKIKeyUsage', 'pKIOverlapPeri
 $script:SchemaTypeCache     = @{}
 $script:TemplateAllowedCache = $null
 $script:RootDomainSidCache  = $null
+
+function Convert-ToLatestCompatibility {
+    # Raises a template's compatibility to the newest setting the Certificate Templates MMC offers -
+    # Certification Authority: Windows Server 2016, Certificate recipient: Windows 10 / Windows
+    # Server 2016 - by mutating the New-ADObject -OtherAttributes hashtable IN PLACE. Only schema
+    # v2/v3 templates are upgraded: v1 built-ins are read-only in the MMC (not upgradable in place)
+    # and templates already at v4 are the newest, so both are left untouched. Returns a report.
+    #
+    # Encoding (verified against real MMC-made v4 templates and a live-DC round-trip):
+    #   msPKI-Template-Schema-Version -> 4
+    #   msPKI-Private-Key-Flag        |= 0x06060000 (CA=Server2016 nibble | recipient=Win10/2016 nibble),
+    #                                    plus 0x100 (CT_FLAG_USE_LEGACY_PROVIDER) for CSP-based
+    #                                    templates only - NOT CNG/KSP templates (no pKIDefaultCSPs)
+    #   flags                          IS_DEFAULT (0x10000) -> IS_MODIFIED (0x20000)
+    #   msPKI-Template-Minor-Revision  += 1
+    param([Parameter(Mandatory)][hashtable]$Attributes)
+
+    $ver = if ($Attributes.ContainsKey('msPKI-Template-Schema-Version')) { [int]$Attributes['msPKI-Template-Schema-Version'] } else { 1 }
+    if ($ver -lt 2) { return [pscustomobject]@{ Upgraded = $false; FromVersion = $ver; Reason = 'schema v1 template - not upgradable in place' } }
+    if ($ver -ge 4) { return [pscustomobject]@{ Upgraded = $false; FromVersion = $ver; Reason = 'already at the latest compatibility (schema v4)' } }
+
+    $pkf = if ($Attributes.ContainsKey('msPKI-Private-Key-Flag')) { [BitConverter]::ToUInt32([BitConverter]::GetBytes([int]$Attributes['msPKI-Private-Key-Flag']), 0) } else { [uint32]0 }
+    $pkf = $pkf -bor 0x06060000
+    # @($null).Count is 1, so test the value explicitly - do NOT rely on the count alone.
+    $isCsp = $Attributes.ContainsKey('pKIDefaultCSPs') -and $null -ne $Attributes['pKIDefaultCSPs'] -and @($Attributes['pKIDefaultCSPs']).Count -gt 0
+    if ($isCsp) { $pkf = $pkf -bor 0x100 }
+
+    $flags = if ($Attributes.ContainsKey('flags')) { [BitConverter]::ToUInt32([BitConverter]::GetBytes([int]$Attributes['flags']), 0) } else { [uint32]0 }
+    $flags = ($flags -band (-bnot 0x10000)) -bor 0x20000
+
+    $Attributes['msPKI-Template-Schema-Version'] = [System.Int32]4
+    $Attributes['msPKI-Private-Key-Flag']        = [BitConverter]::ToInt32([BitConverter]::GetBytes([uint32]$pkf), 0)
+    $Attributes['flags']                         = [BitConverter]::ToInt32([BitConverter]::GetBytes([uint32]$flags), 0)
+    if ($Attributes.ContainsKey('msPKI-Template-Minor-Revision')) {
+        $Attributes['msPKI-Template-Minor-Revision'] = [System.Int32]([int]$Attributes['msPKI-Template-Minor-Revision'] + 1)
+    }
+    return [pscustomobject]@{ Upgraded = $true; FromVersion = $ver; PrivateKeyFlag = ('0x{0:X8}' -f $pkf); LegacyProvider = $isCsp }
+}
 
 function Get-RandomHex {
     param([int]$Length)
@@ -794,6 +847,7 @@ function Import-Template {
         [string]$ExplicitOid,
         [string]$ConfigNC,        # skips the RootDSE read when the caller already has it
         [hashtable]$ADParams,
+        [switch]$UpgradeCompatibility,
         [System.Management.Automation.PSCmdlet]$CallerCmdlet
     )
 
@@ -902,6 +956,20 @@ function Import-Template {
         Write-Warning "msPKI-RA-Application-Policies embeds an msPKI-Key-Security-Descriptor (private-key SDDL). Domain SIDs inside it are from the SOURCE forest and will not resolve here - review and adjust the key security descriptor on the copied template if it carries custom key permissions."
     }
 
+    # Optional: raise the copy to the newest compatibility as it is created (schema v2/v3 -> v4 plus
+    # the matching private-key-flag bits). Mutates $oa in place; the source is never touched.
+    $compatNote = ''
+    if ($UpgradeCompatibility) {
+        $compat = Convert-ToLatestCompatibility -Attributes $oa
+        if ($compat.Upgraded) {
+            Write-Verbose "Compatibility raised to latest: schema v$($compat.FromVersion) -> v4, msPKI-Private-Key-Flag $($compat.PrivateKeyFlag)$(if ($compat.LegacyProvider) { ' (legacy provider)' } else { ' (CNG/KSP)' })."
+            $compatNote = ' [compatibility upgraded to latest: CA Windows Server 2016 / recipient Windows 10]'
+        }
+        else {
+            Write-Warning "-UpgradeCompatibility: $($compat.Reason); the template is imported at its existing compatibility."
+        }
+    }
+
     # Resolve the OID (Preserve / Generate / explicit) BEFORE the ShouldProcess gate, so a missing
     # OID root or a missing source OID fails cleanly with no side effects. New-TemplateOid (Generate)
     # only reads/reserves here; the writes happen inside the gate below.
@@ -919,7 +987,7 @@ function Import-Template {
         throw "A template already carries OID $($oidPlan.Oid): $($oidClash.DistinguishedName). Importing another template with the same OID would make OID-based template lookups (Windows, EJBCA) ambiguous. Use -OidHandling Generate, GenerateFromRoot, or GenerateRandom to mint a different OID."
     }
 
-    $actionText = "Create certificate template (OID handling: $oidLabel)"
+    $actionText = "Create certificate template (OID handling: $oidLabel)$compatNote"
     if ($oidPlan.CompanionCn) {
         $actionText += " and companion OID display object CN=$($oidPlan.CompanionCn),$($oidPlan.CompanionContainerDN)"
     }
@@ -1577,8 +1645,8 @@ Import-Module ActiveDirectory -ErrorAction Stop
 # and a future mode or parameter needs exactly one list updated.
 $modeParams = @{
     Export   = 'Path', 'TemplateName', 'StripIdentity', 'StripOid', 'Server', 'Credential'
-    Import   = 'Path', 'NewTemplateName', 'NewDisplayName', 'OidHandling', 'OidRoot', 'SkipAcl', 'AclBase', 'EnrollPrincipals', 'Server', 'Credential'
-    Sync     = 'TemplateName', 'NewTemplateName', 'NewDisplayName', 'OidHandling', 'OidRoot', 'SkipAcl', 'AclBase', 'EnrollPrincipals', 'Server', 'Credential', 'SourceServer', 'SourceCredential'
+    Import   = 'Path', 'NewTemplateName', 'NewDisplayName', 'OidHandling', 'OidRoot', 'SkipAcl', 'AclBase', 'EnrollPrincipals', 'UpgradeCompatibility', 'Server', 'Credential'
+    Sync     = 'TemplateName', 'NewTemplateName', 'NewDisplayName', 'OidHandling', 'OidRoot', 'SkipAcl', 'AclBase', 'EnrollPrincipals', 'UpgradeCompatibility', 'Server', 'Credential', 'SourceServer', 'SourceCredential'
     Validate = 'TemplateName', 'Path', 'KeepArtifacts', 'Server', 'Credential'
 }
 $commonParams = @([System.Management.Automation.PSCmdlet]::CommonParameters) + @([System.Management.Automation.PSCmdlet]::OptionalCommonParameters) + 'Mode'
@@ -1669,12 +1737,13 @@ switch ($Mode) {
     }
     { $_ -in 'Import', 'Sync' } {
         $importArgs = @{
-            NewTemplateName = $NewTemplateName
-            NewDisplayName  = $NewDisplayName
-            OidHandling     = $OidHandling
-            OidRoot         = $OidRoot
-            ADParams        = $adParams
-            CallerCmdlet    = $PSCmdlet
+            NewTemplateName      = $NewTemplateName
+            NewDisplayName       = $NewDisplayName
+            OidHandling          = $OidHandling
+            OidRoot              = $OidRoot
+            ADParams             = $adParams
+            UpgradeCompatibility = $UpgradeCompatibility
+            CallerCmdlet         = $PSCmdlet
         }
         if ($Mode -eq 'Sync') {
             # Direct forest-to-forest: read the template from the source forest and feed it straight

@@ -68,7 +68,7 @@ Describe 'Sync-ADCSTemplate' {
         # (The script has a mandatory -Mode and runs main logic on load, so it cannot be dot-sourced
         # wholesale; extracting the function definitions gives their real bodies with no side effects.)
         $ast = [System.Management.Automation.Language.Parser]::ParseFile($script:Sync, [ref]$null, [ref]$null)
-        foreach ($name in 'Get-RandomHex', 'ConvertTo-LdapFilterValue', 'New-SyntheticOidBase', 'Get-AttrCanonical', 'Compare-TemplateAttributes') {
+        foreach ($name in 'Get-RandomHex', 'ConvertTo-LdapFilterValue', 'New-SyntheticOidBase', 'Get-AttrCanonical', 'Compare-TemplateAttributes', 'Convert-ToLatestCompatibility') {
             $def = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name }, $false)
             if ($def) { . ([scriptblock]::Create($def[0].Extent.Text)) }
         }
@@ -138,6 +138,52 @@ Describe 'Sync-ADCSTemplate' {
             $tgt = [pscustomobject]@{ 'flags' = 1; 'msPKI-Extra' = 'surprise' }
             $diff = Compare-TemplateAttributes -Source $src -Target $tgt
             ($diff | Where-Object Attribute -eq 'msPKI-Extra') | Should -Not -BeNullOrEmpty
+        }
+
+        It 'Convert-ToLatestCompatibility: CSP-based v2 -> v4 with the exact stock v4 bytes (0x06060100)' {
+            # Oracle: real MMC-made v4 Kerberos Authentication templates carry 0x06060100.
+            $a = @{ 'msPKI-Template-Schema-Version' = [int]2; 'msPKI-Private-Key-Flag' = [int]0
+                    'flags' = [BitConverter]::ToInt32([BitConverter]::GetBytes([uint32]0x10060), 0)
+                    'msPKI-Template-Minor-Revision' = [int]0
+                    'pKIDefaultCSPs' = @('1,Microsoft RSA SChannel Cryptographic Provider') }
+            $r = Convert-ToLatestCompatibility -Attributes $a
+            $r.Upgraded | Should -BeTrue
+            $a['msPKI-Template-Schema-Version'] | Should -Be 4
+            [BitConverter]::ToUInt32([BitConverter]::GetBytes([int]$a['msPKI-Private-Key-Flag']), 0) | Should -Be ([uint32]0x06060100)
+            [BitConverter]::ToUInt32([BitConverter]::GetBytes([int]$a['flags']), 0) | Should -Be ([uint32]0x20060)   # IS_DEFAULT -> IS_MODIFIED
+            $a['msPKI-Template-Minor-Revision'] | Should -Be 1
+        }
+
+        It 'Convert-ToLatestCompatibility: CNG/KSP template (no CSP list) gets 0x06060000, NOT the legacy-provider bit' {
+            $a = @{ 'msPKI-Template-Schema-Version' = [int]3; 'msPKI-Private-Key-Flag' = [int]0 }
+            $r = Convert-ToLatestCompatibility -Attributes $a
+            $r.Upgraded | Should -BeTrue
+            $r.LegacyProvider | Should -BeFalse
+            [BitConverter]::ToUInt32([BitConverter]::GetBytes([int]$a['msPKI-Private-Key-Flag']), 0) | Should -Be ([uint32]0x06060000)
+        }
+
+        It 'Convert-ToLatestCompatibility: an empty/absent CSP list does not fool the @($null).Count trap' {
+            foreach ($csp in @($null, @())) {
+                $a = @{ 'msPKI-Template-Schema-Version' = [int]2; 'msPKI-Private-Key-Flag' = [int]0; 'pKIDefaultCSPs' = $csp }
+                $r = Convert-ToLatestCompatibility -Attributes $a
+                $r.LegacyProvider | Should -BeFalse -Because 'no CSP entries means CNG/KSP - no 0x100'
+                [BitConverter]::ToUInt32([BitConverter]::GetBytes([int]$a['msPKI-Private-Key-Flag']), 0) | Should -Be ([uint32]0x06060000)
+            }
+        }
+
+        It 'Convert-ToLatestCompatibility: v1 is left untouched (not upgradable in place)' {
+            $a = @{ 'msPKI-Template-Schema-Version' = [int]1; 'msPKI-Private-Key-Flag' = [int]0 }
+            $r = Convert-ToLatestCompatibility -Attributes $a
+            $r.Upgraded | Should -BeFalse
+            $a['msPKI-Template-Schema-Version'] | Should -Be 1
+            $a['msPKI-Private-Key-Flag'] | Should -Be 0
+        }
+
+        It 'Convert-ToLatestCompatibility: a template already at v4 is a no-op' {
+            $a = @{ 'msPKI-Template-Schema-Version' = [int]4; 'msPKI-Private-Key-Flag' = [int]0x06060100 }
+            $r = Convert-ToLatestCompatibility -Attributes $a
+            $r.Upgraded | Should -BeFalse
+            $a['msPKI-Private-Key-Flag'] | Should -Be 0x06060100
         }
     }
 
@@ -212,6 +258,16 @@ Describe 'Sync-ADCSTemplate' {
         It 'rejects -SourceServer outside -Mode Sync' {
             { & $script:Sync -Mode Export -Path x.json -SourceServer dc1 } |
                 Should -Throw -ExpectedMessage '*not applicable to -Mode Export*'
+        }
+
+        It 'rejects -UpgradeCompatibility for -Mode Export (Import/Sync only)' {
+            { & $script:Sync -Mode Export -Path x.json -UpgradeCompatibility } |
+                Should -Throw -ExpectedMessage '*not applicable to -Mode Export*'
+        }
+
+        It 'rejects -UpgradeCompatibility for -Mode Validate' {
+            { & $script:Sync -Mode Validate -TemplateName K -UpgradeCompatibility } |
+                Should -Throw -ExpectedMessage '*not applicable to -Mode Validate*'
         }
     }
 
@@ -356,6 +412,26 @@ Describe 'Sync-ADCSTemplate' {
             if ($Mode -eq 'Generate') {
                 $r.Oid | Should -BeLike "$script:ForestRoot.*" -Because 'Generate mints under the real forest OID root'
             }
+        }
+
+        It '-UpgradeCompatibility raises the imported copy to v4 with the stock v4 private-key-flag' {
+            # Fixture is the built-in Kerberos Authentication template (schema v2, CSP-based), so the
+            # upgrade must land it at v4 / 0x06060100 - the exact value real MMC-made v4 copies carry.
+            $cn = script:New-LabName
+            $r = script:Invoke-LabCreate -SyncParams @{ Mode = 'Import'; Path = $script:ExportFile; Server = $AronsServer
+                NewTemplateName = $cn; NewDisplayName = $cn; OidHandling = 'GenerateRandom'; SkipAcl = $true; UpgradeCompatibility = $true }
+            $r.DN | Should -Not -BeNullOrEmpty
+            $t = script:Get-ADObjectRetry -AdParams $script:AP -Identity $r.DN -Properties 'msPKI-Template-Schema-Version', 'msPKI-Private-Key-Flag'
+            [int]$t.'msPKI-Template-Schema-Version' | Should -Be 4
+            [BitConverter]::ToUInt32([BitConverter]::GetBytes([int]$t.'msPKI-Private-Key-Flag'), 0) | Should -Be ([uint32]0x06060100)
+        }
+
+        It 'a plain import (no -UpgradeCompatibility) preserves the source schema version' {
+            $cn = script:New-LabName
+            $r = script:Invoke-LabCreate -SyncParams @{ Mode = 'Import'; Path = $script:ExportFile; Server = $AronsServer
+                NewTemplateName = $cn; NewDisplayName = $cn; OidHandling = 'GenerateRandom'; SkipAcl = $true }
+            $t = script:Get-ADObjectRetry -AdParams $script:AP -Identity $r.DN -Properties 'msPKI-Template-Schema-Version'
+            [int]$t.'msPKI-Template-Schema-Version' | Should -Be 2 -Because 'the Kerberos Authentication fixture is schema v2 and must be copied as-is without the switch'
         }
 
         It 'Import -AclBase Standard writes a protected DACL; SkipAcl leaves the schema default' {
