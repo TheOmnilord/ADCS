@@ -692,4 +692,8 @@ Invoke-Pester -Container $cfg
 
 ## Contributing
 
-Issues and pull requests welcome.
+Issues and pull requests welcome — see [CONTRIBUTING.md](./CONTRIBUTING.md) for the house style, the dual-engine (PowerShell 5.1 + 7) and `-WhatIf` expectations, and how to run the analyzer and the four-tier test suites.
+
+## Security
+
+To report a vulnerability, use GitHub's private reporting (**Security → Report a vulnerability**) rather than a public issue — details and the safety model are in [SECURITY.md](./SECURITY.md).
