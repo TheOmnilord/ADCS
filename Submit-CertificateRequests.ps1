@@ -1,3 +1,15 @@
+<#PSScriptInfo
+.VERSION 1.0.1
+.GUID 6f98f16e-0c56-4a72-ba31-443938175c06
+.AUTHOR Sveinung Svea
+.PROJECTURI https://github.com/TheOmnilord/ADCS
+.LICENSEURI https://github.com/TheOmnilord/ADCS/blob/main/LICENSE
+.TAGS ADCS PKI CertificateServices
+.RELEASENOTES
+1.0.1 - Retrieve mode honours an explicit -OutputFolder (previously the path recorded at submit time was always used)
+1.0.0 - Initial release
+#>
+
 <#
 .SYNOPSIS
     Batch submission and retrieval of certificates via ADCS (certreq.exe).
@@ -26,6 +38,8 @@
 .PARAMETER OutputFolder
     Folder where issued certificates (.cer) are saved.
     Relative paths are resolved against the current directory and stored as absolute paths.
+    In Retrieve mode each row is written to the path recorded at submit time; pass -OutputFolder
+    explicitly to redirect retrieved .cer files there instead (the tracking row is updated).
 
 .PARAMETER Mode
     Submit   = Submit new certificate requests.
@@ -586,7 +600,25 @@ if ($Mode -in 'Retrieve', 'Both') {
 
         $runResults = [System.Collections.ArrayList]@()
 
+        # The .cer path is recorded per row at submit time. An explicit -OutputFolder on a
+        # Retrieve run overrides it (the file name is kept); the default is not applied here,
+        # so a Retrieve from another working directory still lands where Submit put it.
+        $redirectOutput = $PSBoundParameters.ContainsKey('OutputFolder')
+        if ($redirectOutput) {
+            Write-BatchLog "Retrieved certificates will be written to: $OutputFolder"
+        }
+
         foreach ($record in $unresolved) {
+            if ($redirectOutput) {
+                $cerName = if ($record.OutputCertFile) {
+                    [System.IO.Path]::GetFileName($record.OutputCertFile)
+                }
+                else {
+                    [System.IO.Path]::GetFileNameWithoutExtension($record.RequestFile) + '.cer'
+                }
+                $record.OutputCertFile = Join-Path $OutputFolder $cerName
+            }
+
             if ($PSCmdlet.ShouldProcess("RequestID $($record.RequestID)", "Retrieve certificate from $CAConfig")) {
                 try {
                     Get-IssuedCertificate -Record $record -CAConfig $CAConfig -KeepRspFile:$KeepRspFile

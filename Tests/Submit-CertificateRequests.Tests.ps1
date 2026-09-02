@@ -154,6 +154,11 @@ Describe 'Submit-CertificateRequests' {
             $syn | Should -Not -Match '\[\[-|\[<CommonParameters>\]'
         }
 
+        It 'carries a PSScriptInfo header (Test-ScriptFileInfo parses it; Version is semver)' {
+            $info = Test-ScriptFileInfo -Path $script:Submit -ErrorAction Stop
+            $info.Version | Should -Match '^\d+\.\d+\.\d+$'
+            $info.Guid    | Should -Not -BeNullOrEmpty
+        }
         It 'documents every non-common parameter' {
             $cmd = Get-Command $script:Submit
             $common = [System.Management.Automation.PSCmdlet]::CommonParameters + [System.Management.Automation.PSCmdlet]::OptionalCommonParameters
@@ -254,8 +259,9 @@ RequestType = PKCS10
             # Run the script capturing ALL streams as one string, then re-read the tracking CSV.
             function script:Invoke-Submit {
                 param([hashtable]$Params)
-                $base = @{ CAConfig = $script:Ca; TrackingFile = $script:Tracking; OutputFolder = $script:CertDir; Confirm = $false }
-                $out = & $script:Submit @base @Params *>&1 | Out-String -Width 400
+                $call = @{ CAConfig = $script:Ca; TrackingFile = $script:Tracking; OutputFolder = $script:CertDir; Confirm = $false }
+                foreach ($k in $Params.Keys) { $call[$k] = $Params[$k] }   # a test may override a default (e.g. OutputFolder)
+                $out = & $script:Submit @call *>&1 | Out-String -Width 400
                 $rows = if (Test-Path $script:Tracking) { @(Import-Csv $script:Tracking) } else { @() }
                 foreach ($r in $rows) {
                     if ($r.RequestID -match '^\d+$' -and [int]$r.RequestID -notin $script:CaRequestIds) {
@@ -363,6 +369,21 @@ RequestType = PKCS10
             $updated = $r.Rows | Where-Object { $_.RequestID -eq $rows[0].RequestID } | Select-Object -First 1
             $updated.Status | Should -BeExactly 'Issued'
             Test-Path $updated.OutputCertFile | Should -BeTrue
+        }
+
+        It 'Retrieve mode with an explicit -OutputFolder writes the .cer there and updates the row' {
+            $rows = @(Import-Csv $script:Tracking)
+            $rows[0].Status = 'Unknown'
+            Remove-Item -LiteralPath $rows[0].OutputCertFile -Force
+            $rows | Export-Csv $script:Tracking -NoTypeInformation -Encoding utf8
+            $altDir = Join-Path $TestDrive 'certs-alt'
+
+            $r = script:Invoke-Submit @{ Mode = 'Retrieve'; OutputFolder = $altDir }
+            $updated = $r.Rows | Where-Object { $_.RequestID -eq $rows[0].RequestID } | Select-Object -First 1
+            $updated.Status | Should -BeExactly 'Issued'
+            $updated.OutputCertFile | Should -Be (Join-Path $altDir ([IO.Path]::GetFileName($rows[0].OutputCertFile)))
+            Test-Path $updated.OutputCertFile | Should -BeTrue
+            Test-Path $rows[0].OutputCertFile | Should -BeFalse
         }
 
         It 'skips an empty request file without creating a row' {

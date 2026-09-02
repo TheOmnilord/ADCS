@@ -18,6 +18,15 @@ existing code.
     silently fails to bind and shows only auto-generated syntax (a real bug this repo has hit).
     Either placement works with the blank line — the scripts here use both (`Sync-ADCSTemplate`
     keeps `#Requires` before the help with a blank line; the others put it after).
+  - The same applies to the **`<#PSScriptInfo ... #>` header** at the very top of every script:
+    PowerShell merges adjacent comment blocks, so the blank line after its `#>` is what keeps the
+    help block separate. Without it both `Get-Help` and `Test-ScriptFileInfo` break (verified on
+    5.1 and 7). The Static tier asserts the header parses.
+- **Bump the script version.** Each script carries its own `.VERSION` in that `PSScriptInfo`
+  header, bumped only when that script changes (patch for a fix, minor for a new feature, major
+  for a breaking parameter change), with a line under `.RELEASENOTES`. Add a matching entry to
+  [CHANGELOG.md](./CHANGELOG.md) under *Unreleased*; the repo release tag is bumped when a release
+  is cut, and its changelog section lists the script versions it ships.
 
 ## Before you open a PR
 

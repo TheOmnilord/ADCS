@@ -1,3 +1,14 @@
+<#PSScriptInfo
+.VERSION 1.0.0
+.GUID 61adf5d1-6eb5-4f41-8670-e9da72134570
+.AUTHOR Sveinung Svea
+.PROJECTURI https://github.com/TheOmnilord/ADCS
+.LICENSEURI https://github.com/TheOmnilord/ADCS/blob/main/LICENSE
+.TAGS ADCS PKI CertificateServices
+.RELEASENOTES
+1.0.0 - Initial release
+#>
+
 <#
 .SYNOPSIS
     Registers (or removes) a certificate enrollment policy (CEP) server in the registry

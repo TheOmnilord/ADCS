@@ -17,6 +17,12 @@ Currently includes:
 
 Works on Windows PowerShell 5.1 and PowerShell 7+. `Set-ADCSTemplateValidity` and `Submit-CertificateRequests` have no AD PowerShell module dependency; `Sync-ADCSTemplate` requires the RSAT ActiveDirectory module and `Add-CertificateEnrollmentPolicyServerToGpo` the GroupPolicy module (see each script's requirements); `Add-CertificateEnrollmentPolicyServerOffline` needs no module.
 
+**Versioning.** Each script carries its own version in a `PSScriptInfo` header at the top of the file, bumped only when that script changes; releases are tagged on the repository (badge above) and [CHANGELOG.md](./CHANGELOG.md) lists which script versions each release ships. To check whether a deployed copy is current without opening it:
+
+```powershell
+Test-ScriptFileInfo .\Submit-CertificateRequests.ps1 | Select-Object Name, Version
+```
+
 ## Scripts
 
 Jump to a script — or straight to a section within it. Each script title links to its full documentation; the source file is linked alongside.
@@ -214,7 +220,7 @@ Batch-submits certificate signing requests (`.req` / `.csr` / `.txt`) from a fol
 | `-CAConfig` | `string` | Yes | | CA configuration string, e.g. `CA01.domain.com\Contoso Issuing CA 1`. Always required. |
 | `-CertificateTemplate` | `string` | Submit/Both only | | Certificate template name (the CN, not the display name). Not used, and not required, for `-Mode Retrieve`. |
 | `-TrackingFile` | `string` | No | `.\CertTracking.csv` | CSV file used to track request IDs and statuses across runs. |
-| `-OutputFolder` | `string` | No | `.\Certificates` | Folder where issued `.cer` files are saved (one per request, named after the request file). |
+| `-OutputFolder` | `string` | No | `.\Certificates` | Folder where issued `.cer` files are saved (one per request, named after the request file). In `Retrieve` mode each row is written to the path recorded at submit time unless `-OutputFolder` is passed explicitly, which redirects the retrieved files (and updates the tracking row). |
 | `-Mode` | `Submit` / `Retrieve` / `Both` | No | `Submit` | `Submit` = submit new requests only; `Retrieve` = pull certs for previously-pending requests; `Both` = do both. |
 | `-KeepRspFile` | switch | No | | By default the `.rsp` file `certreq` writes next to each retrieved `.cer` is deleted. Specify this switch to leave it in place. |
 | `-Force` | switch | No | | Resubmit request files that already have a tracked RequestID without prompting. Without `-Force`, the script asks y/n for each already-submitted file (default = No / skip). |
@@ -237,6 +243,14 @@ Batch-submits certificate signing requests (`.req` / `.csr` / `.txt`) from a fol
 .\Submit-CertificateRequests.ps1 `
     -CAConfig "CA01.domain.com\Contoso Issuing CA 1" `
     -Mode Retrieve
+```
+
+Retrieved `.cer` files land at the path recorded for each row at submit time. To put them somewhere else, pass `-OutputFolder` explicitly on the `Retrieve` run:
+```powershell
+.\Submit-CertificateRequests.ps1 `
+    -CAConfig "CA01.domain.com\Contoso Issuing CA 1" `
+    -Mode Retrieve `
+    -OutputFolder "C:\Certificates\Issued"
 ```
 
 **Submit and retrieve in one go:**

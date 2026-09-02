@@ -160,6 +160,11 @@ Describe 'Add-CertificateEnrollmentPolicyServerToGpo' {
             (Get-Help $script:Gpo).Synopsis.Trim() | Should -Not -BeNullOrEmpty
         }
 
+        It 'carries a PSScriptInfo header (Test-ScriptFileInfo parses it; Version is semver)' {
+            $info = Test-ScriptFileInfo -Path $script:Gpo -ErrorAction Stop
+            $info.Version | Should -Match '^\d+\.\d+\.\d+$'
+            $info.Guid    | Should -Not -BeNullOrEmpty
+        }
         It 'documents every non-common parameter' {
             $cmd = Get-Command $script:Gpo
             $common = [System.Management.Automation.PSCmdlet]::CommonParameters + [System.Management.Automation.PSCmdlet]::OptionalCommonParameters

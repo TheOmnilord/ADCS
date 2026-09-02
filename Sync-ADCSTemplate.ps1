@@ -1,3 +1,14 @@
+<#PSScriptInfo
+.VERSION 1.0.0
+.GUID 689db74d-e668-410a-9a62-0b208179a369
+.AUTHOR Sveinung Svea
+.PROJECTURI https://github.com/TheOmnilord/ADCS
+.LICENSEURI https://github.com/TheOmnilord/ADCS/blob/main/LICENSE
+.TAGS ADCS PKI CertificateServices
+.RELEASENOTES
+1.0.0 - Initial release
+#>
+
 #Requires -Modules ActiveDirectory
 
 <#

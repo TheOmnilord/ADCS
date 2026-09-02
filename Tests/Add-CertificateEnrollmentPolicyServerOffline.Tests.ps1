@@ -147,6 +147,11 @@ Describe 'Add-CertificateEnrollmentPolicyServerOffline' {
             (Get-Help $script:Cep).Synopsis.Trim() | Should -Not -BeNullOrEmpty
         }
 
+        It 'carries a PSScriptInfo header (Test-ScriptFileInfo parses it; Version is semver)' {
+            $info = Test-ScriptFileInfo -Path $script:Cep -ErrorAction Stop
+            $info.Version | Should -Match '^\d+\.\d+\.\d+$'
+            $info.Guid    | Should -Not -BeNullOrEmpty
+        }
         It 'documents every non-common parameter' {
             $cmd = Get-Command $script:Cep
             $common = [System.Management.Automation.PSCmdlet]::CommonParameters + [System.Management.Automation.PSCmdlet]::OptionalCommonParameters

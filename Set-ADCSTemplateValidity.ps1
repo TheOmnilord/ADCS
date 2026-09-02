@@ -1,4 +1,15 @@
-﻿<#
+﻿<#PSScriptInfo
+.VERSION 1.0.0
+.GUID 48b937ae-18bd-4710-9de9-5ae76f7c9a72
+.AUTHOR Sveinung Svea
+.PROJECTURI https://github.com/TheOmnilord/ADCS
+.LICENSEURI https://github.com/TheOmnilord/ADCS/blob/main/LICENSE
+.TAGS ADCS PKI CertificateServices
+.RELEASENOTES
+1.0.0 - Initial release
+#>
+
+<#
 .SYNOPSIS
     Sets the validity period (and optionally the renewal overlap period) on one or more ADCS certificate templates.
 

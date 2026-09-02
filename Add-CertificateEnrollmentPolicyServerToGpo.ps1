@@ -1,3 +1,14 @@
+<#PSScriptInfo
+.VERSION 1.0.0
+.GUID 54763db6-2359-401f-8960-ef0de5911aaf
+.AUTHOR Sveinung Svea
+.PROJECTURI https://github.com/TheOmnilord/ADCS
+.LICENSEURI https://github.com/TheOmnilord/ADCS/blob/main/LICENSE
+.TAGS ADCS PKI CertificateServices
+.RELEASENOTES
+1.0.0 - Initial release
+#>
+
 <#
 .SYNOPSIS
     Writes (or removes) a certificate enrollment policy (CEP) server directly in a domain GPO -
