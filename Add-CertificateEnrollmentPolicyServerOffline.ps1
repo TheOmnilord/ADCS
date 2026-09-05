@@ -1,11 +1,12 @@
 <#PSScriptInfo
-.VERSION 1.0.0
+.VERSION 1.0.1
 .GUID 61adf5d1-6eb5-4f41-8670-e9da72134570
 .AUTHOR Sveinung Svea
 .PROJECTURI https://github.com/TheOmnilord/ADCS
 .LICENSEURI https://github.com/TheOmnilord/ADCS/blob/main/LICENSE
 .TAGS ADCS PKI CertificateServices
 .RELEASENOTES
+1.0.1 - For the GP locations the domain objectGUID for the AD Enrollment Policy row is resolved BEFORE the CEP entry is written; on a domain-joined machine a lookup failure now aborts the run with nothing written (previously the entry was written first and the failure became a warning, leaving a GP configuration that removes the AD enrollment policy); on a workgroup machine the row is still skipped with a warning
 1.0.0 - Initial release
 #>
 
@@ -346,8 +347,95 @@ if ($AllowUntrustedIssuer) { $flags = $flags -bor 0x20 }  # PsfAllowUnTrustedCA
 
 $entryApplied = $false; $adRow = 'n/a'; $defaultChanged = $false; $dupRemoved = @()
 
-# ---- 1. the CEP entry ----------------------------------------------------------------------
-$verb = if (Test-Path -LiteralPath $target) { 'Update' } else { 'Create' }
+# ---- 0. prerequisite for the AD enrollment policy row (GP locations) - resolved BEFORE any write
+# Once GP-based CEP configuration exists, the client stops synthesizing the AD enrollment policy;
+# without the LDAP: row it is lost. So the domain objectGUID the row needs is resolved first: on a
+# domain-joined machine a failure aborts the run with nothing written (it must not become a
+# warning after the entry exists); on a workgroup machine there is no AD policy to lose, so the
+# row is skipped with a warning as documented.
+$adPid = $null
+if ($isGP -and -not $SkipADPolicy) {
+    try {
+        $dn  = ([ADSI]'LDAP://RootDSE').defaultNamingContext.Value
+        if (-not $dn) { throw 'RootDSE returned no defaultNamingContext' }
+        $dom = [ADSI]("LDAP://$dn")
+        $adPid = '{' + (New-Object Guid (, ([byte[]]$dom.Properties['objectGUID'][0]))).ToString().ToUpper() + '}'
+    } catch {
+        $lookupError = $_
+        # Fail closed on the membership probe too: if it cannot be determined, assume joined.
+        $joined = $true
+        try { $joined = [bool](Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).PartOfDomain } catch { Write-Verbose "Domain membership probe failed ($_); assuming domain-joined." }
+        if ($joined) {
+            throw "Could not resolve the domain objectGUID needed for the AD Enrollment Policy row on this domain-joined machine ($lookupError). Nothing was written. Without that row the machine would LOSE the AD enrollment policy (autoenrollment against AD-published templates stops), so the run stops here: fix the lookup (connectivity, permissions), or pass -SkipADPolicy to omit the row deliberately."
+        }
+        Write-Warning "Workgroup machine (no domain objectGUID available): skipping the AD policy row - there is no AD enrollment policy to preserve here. ($lookupError)"
+        $adRow = 'skipped (no domain)'
+    }
+}
+
+# ---- 1. AD enrollment policy row FIRST (GP locations; prevents losing the AD default policy)
+# Written before the CEP entry so the hive is never left in the state "CEP entry present, LDAP:
+# row absent" - neither through a write failure (aborts before the entry exists) nor through a
+# declined confirmation (the CEP step below refuses to run then).
+# "Already present" means a COMPLETE, correct row: URL 'LDAP:' AND this domain's PolicyID - not
+# merely the key (Write-CepEntry creates the key before its values, so an interrupted earlier run
+# can leave an empty one that would not restore the AD enrollment policy).
+$adRowPresent = $false
+if ($isGP -and $adPid -and (Test-Path -LiteralPath "$hive\$AD_KEY")) {
+    $adKey = Get-Item -LiteralPath "$hive\$AD_KEY"
+    $adRowPresent = ("$($adKey.GetValue('URL'))" -eq 'LDAP:') -and ("$($adKey.GetValue('PolicyID'))" -eq "$adPid")
+}
+if ($isGP) {
+    if ($SkipADPolicy) { $adRow = 'skipped (-SkipADPolicy)' }
+    elseif ($adPid) {
+        $adTarget = "$hive\$AD_KEY"
+        if ($PSCmdlet.ShouldProcess($adTarget, "Ensure AD Enrollment Policy row (URL=LDAP:, PolicyID=$adPid, Flags=0x14, Cost=0xFFFFFFFF)")) {
+            try {
+                Write-CepEntry -EntryPath $adTarget `
+                    -Strings @{ URL = 'LDAP:'; PolicyID = $adPid; FriendlyName = 'Active Directory Enrollment Policy' } `
+                    -Dwords  @{ Flags = 0x14; AuthFlags = 2; Cost = (ConvertTo-DwordInt 4294967295) }
+            } catch { throw "AD policy row write to $adTarget failed: $_ (the CEP entry was NOT written)" }
+            $adRow = 'applied'
+        } else { $adRow = 'not run' }
+    }
+}
+
+function New-AddSummary([string[]]$Removed) {
+    # The Add-mode result object, from the ACTUAL registry state at the time it is built.
+    [pscustomobject]@{
+        Mode           = 'Add'
+        Location       = $Location
+        Path           = $target
+        Url            = $Url
+        PolicyID       = $PolicyId
+        FriendlyName   = $PolicyName
+        Flags          = '0x{0:X}' -f $flags
+        Authentication = '{0} (0x{1:X})' -f $Authentication, $authFlags
+        Cost           = '0x{0:X}' -f $Cost
+        EntryApplied   = $entryApplied
+        ADPolicyRow    = $adRow
+        RootFlags      = Get-RootFlagsDisplay
+        DefaultMarker  = "$(Get-DefaultMarker)"
+        DefaultChanged = $defaultChanged
+        DuplicatesRemoved = @($Removed)
+        Notes          = @($notes)
+    }
+}
+
+# ---- 2. the CEP entry ----------------------------------------------------------------------
+# For the GP locations this depends on step 1: without an LDAP: row (just written, already
+# present, deliberately omitted with -SkipADPolicy, or moot on a workgroup machine) the entry is
+# NOT written and the Add workflow STOPS here - a declined AD-row prompt declines the CEP entry
+# and everything that builds on it (root Flags, (Default) marker, sibling cleanup). -WhatIf
+# previews all steps regardless.
+$entryPreexisting = Test-Path -LiteralPath $target
+$adRowSatisfied = (-not $isGP) -or $SkipADPolicy -or $adRow -in 'applied', 'skipped (no domain)' -or $adRowPresent
+if (-not $adRowSatisfied -and -not $WhatIfPreference) {
+    $notes.Add("CEP entry NOT written and the run stopped here: the AD Enrollment Policy row was declined and $hive carries none. Writing the entry without it would make this machine LOSE the AD enrollment policy (autoenrollment against AD-published templates stops). Nothing else was changed. Re-run and accept the AD row, or pass -SkipADPolicy to omit it deliberately.")
+    foreach ($n in $notes) { Write-Warning $n }
+    return New-AddSummary -Removed @()
+}
+$verb = if ($entryPreexisting) { 'Update' } else { 'Create' }
 $action = "$verb CEP entry '{0}' (URL={1}, PolicyID={2}, Flags=0x{3:X}, AuthFlags=0x{4:X} {5}, Cost=0x{6:X})" -f `
           $PolicyName, $Url, $PolicyId, $flags, $authFlags, $Authentication, $Cost
 if ($PSCmdlet.ShouldProcess($target, $action)) {
@@ -358,33 +446,20 @@ if ($PSCmdlet.ShouldProcess($target, $action)) {
     } catch { throw "CEP entry write to $target failed (the key may be partially written - inspect it): $_" }
     $entryApplied = $true
 }
-
-# ---- 2. AD enrollment policy row (GP locations; prevents losing the AD default policy) -----
-if ($isGP) {
-    if ($SkipADPolicy) { $adRow = 'skipped (-SkipADPolicy)' }
-    else {
-        $adPid = $null
-        try {
-            $dn  = ([ADSI]'LDAP://RootDSE').defaultNamingContext.Value
-            $dom = [ADSI]("LDAP://$dn")
-            $adPid = '{' + (New-Object Guid (, ([byte[]]$dom.Properties['objectGUID'][0]))).ToString().ToUpper() + '}'
-        } catch {
-            Write-Warning "Could not resolve the domain objectGUID (workgroup machine?). Skipping the AD policy row - clients using this GP configuration will NOT see the AD enrollment policy. ($_)"
-            $adRow = 'skipped (no domain)'
-        }
-        if ($adPid) {
-            $adTarget = "$hive\$AD_KEY"
-            if ($PSCmdlet.ShouldProcess($adTarget, "Ensure AD Enrollment Policy row (URL=LDAP:, PolicyID=$adPid, Flags=0x14, Cost=0xFFFFFFFF)")) {
-                try {
-                    Write-CepEntry -EntryPath $adTarget `
-                        -Strings @{ URL = 'LDAP:'; PolicyID = $adPid; FriendlyName = 'Active Directory Enrollment Policy' } `
-                        -Dwords  @{ Flags = 0x14; AuthFlags = 2; Cost = (ConvertTo-DwordInt 4294967295) }
-                } catch { throw "AD policy row write to $adTarget failed: $_" }
-                $adRow = 'applied'
-            } else { $adRow = 'not run' }
-        }
-    }
+# The (Default) marker and the removal of stale siblings point AT the entry, so they run only
+# when an entry for THIS URL serving THIS PolicyID exists (written now, or already present from
+# an earlier run with the same PolicyID). A declined CEP prompt must not leave a marker pointing
+# at nothing, and an existing entry that still serves a DIFFERENT PolicyID (the declined update
+# would have changed it) must not let the marker or the sibling cleanup act for the requested one.
+# A pre-existing entry counts only when COMPLETE for this request - URL and PolicyID both as
+# requested (an interrupted earlier write can leave a key with a PolicyID but no URL, which no
+# client can use). Re-evaluated from the live registry right before the sibling cleanup.
+function Test-EntryComplete {
+    if (-not (Test-Path -LiteralPath $target)) { return $false }
+    $k = Get-Item -LiteralPath $target
+    ("$($k.GetValue('URL'))" -eq $Url) -and ("$($k.GetValue('PolicyID'))" -eq "$PolicyId")
 }
+$entryExists = $entryApplied -or $WhatIfPreference -or (Test-EntryComplete)
 
 # ---- 3. root Flags (GP locations; DISABLE bits, preserved across runs) ---------------------
 if ($isGP) {
@@ -407,7 +482,10 @@ if ($isGP) {
 
 # ---- 4. (Default) marker -------------------------------------------------------------------
 if ($SetAsDefault) {
-    if ($PSCmdlet.ShouldProcess($hive, "Set (Default) marker = $PolicyId (default enrollment policy = '$PolicyName')")) {
+    if (-not $entryExists) {
+        $notes.Add("(Default) marker NOT set: the CEP entry was declined and does not exist under $hive, so the marker would point at nothing.")
+    }
+    elseif ($PSCmdlet.ShouldProcess($hive, "Set (Default) marker = $PolicyId (default enrollment policy = '$PolicyName')")) {
         if (-not (Test-Path -LiteralPath $hive)) { New-Item -Path $hive -Force | Out-Null }
         Set-ItemProperty -LiteralPath $hive -Name '(default)' -Value $PolicyId
         $defaultChanged = $true
@@ -419,10 +497,29 @@ if ($ClearDefault -and (Get-DefaultMarker)) {
 
 # ---- 5. consistency checks: stale duplicates and orphaned default --------------------------
 $entries = @(Get-CepEntries)
+# Sibling removal is judged on the registry as it is NOW: the replacing entry must be complete at
+# this moment - "written earlier this run" does not count, another writer may have removed or
+# changed it since - or the "superseded" siblings are the only working endpoints and must stay.
+$entryExists = $WhatIfPreference -or (Test-EntryComplete)
 $dups = @($entries | Where-Object { "$($_.PolicyID)" -eq "$PolicyId" -and $_.Key -ne $key -and $_.Key -ne $AD_KEY })
 foreach ($d in $dups) {
-    if ($ReplaceExisting) {
+    if ($ReplaceExisting -and -not $entryExists) {
+        $notes.Add("Superseded entry '$($d.URL)' (key $($d.Key)) NOT removed: the replacing CEP entry was declined and does not exist, so removing it would leave no endpoint for PolicyID $PolicyId.")
+    }
+    elseif ($ReplaceExisting) {
         if ($PSCmdlet.ShouldProcess("$hive\$($d.Key)", "Remove superseded entry with same PolicyID (URL=$($d.URL))")) {
+            # Re-validate AFTER the approval (a -Confirm prompt can stay open indefinitely): the
+            # replacement must still be complete, and this sibling must still serve the requested
+            # PolicyID under a different URL, in the live registry right now.
+            if (-not (Test-EntryComplete)) {
+                $notes.Add("Superseded entry '$($d.URL)' (key $($d.Key)) NOT removed: the replacing CEP entry is no longer complete (changed or removed while the prompt was open).")
+                continue
+            }
+            $sib = Get-Item -LiteralPath "$hive\$($d.Key)" -ErrorAction SilentlyContinue
+            if (-not $sib -or "$($sib.GetValue('PolicyID'))" -ne "$PolicyId" -or "$($sib.GetValue('URL'))" -eq $Url) {
+                $notes.Add("Entry at key $($d.Key) NOT removed: it no longer serves PolicyID $PolicyId under a different URL (changed or removed while the prompt was open).")
+                continue
+            }
             Remove-Item -LiteralPath "$hive\$($d.Key)" -Recurse -Force
             $dupRemoved += $d.URL
         }
@@ -439,21 +536,4 @@ if ($marker) {
 }
 foreach ($n in $notes) { Write-Warning $n }
 
-[pscustomobject]@{
-    Mode           = 'Add'
-    Location       = $Location
-    Path           = $target
-    Url            = $Url
-    PolicyID       = $PolicyId
-    FriendlyName   = $PolicyName
-    Flags          = '0x{0:X}' -f $flags
-    Authentication = '{0} (0x{1:X})' -f $Authentication, $authFlags
-    Cost           = '0x{0:X}' -f $Cost
-    EntryApplied   = $entryApplied
-    ADPolicyRow    = $adRow
-    RootFlags      = Get-RootFlagsDisplay
-    DefaultMarker  = "$(Get-DefaultMarker)"
-    DefaultChanged = $defaultChanged
-    DuplicatesRemoved = @($dupRemoved)
-    Notes          = @($notes)
-}
+New-AddSummary -Removed $dupRemoved

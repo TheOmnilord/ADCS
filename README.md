@@ -100,7 +100,7 @@ Sources: [michalspacek.com](https://www.michalspacek.com/validity-period-of-http
 
 | Parameter | Type | Required | Description |
 | --- | --- | --- | --- |
-| `-TemplateName` | `string[]` | Yes | One or more template CN names. Supports LDAP wildcards (`*`, `?`). |
+| `-TemplateName` | `string[]` | Yes | One or more template CN names. Supports the LDAP wildcard `*` (LDAP has no single-character wildcard; a `?` matches literally). |
 | `-ValidityPeriod` | `int` (1-9999) | Yes | Numeric value for the new validity period. |
 | `-ValidityPeriodUnit` | `Years` / `Months` / `Weeks` / `Days` / `Hours` | Yes | Unit for `-ValidityPeriod`. AD uses 365 days/year and 30 days/month. |
 | `-OverlapPeriod` | `int` (1-9999) | No | Numeric value for the renewal overlap period. |
@@ -172,6 +172,7 @@ A color-coded summary is printed at the end:
 - Changes replicate forest-wide from the Configuration NC. Allow normal AD replication time.
 - The script increments `msPKI-Template-Minor-Revision` on each change so issuing CAs detect the update.
 - `-WhatIf` templates show as `Skipped` in the output (they would have been modified but weren't due to the WhatIf flag).
+- Failures are reported per template as they happen and the remaining templates are still processed — but a run in which anything failed ends with a terminating error (non-zero exit) after the summary, so automation cannot mistake a partial update for success.
 
 ### How It Works
 
@@ -179,7 +180,7 @@ A color-coded summary is printed at the end:
 2. Searches `CN=Certificate Templates,CN=Public Key Services,CN=Services,<ConfigNC>` for templates matching the pattern(s) using an LDAP filter.
 3. For each match, decodes the current `pKIExpirationPeriod` / `pKIOverlapPeriod` (8-byte little-endian negative FILETIME ticks).
 4. Compares against the requested value; skips if already equal.
-5. Writes the new byte array via `DirectoryEntry.InvokeSet()` and calls `SetInfo()` to commit.
+5. Assigns the new byte array through the property cache (`DirectoryEntry.Properties['pKIExpirationPeriod'].Value`) and calls `SetInfo()` to commit. (`InvokeSet()` is deliberately *not* used: its `params object[]` binding unrolls the 8-byte array into eight separate values.)
 
 <sub>[↑ Back to top](#top)</sub>
 
@@ -224,6 +225,8 @@ Batch-submits certificate signing requests (`.req` / `.csr` / `.txt`) from a fol
 | `-Mode` | `Submit` / `Retrieve` / `Both` | No | `Submit` | `Submit` = submit new requests only; `Retrieve` = pull certs for previously-pending requests; `Both` = do both. |
 | `-KeepRspFile` | switch | No | | By default the `.rsp` file `certreq` writes next to each retrieved `.cer` is deleted. Specify this switch to leave it in place. |
 | `-Force` | switch | No | | Resubmit request files that already have a tracked RequestID without prompting. Without `-Force`, the script asks y/n for each already-submitted file (default = No / skip). |
+| `-AllowUnprotectedOutputFolder` | switch | No | | By default the script refuses to deliver into or through a folder that an untrusted principal owns, or can delete, rename or write to (such a user could swap it for a junction during a delivery, or turn an empty folder into one with mere write rights). Pass this to accept the risk; the conditions are then only warned about. |
+| `-TrustedOutputPrincipal` | `string[]` | No | | Additional principals (SIDs or `DOMAIN\Group` names) that may own, or hold delete/rename/write rights on, the delivery folders, on top of SYSTEM, Administrators, TrustedInstaller, the running account and its Domain/Enterprise Admins. |
 | `-WhatIf` | switch | No | | Preview without submitting/retrieving. |
 | `-Confirm` | switch | No | | Prompt before each action. |
 
@@ -314,7 +317,7 @@ In this example the lone `Error: 1` is a historical row from an earlier session,
 | `RequestFile` | Full path of the source `.req`/`.csr`/`.txt` file |
 | `RequestID` | Numeric request ID assigned by the CA |
 | `SubmitTime` | ISO-8601 submission timestamp |
-| `Status` | `Issued`, `Pending`, `Denied`, `Error`, or `Unknown` |
+| `Status` | `Issued`, `Pending`, `Denied`, `Error`, `Unknown`, or `Undelivered` (the CA issued, but the `.cer` could not be delivered to its destination; counts as submitted, re-fetched by `Retrieve` when a RequestID is present) |
 | `OutputCertFile` | Full path where the issued `.cer` is saved |
 | `LastCheckTime` | ISO-8601 timestamp of last status check |
 | `ErrorMessage` | Error output from `certreq` if the submission or retrieval failed |
@@ -322,6 +325,11 @@ In this example the lone `Error: 1` is a historical row from an earlier session,
 ### Notes
 
 - The tracking CSV is the source of truth for resume behavior. Deleting it will cause the script to re-submit all files (and the CA may issue duplicates).
+- One run per tracking file: the script holds an exclusive lock file (`<TrackingFile>.lock`, removed when the run ends) for its whole run and refuses to start while another run holds it — on this or any other machine, via any alias of the path — because two concurrent writers would silently drop each other's rows. The tracking file's name is canonicalized first (an 8.3 short name resolves to the long name, so both spellings share one lock), and a hard-linked or symlinked tracking file is refused. A `-WhatIf` run takes no lock.
+- certreq always writes into a private, randomly named staging file **inside the destination folder** (never %TEMP%, whose inherited file ACL could let another account tamper with the certificate and would travel onto the delivered file); the destination is touched only after a successful write, so a pending, denied or failed request never disturbs it, and the delivered file is reset to inherit the folder's ACL. A row's `OutputCertFile` is an identifier inside an operator-chosen boundary, not an authority: it must be a rooted `.cer` path in an existing folder beneath the tracking file's folder or the run's `-OutputFolder` (canonically, with no junction/symlink in between, re-checked right before delivery), and `RequestID` must be numeric; rows failing this are skipped with an error and never reach certreq. The destination itself must be a plain file or absent (a folder or link named `x.cer` is refused, and delivery verifies that a plain file resulted). If an issued certificate cannot be delivered (locked destination, denied rename), the row becomes `Undelivered` with its RequestID kept and the certificate left in its staging file beside the destination (path in `ErrorMessage`): it counts as submitted on later runs (never resubmitted automatically) and `Retrieve` re-fetches it; an `Undelivered` row with no RequestID is reported for manual reconciliation.
+- Output folders must not be swappable by untrusted users. Every folder from the destination up to the volume/share root is checked, and the script **refuses** to deliver when any of them is a reparse point (junction/symlink/mount point), is owned by an untrusted principal, can be deleted, renamed or written to by one (delete/rename lets such a user replace it with a junction between the path check and the privileged delivery; write-data or write-attributes access is all `FSCTL_SET_REPARSE_POINT` needs, so "create files" rights let them turn an *empty* folder, such as a freshly created output folder, into a junction in place), or has a security descriptor that cannot be read. Trusted principals are SYSTEM, `BUILTIN\Administrators`, TrustedInstaller, the running account, its Domain Admins / Enterprise Admins, and anything named in `-TrustedOutputPrincipal`; `-AllowUnprotectedOutputFolder` downgrades the refusals to warnings. Only the create-*subfolder* right by itself (what the `C:\` root grants Users on itself) and inherit-only ACEs are tolerated: neither can set a reparse point on the folder, a pre-planted junction is refused by the reparse-point checks, an attacker-created subfolder is refused by the owner check, and a folder or junction planted under the exact destination name between check and delivery receives no file, because every delivery is a no-overwrite rename (`File.Move`) that fails when anything occupies the name instead of moving the file into it. The `.rsp` written with `-KeepRspFile` and the tracking-file replacement follow the same rule.
+- `Issued` is decided by certreq's exit code plus the presence of the certificate it wrote (into a fresh temp file, so it is unambiguously this run's output; language-independent). On success the certificate is delivered to the destination; a file already there (a `-Force` resubmit, or a retry of an unresolved row) is moved aside as `<name>.superseded-<UTC stamp>.cer` — never deleted — and that copy is removed again only if the fresh certificate is byte-identical. A retrieval that reports Issued without producing the file is recorded as `Error` and retried on the next `Retrieve`. The RequestID and the `Pending`/`Denied` dispositions are parsed from certreq's console text, which Windows localizes; on a non-English system they may parse as `Unknown`, and a missing RequestID is flagged in `ErrorMessage` so it can be filled in from the CA database.
+- Values that reach the certreq command line (`-CAConfig`, `-CertificateTemplate`, the `.cer` paths and `RequestID`) must not contain double quotes or control characters; such values are rejected before certreq runs.
 - `Pending` typically means the CA requires manager approval. Re-run in `Retrieve` mode after approval to pull the issued cert.
 - Issued `.cer` files are named after the source request file (e.g. `server1.req` -> `server1.cer`).
 - Empty request files are skipped with a warning.
@@ -585,6 +593,7 @@ It also handles the parts the dialog hides: on the Group Policy hives it preserv
 
 - `-PolicyName` is hashed **verbatim** — renaming the alias in EJBCA changes the PolicyID and orphans already-deployed entries.
 - Rerunning with a **different** URL does not remove the old entry (multiple URLs per PolicyID is also the legitimate redundant-endpoint pattern); use `-ReplaceExisting` to clean up a superseded one.
+- GP locations: the domain objectGUID for the AD Enrollment Policy row is resolved **before** anything is written. On a domain-joined machine a failed lookup aborts the run with nothing written (a GP configuration without that row removes the AD enrollment policy); on a workgroup machine the row is skipped with a warning. The row is written before the CEP entry; if the row's confirmation was declined and the hive carries none, the CEP entry is not written and the run stops there. The `(Default)` marker and `-ReplaceExisting` removals run only when a complete CEP entry for this URL exists (URL and PolicyID as requested, re-read right before the cleanup). Pass `-SkipADPolicy` to omit it deliberately.
 - `-Remove` handles a single entry and its `(Default)` marker; shared/root configuration (root Flags, the AD row, autoenrollment) is left in place — full manual teardown is documented in the script's `.NOTES`.
 
 ### Tests
@@ -681,6 +690,8 @@ Configuring CEP through Group Policy normally means the same server round-trip i
 - After a change, clients pick it up at the next GP refresh — force with `gpupdate`, then trigger enrollment with `certutil -pulse` (machine) or `certutil -user -pulse` (user).
 - `-PolicyName` is hashed **verbatim**; keep it identical to the EJBCA alias or deployed entries orphan.
 - `-Remove` clears one entry and its `(Default)` marker; shared configuration (root Flags, the AD row, Auto-Enrollment) is left in place — full teardown via `Remove-GPRegistryValue` is listed in the script's `.NOTES`.
+- The domain objectGUID for the AD Enrollment Policy row is resolved **before** any GPO write; if it cannot be resolved the run aborts with nothing written (a GPO carrying a CEP entry but no `LDAP:` row removes the AD enrollment policy from every client in scope). The row is then written and verified **before** the CEP entry; if the row's confirmation was declined and the GPO carries none, the CEP entry is not written and the run stops there (no root Flags, marker, Auto-Enrollment or sibling changes). The `(Default)` marker and `-ReplaceExisting` removals run only when a **complete** CEP entry for this URL exists (URL and PolicyID as requested, re-read right before the cleanup), so a declined entry prompt or a half-written entry cannot leave a marker pointing at nothing, delete the only working endpoint, or act for a PolicyID the retained entry does not serve. Pass `-SkipADPolicy` to omit the row deliberately.
+- A GUID-shaped `-GpoName` is read as a GPO ID only after an independent listing proves no GPO carries that display name; any other name-lookup failure aborts instead of silently retargeting.
 
 ### Tests
 

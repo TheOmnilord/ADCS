@@ -14,9 +14,12 @@
                    -CertificateTemplate), plus the connectivity pre-check against a CA that can
                    never exist (localhost) - certutil.exe is standard on Windows, so this runs on
                    CI. All Guard invocations use -WhatIf, so no folder or log file is created.
-      -Tag Lab     LIVE submissions to a real Enterprise CA. Skipped unless -RunLab is passed.
-                   Requires an enrollable template (default WebServer - subject supplied in the
-                   request, Enroll for Domain Admins). Surgical by construction: CSR subjects and
+      -Tag Lab     LIVE submissions to a real Enterprise CA. Skipped unless -RunLab is passed
+                   TOGETHER WITH an explicit -CAConfig naming the lab CA: the tier deletes the CA
+                   database rows it creates, so it never auto-discovers a CA (the first CA
+                   registered in AD could be production). Requires an enrollable template
+                   (default WebServer - subject supplied in the request, Enroll for Domain
+                   Admins). Surgical by construction: CSR subjects and
                    key containers carry a per-run PESTER-<hex> prefix, every CA RequestID this run
                    creates is tracked and its CA database row deleted in teardown by exact ID
                    (certutil -deleterow), pending-request store entries are removed by the
@@ -28,8 +31,10 @@
     Invoke-Pester -Path .\Tests\Submit-CertificateRequests.Tests.ps1 -ExcludeTag Lab
 
 .EXAMPLE
-    # Full run against a live CA (auto-discovers the CA config from AD Enrollment Services):
-    $cfg = New-PesterContainer -Path .\Tests\Submit-CertificateRequests.Tests.ps1 -Data @{ RunLab = $true }
+    # Full run against a live LAB CA - the CA must be named explicitly (no auto-discovery):
+    $cfg = New-PesterContainer -Path .\Tests\Submit-CertificateRequests.Tests.ps1 -Data @{
+        RunLab = $true; CAConfig = 'LAB-CA01.lab.example\Lab Issuing CA'
+    }
     Invoke-Pester -Container $cfg
 #>
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', '',
@@ -39,12 +44,17 @@
 param(
     [bool]   $RunLab      = $false,
     [string] $ScriptPath  = (Join-Path (Split-Path $PSScriptRoot -Parent) 'Submit-CertificateRequests.ps1'),
-    [string] $CAConfig    = '',            # Lab: '<host>\<CA name>'; auto-discovered from AD Enrollment Services when empty
+    [string] $CAConfig    = '',            # Lab: '<host>\<CA name>' of the LAB CA. REQUIRED for -RunLab (never auto-discovered).
     [string] $LabTemplate = 'WebServer'    # Lab: an enrollable subject-in-request template published on the CA
 )
 
 BeforeDiscovery {
-    $script:LabReady = $RunLab
+    # The Lab tier mutates a CA database (submits, then deletes its own rows), so it runs only
+    # against a CA the operator NAMED - never one picked up from AD, which could be production.
+    $script:LabReady = $RunLab -and -not [string]::IsNullOrWhiteSpace($CAConfig)
+    if ($RunLab -and -not $script:LabReady) {
+        Write-Warning 'Submit-CertificateRequests Lab tier skipped: -RunLab needs an explicit -CAConfig naming the lab CA (auto-discovery is deliberately not offered for a tier that deletes CA database rows).'
+    }
 }
 
 Describe 'Submit-CertificateRequests' {
@@ -57,7 +67,9 @@ Describe 'Submit-CertificateRequests' {
         # (The script has a mandatory -CAConfig and pings the CA on load, so it cannot be
         # dot-sourced wholesale; extracting the function bodies runs them with no side effects.)
         $ast = [System.Management.Automation.Language.Parser]::ParseFile($script:Submit, [ref]$null, [ref]$null)
-        foreach ($name in 'Resolve-FullPath', 'Write-BatchLog', 'Get-RequestIdFromOutput', 'Get-DispositionFromOutput',
+        foreach ($name in 'Resolve-FullPath', 'Resolve-TrackingFilePath', 'Assert-SafeNativeArgument', 'Assert-CertificateOutputPath', 'Assert-ProtectedDirectoryChain', 'Move-StaleCertificateAside', 'Remove-AsideIfIdentical', 'Move-RetrievedCertificate', 'New-TempCertificatePath',
+                          'Get-TrustedPrincipalSet', 'ConvertTo-PrincipalLabel', 'Get-UntrustedGrant', 'Get-UntrustedOwner',
+                          'Write-BatchLog', 'Get-RequestIdFromOutput', 'Get-DispositionFromOutput',
                           'Get-FriendlyErrorHint', 'Import-TrackingData', 'Export-TrackingData', 'Remove-RspFile') {
             $def = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name }, $false)
             if ($def) { . ([scriptblock]::Create($def[0].Extent.Text)) }
@@ -65,6 +77,28 @@ Describe 'Submit-CertificateRequests' {
         # Write-BatchLog (called by Export-TrackingData/Remove-RspFile) writes to $script:LogFile
         # unless suppressed - suppress it so Unit tests never touch the filesystem outside TestDrive.
         $script:SuppressLogFile = $true
+        # Assert-CertificateOutputPath reads the -AllowUnprotectedOutputFolder decision and the
+        # trusted-principal set from here (as the script's main block sets them).
+        $script:AllowUnprotectedOutput = $false
+        $script:TrustedSids = Get-TrustedPrincipalSet
+        # The machine's TEMP chain (where TestDrive lives) may legitimately grant delete/rename
+        # rights to principals the script does not know (e.g. a sandbox account on a dev box). The
+        # tests exercise the trust LOGIC, not this machine's ACLs, so whatever the pre-existing
+        # environment grants on TestDrive's ancestors are treated as trusted for the run - exactly
+        # what an operator would do with -TrustedOutputPrincipal. Folders the tests create carry
+        # only the ACEs the tests put there (inheritance is cut), so the assertions stay exact.
+        $script:EnvTrusted = @()
+        $probe = $TestDrive
+        while ($probe) {
+            try {
+                foreach ($label in @(Get-UntrustedGrant -Path $probe -Kind Swap)) { if ($label -match 'S-1-[\d-]+') { $script:EnvTrusted += $Matches[0] } }
+                $owner = Get-UntrustedOwner -Path $probe
+                if ($owner -and $owner -match 'S-1-[\d-]+') { $script:EnvTrusted += $Matches[0] }
+            } catch { }
+            $probe = [System.IO.Path]::GetDirectoryName($probe)
+        }
+        $script:EnvTrusted = @($script:EnvTrusted | Sort-Object -Unique)
+        $script:TrustedSids = Get-TrustedPrincipalSet -Extra $script:EnvTrusted
     }
 
     Context 'Unit: pure helpers' -Tag 'Unit' {
@@ -76,6 +110,25 @@ Describe 'Submit-CertificateRequests' {
 
         It 'Resolve-FullPath returns a rooted path unchanged (normalized)' {
             Resolve-FullPath -Path 'C:\a\..\b\t.csv' | Should -BeExactly 'C:\b\t.csv'
+        }
+
+        It 'Resolve-TrackingFilePath canonicalizes an 8.3 alias to the long name (same lock for both spellings)' {
+            $long = Join-Path $TestDrive 'CertificateTracking.csv'; 'x' | Out-File $long
+            $short = (New-Object -ComObject Scripting.FileSystemObject).GetFile($long).ShortPath
+            if ($short -eq $long) { Set-ItResult -Skipped -Because '8.3 names are disabled on this volume'; return }
+            Resolve-TrackingFilePath -Path $short | Should -BeExactly (Resolve-TrackingFilePath -Path $long)
+            (Resolve-TrackingFilePath -Path $short) | Should -Not -Match '~'
+            # a not-yet-existing file simply resolves to its absolute path
+            Resolve-TrackingFilePath -Path (Join-Path $TestDrive 'new.csv') | Should -BeExactly (Join-Path $TestDrive 'new.csv')
+        }
+
+        It 'Resolve-TrackingFilePath refuses a hard-linked or symlinked tracking file' {
+            $orig = Join-Path $TestDrive 'linked.csv'; 'x' | Out-File $orig
+            $link = Join-Path $TestDrive 'alias.csv'
+            try { New-Item -ItemType HardLink -Path $link -Target $orig -ErrorAction Stop | Out-Null }
+            catch { Set-ItResult -Skipped -Because "cannot create a hard link here: $_"; return }
+            { Resolve-TrackingFilePath -Path $link } | Should -Throw -ExpectedMessage '*HardLink*'
+            { Resolve-TrackingFilePath -Path $orig } | Should -Throw -ExpectedMessage '*HardLink*'   # both names are the same file
         }
 
         It 'Get-RequestIdFromOutput parses plain and quoted RequestId lines' {
@@ -125,8 +178,334 @@ Describe 'Submit-CertificateRequests' {
             $back[0].RequestID | Should -Be '5'
         }
 
+        It 'Export-TrackingData and Write-BatchLog suppress nested confirmation (the checkpoint is never a separate prompt)' {
+            # Under the script's -Confirm, $ConfirmPreference is Low and Export-Csv / Out-File would
+            # prompt on their own; declining THAT after certreq has submitted would lose the
+            # RequestID. Both must pass -Confirm:$false explicitly.
+            Mock Export-Csv { }
+            Mock Out-File { }
+            $rows = @([pscustomobject]@{ RequestFile = 'a.req'; RequestID = 1; SubmitTime = 't'; Status = 'Issued'; OutputCertFile = 'a.cer'; LastCheckTime = 't'; ErrorMessage = '' })
+            try { Export-TrackingData -Data $rows -Path (Join-Path $TestDrive 'nc.csv') } catch { }   # the (mocked-away) temp file makes the rename fail; irrelevant here
+            Should -Invoke Export-Csv -Times 1 -ParameterFilter { $null -ne $Confirm -and -not [bool]$Confirm }
+            $script:SuppressLogFile = $false
+            $script:LogFile = Join-Path $TestDrive 'nc.log'
+            try { Write-BatchLog 'checkpoint' } finally { $script:SuppressLogFile = $true }
+            Should -Invoke Out-File -Times 1 -ParameterFilter { $null -ne $Confirm -and -not [bool]$Confirm }
+        }
+
         It 'Import-TrackingData returns an empty array for a missing file' {
             @(Import-TrackingData -Path (Join-Path $TestDrive 'nope.csv')).Count | Should -Be 0
+        }
+
+        It 'Assert-SafeNativeArgument rejects quotes and control characters, accepts ordinary CA/template values' {
+            { Assert-SafeNativeArgument -Name T -Value 'CA01.domain.com\Contoso Issuing CA 1' } | Should -Not -Throw
+            { Assert-SafeNativeArgument -Name T -Value 'x" -foo "y' } | Should -Throw -ExpectedMessage '*double quotes*'
+            { Assert-SafeNativeArgument -Name T -Value "a`tb" }      | Should -Throw -ExpectedMessage '*control characters*'
+            { Assert-SafeNativeArgument -Name T -Value '' }          | Should -Not -Throw
+        }
+
+        It 'Assert-CertificateOutputPath confines a tracking-row path to a rooted .cer beneath an allowed root' {
+            $root = Join-Path $TestDrive 'batch'; $sub = Join-Path $root 'Certificates'
+            New-Item -ItemType Directory -Force $sub | Out-Null
+            { Assert-CertificateOutputPath -Name T -Path (Join-Path $sub 'srv1.cer') -AllowedRoots @($root) } | Should -Not -Throw
+            { Assert-CertificateOutputPath -Name T -Path (Join-Path $root 'srv1.cer') -AllowedRoots @($root) } | Should -Not -Throw   # directly in the root
+            # a script/config/other type can never be the delivery or move-aside target
+            { Assert-CertificateOutputPath -Name T -Path (Join-Path $sub 'startup.ps1') -AllowedRoots @($root) } | Should -Throw -ExpectedMessage '*must be a .cer file*'
+            # OUTSIDE the boundary - a sibling folder, and a '..' escape that textually starts inside
+            $outside = Join-Path $TestDrive 'elsewhere'; New-Item -ItemType Directory -Force $outside | Out-Null
+            { Assert-CertificateOutputPath -Name T -Path (Join-Path $outside 'x.cer') -AllowedRoots @($root) }        | Should -Throw -ExpectedMessage '*outside the allowed output locations*'
+            { Assert-CertificateOutputPath -Name T -Path (Join-Path $root '..\elsewhere\x.cer') -AllowedRoots @($root) } | Should -Throw -ExpectedMessage '*outside the allowed output locations*'
+            # a root that merely PREFIXES the name is not containment (C:\batch2 vs C:\batch)
+            $root2 = "${root}2"; New-Item -ItemType Directory -Force $root2 | Out-Null
+            { Assert-CertificateOutputPath -Name T -Path (Join-Path $root2 'x.cer') -AllowedRoots @($root) } | Should -Throw -ExpectedMessage '*outside the allowed output locations*'
+            # any of several roots may contain it
+            { Assert-CertificateOutputPath -Name T -Path (Join-Path $outside 'x.cer') -AllowedRoots @($root, $outside) } | Should -Not -Throw
+            # relative paths are not accepted from the CSV (rows are stored absolute)
+            { Assert-CertificateOutputPath -Name T -Path '.\x.cer' -AllowedRoots @($root) } | Should -Throw -ExpectedMessage '*rooted*'
+            # the folder must already exist
+            { Assert-CertificateOutputPath -Name T -Path (Join-Path $sub 'nope\x.cer') -AllowedRoots @($root) } | Should -Throw -ExpectedMessage '*does not exist*'
+            # and the command-line rule still applies
+            { Assert-CertificateOutputPath -Name T -Path (Join-Path $sub 'a"b.cer') -AllowedRoots @($root) } | Should -Throw -ExpectedMessage '*double quotes*'
+        }
+
+        It 'Assert-CertificateOutputPath rejects a destination that is itself a folder or a link named *.cer' {
+            $root = Join-Path $TestDrive 'droot'; New-Item -ItemType Directory -Force $root | Out-Null
+            $dirNamedCer = Join-Path $root 'trap.cer'; New-Item -ItemType Directory -Force $dirNamedCer | Out-Null
+            { Assert-CertificateOutputPath -Name T -Path $dirNamedCer -AllowedRoots @($root) } | Should -Throw -ExpectedMessage '*existing folder*'
+            $away = Join-Path $TestDrive 'daway'; New-Item -ItemType Directory -Force $away | Out-Null
+            $junctionCer = Join-Path $root 'jtrap.cer'
+            try { New-Item -ItemType Junction -Path $junctionCer -Target $away -ErrorAction Stop | Out-Null }
+            catch { Set-ItResult -Skipped -Because "cannot create a junction here: $_"; return }
+            # a junction is a folder AND a reparse point - either rule must stop it
+            { Assert-CertificateOutputPath -Name T -Path $junctionCer -AllowedRoots @($root) } | Should -Throw
+            # RACE: a folder/junction planted under the destination name AFTER validation (simulated by
+            # skipping the check) must receive NO file - the no-overwrite rename fails instead.
+            $tmp = Join-Path $TestDrive 'certreq-d.cer'; 'cert' | Out-File $tmp -Encoding ascii
+            { Move-RetrievedCertificate -TempCer $tmp -Destination $dirNamedCer } | Should -Throw
+            @(Get-ChildItem $dirNamedCer -Force).Count | Should -Be 0 -Because 'nothing may be moved INTO a folder planted under the destination name'
+            Test-Path $tmp | Should -BeTrue -Because 'the undelivered certificate stays in its staging file for recovery'
+            { Move-RetrievedCertificate -TempCer $tmp -Destination $junctionCer } | Should -Throw
+            @(Get-ChildItem $away -Force).Count | Should -Be 0 -Because 'a raced junction receives no file'
+            # a plain file planted under the name is not overwritten either
+            $planted = Join-Path $root 'planted.cer'; 'theirs' | Out-File $planted -Encoding ascii
+            $tmp2 = Join-Path $TestDrive 'certreq-d2.cer'; 'cert' | Out-File $tmp2 -Encoding ascii
+            Move-RetrievedCertificate -TempCer $tmp2 -Destination $planted 6>$null
+            (Get-Content $planted -Raw).Trim() | Should -BeExactly 'cert' -Because 'a pre-existing plain file is moved aside (kept), then replaced'
+        }
+
+        It 'Assert-CertificateOutputPath rejects a junction below the root (a redirecting folder is not containment)' {
+            $root = Join-Path $TestDrive 'jroot'; $away = Join-Path $TestDrive 'jaway'
+            New-Item -ItemType Directory -Force $root, $away | Out-Null
+            $junction = Join-Path $root 'Certificates'
+            try { New-Item -ItemType Junction -Path $junction -Target $away -ErrorAction Stop | Out-Null }
+            catch { Set-ItResult -Skipped -Because "cannot create a junction here: $_"; return }
+            { Assert-CertificateOutputPath -Name T -Path (Join-Path $junction 'x.cer') -AllowedRoots @($root) } | Should -Throw -ExpectedMessage '*reparse point*'
+        }
+
+        It 'Move-RetrievedCertificate re-validates the destination right before delivery and leaves the temp file when it fails' {
+            $root = Join-Path $TestDrive 'rv-root'; $outside = Join-Path $TestDrive 'rv-outside'
+            New-Item -ItemType Directory -Force $root, $outside | Out-Null
+            $tmp = Join-Path $TestDrive 'certreq-rv.cer'; 'cert' | Out-File $tmp -Encoding ascii
+            { Move-RetrievedCertificate -TempCer $tmp -Destination (Join-Path $outside 'x.cer') -AllowedRoots @($root) } |
+                Should -Throw -ExpectedMessage '*outside the allowed output locations*'
+            Test-Path $tmp | Should -BeTrue -Because 'an undelivered certificate must survive for recovery'
+            Test-Path (Join-Path $outside 'x.cer') | Should -BeFalse
+            Move-RetrievedCertificate -TempCer $tmp -Destination (Join-Path $root 'x.cer') -AllowedRoots @($root)
+            Test-Path (Join-Path $root 'x.cer') | Should -BeTrue
+        }
+
+        It 'Get-UntrustedGrant separates swap-capable (delete/rename/write-data) from create-subfolder-only rights and ignores trusted principals' {
+            $tight = Join-Path $TestDrive 'acl-tight'; $create = Join-Path $TestDrive 'acl-create'; $swap = Join-Path $TestDrive 'acl-swap'
+            New-Item -ItemType Directory -Force $tight, $create, $swap | Out-Null
+            $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+            foreach ($d in $tight, $create, $swap) {
+                $acl = Get-Acl -LiteralPath $d
+                $acl.SetAccessRuleProtection($true, $false)                       # drop inherited ACEs
+                foreach ($r in @($acl.Access)) { [void]$acl.RemoveAccessRule($r) }
+                $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($me, 'FullControl', 'ContainerInherit, ObjectInherit', 'None', 'Allow')))
+                # SYSTEM and Administrators with Full Control are TRUSTED - never reported
+                $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule((New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18')), 'FullControl', 'ContainerInherit, ObjectInherit', 'None', 'Allow')))
+                $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule((New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')), 'FullControl', 'ContainerInherit, ObjectInherit', 'None', 'Allow')))
+                Set-Acl -LiteralPath $d -AclObject $acl
+            }
+            @(Get-UntrustedGrant -Path $tight -Kind Swap).Count   | Should -Be 0
+            @(Get-UntrustedGrant -Path $tight -Kind Create).Count | Should -Be 0
+            # the C:\ default: Authenticated Users may create folders - create-only, NOT swap-capable
+            $acl = Get-Acl -LiteralPath $create
+            $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+                (New-Object System.Security.Principal.SecurityIdentifier('S-1-5-11')), 'CreateDirectories', 'ContainerInherit', 'None', 'Allow')))
+            Set-Acl -LiteralPath $create -AclObject $acl
+            @(Get-UntrustedGrant -Path $create -Kind Create) -join ' ' | Should -Match 'Authenticated Users'
+            @(Get-UntrustedGrant -Path $create -Kind Swap).Count | Should -Be 0
+            # ...but "create FILES" (FILE_WRITE_DATA) or write-attributes IS swap-capable: a directory
+            # handle with either right can set a reparse point, turning an empty folder into a
+            # junction in place with nothing deleted or renamed
+            foreach ($right in 'CreateFiles', 'WriteAttributes') {
+                $wd = Join-Path $TestDrive "acl-$right"; New-Item -ItemType Directory -Force $wd | Out-Null
+                $acl = Get-Acl -LiteralPath $wd
+                $acl.SetAccessRuleProtection($true, $false); foreach ($r in @($acl.Access)) { [void]$acl.RemoveAccessRule($r) }
+                $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($me, 'FullControl', 'ContainerInherit, ObjectInherit', 'None', 'Allow')))
+                $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+                    (New-Object System.Security.Principal.SecurityIdentifier('S-1-5-11')), $right, 'None', 'None', 'Allow')))
+                Set-Acl -LiteralPath $wd -AclObject $acl
+                @(Get-UntrustedGrant -Path $wd -Kind Swap) -join ' ' | Should -Match 'Authenticated Users' -Because "$right lets an untrusted user set a reparse point on the folder"
+            }
+            # Modify (includes Delete) for a NON-builtin, unresolvable principal (a "Domain Users"
+            # of some domain) IS swap-capable and untrusted - a fixed list of broad groups would miss it
+            $acl = Get-Acl -LiteralPath $swap
+            $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+                (New-Object System.Security.Principal.SecurityIdentifier('S-1-5-21-111-222-333-513')), 'Modify', 'ContainerInherit, ObjectInherit', 'None', 'Allow')))
+            Set-Acl -LiteralPath $swap -AclObject $acl
+            @(Get-UntrustedGrant -Path $swap -Kind Swap) -join ' ' | Should -Match 'S-1-5-21-111-222-333-513'
+            # ...unless that principal is named as trusted
+            $saved = $script:TrustedSids
+            try {
+                $script:TrustedSids = Get-TrustedPrincipalSet -Extra 'S-1-5-21-111-222-333-513'
+                @(Get-UntrustedGrant -Path $swap -Kind Swap).Count | Should -Be 0
+            } finally { $script:TrustedSids = $saved }
+            # read-only for a broad group is neither
+            $acl = Get-Acl -LiteralPath $tight
+            $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+                (New-Object System.Security.Principal.SecurityIdentifier('S-1-1-0')), 'ReadAndExecute', 'ContainerInherit, ObjectInherit', 'None', 'Allow')))
+            Set-Acl -LiteralPath $tight -AclObject $acl
+            @(Get-UntrustedGrant -Path $tight -Kind Swap).Count   | Should -Be 0
+            @(Get-UntrustedGrant -Path $tight -Kind Create).Count | Should -Be 0
+        }
+
+        It 'Get-UntrustedOwner flags a folder owned by an untrusted principal (an attacker-created subfolder)' {
+            $d = Join-Path $TestDrive 'owned-by-users'; New-Item -ItemType Directory -Force $d | Out-Null
+            Get-UntrustedOwner -Path $d | Should -BeNullOrEmpty -Because 'a folder we created is owned by the running account or Administrators'
+            $acl = Get-Acl -LiteralPath $d
+            try { $acl.SetOwner((New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-545'))); Set-Acl -LiteralPath $d -AclObject $acl -ErrorAction Stop }
+            catch { Set-ItResult -Skipped -Because "cannot reassign ownership here: $_"; return }
+            (Get-UntrustedOwner -Path $d) | Should -Match 'Users'
+            { Assert-ProtectedDirectoryChain -Name T -Directory $d -Path (Join-Path $d 'x.cer') } | Should -Throw -ExpectedMessage '*OWNED by untrusted principal*'
+            # restore ownership so TestDrive cleanup is unaffected
+            $acl = Get-Acl -LiteralPath $d
+            $acl.SetOwner([System.Security.Principal.WindowsIdentity]::GetCurrent().User); Set-Acl -LiteralPath $d -AclObject $acl
+        }
+
+        It 'Assert-CertificateOutputPath REFUSES a swappable folder on the path unless the override is set' {
+            $root = Join-Path $TestDrive 'sw-root'; $sub = Join-Path $root 'drop'
+            New-Item -ItemType Directory -Force $sub | Out-Null
+            $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+            foreach ($d in $root, $sub) {
+                $acl = Get-Acl -LiteralPath $d
+                $acl.SetAccessRuleProtection($true, $false)
+                foreach ($r in @($acl.Access)) { [void]$acl.RemoveAccessRule($r) }
+                $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($me, 'FullControl', 'ContainerInherit, ObjectInherit', 'None', 'Allow')))
+                Set-Acl -LiteralPath $d -AclObject $acl
+            }
+            { Assert-CertificateOutputPath -Name T -Path (Join-Path $sub 'x.cer') -AllowedRoots @($root) } | Should -Not -Throw
+            # Users may delete/rename the intermediate folder -> refused (fail closed)
+            $acl = Get-Acl -LiteralPath $sub
+            $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+                (New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-545')), 'Modify', 'ContainerInherit, ObjectInherit', 'None', 'Allow')))
+            Set-Acl -LiteralPath $sub -AclObject $acl
+            { Assert-CertificateOutputPath -Name T -Path (Join-Path $sub 'x.cer') -AllowedRoots @($root) } | Should -Throw -ExpectedMessage '*can delete, rename or write to*'
+            # ...also when it is the ROOT itself that is swappable
+            { Assert-CertificateOutputPath -Name T -Path (Join-Path $sub 'x.cer') -AllowedRoots @($sub) } | Should -Throw -ExpectedMessage '*can delete, rename or write to*'
+            # the explicit override turns the refusal into acceptance
+            $script:AllowUnprotectedOutput = $true
+            try { { Assert-CertificateOutputPath -Name T -Path (Join-Path $sub 'x.cer') -AllowedRoots @($root) } | Should -Not -Throw }
+            finally { $script:AllowUnprotectedOutput = $false }
+        }
+
+        It 'Assert-CertificateOutputPath checks the chain ABOVE the root too: a junction ancestor is refused' {
+            $away = Join-Path $TestDrive 'anc-away'; New-Item -ItemType Directory -Force (Join-Path $away 'Certificates') | Out-Null
+            $jparent = Join-Path $TestDrive 'anc-jparent'
+            try { New-Item -ItemType Junction -Path $jparent -Target $away -ErrorAction Stop | Out-Null }
+            catch { Set-ItResult -Skipped -Because "cannot create a junction here: $_"; return }
+            # the allowed root itself is a real folder... reached THROUGH a junction one level up
+            $root = Join-Path $jparent 'Certificates'
+            { Assert-CertificateOutputPath -Name T -Path (Join-Path $root 'x.cer') -AllowedRoots @($root) } | Should -Throw -ExpectedMessage '*reparse point*'
+        }
+
+        It 'Assert-ProtectedDirectoryChain fails CLOSED when an ACL cannot be read (override turns it into a warning)' {
+            $d = Join-Path $TestDrive 'acl-unreadable'; New-Item -ItemType Directory -Force $d | Out-Null
+            Mock Get-Acl { throw 'simulated: access to the security descriptor is denied' }
+            { Assert-ProtectedDirectoryChain -Name T -Directory $d -Path (Join-Path $d 'x.cer') } | Should -Throw -ExpectedMessage '*could not be read*'
+            $script:AllowUnprotectedOutput = $true
+            try { { Assert-ProtectedDirectoryChain -Name T -Directory $d -Path (Join-Path $d 'x.cer') 3>$null } | Should -Not -Throw }
+            finally { $script:AllowUnprotectedOutput = $false }
+        }
+
+        It 'Get-UntrustedGrant ignores inherit-only ACEs when judging the folder itself' {
+            $d = Join-Path $TestDrive 'acl-inheritonly'; New-Item -ItemType Directory -Force $d | Out-Null
+            $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+            $acl = Get-Acl -LiteralPath $d
+            $acl.SetAccessRuleProtection($true, $false)
+            foreach ($r in @($acl.Access)) { [void]$acl.RemoveAccessRule($r) }
+            $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($me, 'FullControl', 'ContainerInherit, ObjectInherit', 'None', 'Allow')))
+            # the C:\-style "Modify, subfolders and files only" entry: applies to CHILDREN, not to this folder
+            $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+                (New-Object System.Security.Principal.SecurityIdentifier('S-1-5-11')), 'Modify', 'ContainerInherit, ObjectInherit', 'InheritOnly', 'Allow')))
+            Set-Acl -LiteralPath $d -AclObject $acl
+            @(Get-UntrustedGrant -Path $d -Kind Swap).Count | Should -Be 0 -Because 'an inherit-only ACE grants nothing on the folder itself'
+            # ...but a child created beneath it inherits the effective Modify and IS swappable
+            $child = Join-Path $d 'child'; New-Item -ItemType Directory -Force $child | Out-Null
+            @(Get-UntrustedGrant -Path $child -Kind Swap) -join ' ' | Should -Match 'Authenticated Users'
+        }
+
+        It 'Assert-CertificateOutputPath picks the DEEPEST matching root and refuses a root that is a junction' {
+            $outer = Join-Path $TestDrive 'deep-outer'; $inner = Join-Path $outer 'Certificates'
+            New-Item -ItemType Directory -Force $inner | Out-Null
+            # both roots contain the file; the walk must stop at the inner one (no intermediate components)
+            { Assert-CertificateOutputPath -Name T -Path (Join-Path $inner 'x.cer') -AllowedRoots @($outer, $inner) } | Should -Not -Throw
+            $away = Join-Path $TestDrive 'deep-away'; New-Item -ItemType Directory -Force $away | Out-Null
+            $jroot = Join-Path $TestDrive 'deep-jroot'
+            try { New-Item -ItemType Junction -Path $jroot -Target $away -ErrorAction Stop | Out-Null }
+            catch { Set-ItResult -Skipped -Because "cannot create a junction here: $_"; return }
+            { Assert-CertificateOutputPath -Name T -Path (Join-Path $jroot 'x.cer') -AllowedRoots @($jroot) } | Should -Throw -ExpectedMessage '*reparse point*'
+        }
+
+        It 'Move-RetrievedCertificate refuses to place the .rsp through a folder or link named x.rsp' {
+            $dest = Join-Path $TestDrive 'rsp-dest.cer'
+            $trap = Join-Path $TestDrive 'rsp-dest.rsp'; New-Item -ItemType Directory -Force $trap | Out-Null
+            $tmp = Join-Path $TestDrive 'certreq-rsp.cer'; 'cert' | Out-File $tmp -Encoding ascii
+            'rsp' | Out-File ([System.IO.Path]::ChangeExtension($tmp, '.rsp')) -Encoding ascii
+            Move-RetrievedCertificate -TempCer $tmp -Destination $dest -KeepRspFile 3>$null 6>$null
+            Test-Path $dest -PathType Leaf | Should -BeTrue
+            @(Get-ChildItem $trap).Count | Should -Be 0 -Because 'nothing may be moved INTO a folder named x.rsp'
+        }
+
+        It 'Export-TrackingData never moves the CSV into a folder occupying the tracking-file name' {
+            $trap = Join-Path $TestDrive 'trap.csv'; New-Item -ItemType Directory -Force $trap | Out-Null
+            $rows = @([pscustomobject]@{ RequestFile = 'a.req'; RequestID = 1; SubmitTime = 't'; Status = 'Issued'; OutputCertFile = 'a.cer'; LastCheckTime = 't'; ErrorMessage = '' })
+            { Export-TrackingData -Data $rows -Path $trap } | Should -Throw
+            @(Get-ChildItem $trap -Force).Count | Should -Be 0
+            @(Get-ChildItem $TestDrive -Filter 'trap.csv.*.tmp').Count | Should -Be 0 -Because 'the temp file is cleaned up on failure'
+        }
+
+        It 'Move-RetrievedCertificate delivers the temp file, moves a predecessor aside, and places/drops the .rsp' {
+            $dest = Join-Path $TestDrive 'deliver.cer'
+            'old' | Out-File $dest -Encoding ascii
+            $tmp = Join-Path $TestDrive 'certreq-tmp.cer'; 'new' | Out-File $tmp -Encoding ascii
+            'rsp' | Out-File ([System.IO.Path]::ChangeExtension($tmp, '.rsp')) -Encoding ascii
+            Move-RetrievedCertificate -TempCer $tmp -Destination $dest -KeepRspFile
+            (Get-Content $dest -Raw).Trim() | Should -BeExactly 'new'
+            Test-Path $tmp | Should -BeFalse
+            @(Get-ChildItem $TestDrive -Filter 'deliver.superseded-*.cer').Count | Should -Be 1 -Because 'the predecessor is kept, not deleted'
+            Test-Path (Join-Path $TestDrive 'deliver.rsp') | Should -BeTrue -Because '-KeepRspFile places the .rsp beside the destination'
+            # without -KeepRspFile the .rsp stays with the staging file for the caller''s cleanup - the destination gets none
+            $dest2 = Join-Path $TestDrive 'deliver2.cer'
+            $tmp2 = Join-Path $TestDrive 'certreq-tmp2.cer'; 'new2' | Out-File $tmp2 -Encoding ascii
+            'rsp' | Out-File ([System.IO.Path]::ChangeExtension($tmp2, '.rsp')) -Encoding ascii
+            Move-RetrievedCertificate -TempCer $tmp2 -Destination $dest2
+            Test-Path $dest2 | Should -BeTrue
+            Test-Path (Join-Path $TestDrive 'deliver2.rsp') | Should -BeFalse
+        }
+
+        It 'New-TempCertificatePath stages INSIDE the destination folder (never %TEMP%), under a random .cer name' {
+            $dest = Join-Path $TestDrive 'out\srv1.cer'
+            $a = New-TempCertificatePath -Destination $dest
+            $b = New-TempCertificatePath -Destination $dest
+            [System.IO.Path]::GetDirectoryName($a) | Should -BeExactly (Join-Path $TestDrive 'out')
+            # TestDrive itself lives under %TEMP%, so test the FOLDER identity, not a prefix: the
+            # staging file sits in the destination's own folder, not directly in the TEMP folder
+            [System.IO.Path]::GetDirectoryName($a) | Should -Not -Be ([System.IO.Path]::GetTempPath().TrimEnd('\'))
+            $a | Should -BeLike (Join-Path $TestDrive 'out\srv1.*.staging.cer')
+            $a | Should -Not -Be $b -Because 'a random name cannot be pre-planted'
+        }
+
+        It 'Move-RetrievedCertificate leaves the delivered file inheriting the folder ACL (no explicit ACEs carried over)' {
+            $dir = Join-Path $TestDrive 'acl-inherit'; New-Item -ItemType Directory -Force $dir | Out-Null
+            $tmp = Join-Path $dir 'x.abc.staging.cer'; 'cert' | Out-File $tmp -Encoding ascii
+            # give the staging file an explicit, loose ACE - what a shared TEMP would have handed it
+            $acl = Get-Acl -LiteralPath $tmp
+            $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+                (New-Object System.Security.Principal.SecurityIdentifier('S-1-5-11')), 'Modify', 'Allow')))
+            Set-Acl -LiteralPath $tmp -AclObject $acl
+            $dest = Join-Path $dir 'x.cer'
+            Move-RetrievedCertificate -TempCer $tmp -Destination $dest
+            $explicit = @((Get-Acl -LiteralPath $dest).Access | Where-Object { -not $_.IsInherited })
+            $explicit.Count | Should -Be 0 -Because 'the delivered certificate must be governed by its folder alone'
+            (Get-Acl -LiteralPath $dest).AreAccessRulesProtected | Should -BeFalse
+        }
+
+        It 'Move-StaleCertificateAside clears a pre-existing .cer without deleting it; no-op when absent' {
+            $cer = Join-Path $TestDrive 'stale.cer'
+            Move-StaleCertificateAside -Path $cer | Should -BeNullOrEmpty          # nothing there -> nothing moved
+            'old cert' | Out-File $cer -Encoding ascii
+            $aside = Move-StaleCertificateAside -Path $cer
+            Test-Path $cer   | Should -BeFalse -Because 'the destination must be empty before certreq runs'
+            Test-Path $aside | Should -BeTrue  -Because 'the earlier certificate is preserved, never deleted'
+            $aside | Should -BeLike (Join-Path $TestDrive 'stale.superseded-*.cer')
+            (Get-Content $aside -Raw).Trim() | Should -BeExactly 'old cert'
+        }
+
+        It 'Remove-AsideIfIdentical drops the aside copy only when the fresh file is byte-identical' {
+            $cer = Join-Path $TestDrive 'ident.cer'
+            'same' | Out-File $cer -Encoding ascii
+            $aside = Move-StaleCertificateAside -Path $cer
+            'different' | Out-File $cer -Encoding ascii                             # a resubmission: new certificate
+            Remove-AsideIfIdentical -Path $cer -Aside $aside
+            Test-Path $aside | Should -BeTrue -Because 'a different predecessor is kept'
+            'same' | Out-File $cer -Encoding ascii                                  # the same certificate retrieved again
+            Remove-AsideIfIdentical -Path $cer -Aside $aside
+            Test-Path $aside | Should -BeFalse -Because 'an identical copy is redundant'
+            Test-Path $cer   | Should -BeTrue
+            { Remove-AsideIfIdentical -Path $cer -Aside $null } | Should -Not -Throw   # nothing was moved aside
         }
 
         It 'Remove-RspFile deletes the companion .rsp and leaves the .cer alone' {
@@ -191,8 +570,28 @@ Describe 'Submit-CertificateRequests' {
 
         It 'aborts when the CA cannot be reached (connectivity pre-check)' {
             # localhost runs no CA service, so certutil -ping fails fast with no external traffic.
-            { & $script:Submit -CAConfig 'localhost\PESTER-NoSuchCA' -Mode Retrieve -WhatIf `
+            # -TrustedOutputPrincipal: the output-folder trust check runs BEFORE the CA check and
+            # must pass on this machine's TEMP chain (see BeforeAll) for the CA failure to be reached.
+            { & $script:Submit -CAConfig 'localhost\PESTER-NoSuchCA' -Mode Retrieve -WhatIf -TrustedOutputPrincipal $script:EnvTrusted `
                   -TrackingFile (Join-Path $TestDrive 'g3.csv') -OutputFolder (Join-Path $TestDrive 'g3') 3>$null 2>$null 6>$null } |
+                Should -Throw -ExpectedMessage '*Cannot reach CA*'
+        }
+
+        It 'refuses to start when an output location is swappable by an untrusted principal, unless overridden' {
+            $loose = Join-Path $TestDrive 'guard-loose'; New-Item -ItemType Directory -Force $loose | Out-Null
+            $acl = Get-Acl -LiteralPath $loose
+            $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+                (New-Object System.Security.Principal.SecurityIdentifier('S-1-5-21-111-222-333-513')), 'Modify', 'ContainerInherit, ObjectInherit', 'None', 'Allow')))
+            Set-Acl -LiteralPath $loose -AclObject $acl
+            { & $script:Submit -CAConfig 'localhost\PESTER-NoSuchCA' -Mode Retrieve -WhatIf -TrustedOutputPrincipal $script:EnvTrusted `
+                  -TrackingFile (Join-Path $TestDrive 'g4.csv') -OutputFolder $loose 3>$null 6>$null } |
+                Should -Throw -ExpectedMessage '*can delete, rename or write to*'
+            # naming the principal as trusted, or accepting the risk, lets the run proceed to the CA check
+            { & $script:Submit -CAConfig 'localhost\PESTER-NoSuchCA' -Mode Retrieve -WhatIf -TrustedOutputPrincipal (@($script:EnvTrusted) + 'S-1-5-21-111-222-333-513') `
+                  -TrackingFile (Join-Path $TestDrive 'g4.csv') -OutputFolder $loose 3>$null 2>$null 6>$null } |
+                Should -Throw -ExpectedMessage '*Cannot reach CA*'
+            { & $script:Submit -CAConfig 'localhost\PESTER-NoSuchCA' -Mode Retrieve -WhatIf -AllowUnprotectedOutputFolder `
+                  -TrackingFile (Join-Path $TestDrive 'g4.csv') -OutputFolder $loose 3>$null 2>$null 6>$null } |
                 Should -Throw -ExpectedMessage '*Cannot reach CA*'
         }
     }
@@ -221,16 +620,10 @@ Describe 'Submit-CertificateRequests' {
             $script:PrevDir = (Get-Location).ProviderPath
             Set-Location $TestDrive
 
-            # Resolve the CA: explicit container arg, or auto-discover from AD Enrollment Services.
+            # The CA is always the one the operator NAMED (see BeforeDiscovery) - no auto-discovery
+            # for a tier that deletes CA database rows.
             $script:Ca = $CAConfig
-            if (-not $script:Ca) {
-                Import-Module ActiveDirectory -ErrorAction Stop
-                $cfgNc = (Get-ADRootDSE).configurationNamingContext
-                $es = Get-ADObject -SearchBase "CN=Enrollment Services,CN=Public Key Services,CN=Services,$cfgNc" `
-                    -LDAPFilter '(objectClass=pKIEnrollmentService)' -Properties dNSHostName, cn | Select-Object -First 1
-                $es | Should -Not -BeNullOrEmpty -Because 'the Lab tier needs an Enterprise CA registered in AD'
-                $script:Ca = "$($es.dNSHostName)\$($es.cn)"
-            }
+            $script:Ca | Should -Not -BeNullOrEmpty -Because 'the Lab tier requires an explicit -CAConfig'
             (certutil -config $script:Ca -CATemplates 2>&1 | Out-String) | Should -Match ([regex]::Escape("${LabTemplate}:")) `
                 -Because "template '$LabTemplate' must be published on CA '$script:Ca'"
 
@@ -259,7 +652,8 @@ RequestType = PKCS10
             # Run the script capturing ALL streams as one string, then re-read the tracking CSV.
             function script:Invoke-Submit {
                 param([hashtable]$Params)
-                $call = @{ CAConfig = $script:Ca; TrackingFile = $script:Tracking; OutputFolder = $script:CertDir; Confirm = $false }
+                $call = @{ CAConfig = $script:Ca; TrackingFile = $script:Tracking; OutputFolder = $script:CertDir; Confirm = $false
+                           TrustedOutputPrincipal = $script:EnvTrusted }   # this machine's TEMP-chain grants (see the outer BeforeAll)
                 foreach ($k in $Params.Keys) { $call[$k] = $Params[$k] }   # a test may override a default (e.g. OutputFolder)
                 $out = & $script:Submit @call *>&1 | Out-String -Width 400
                 $rows = if (Test-Path $script:Tracking) { @(Import-Csv $script:Tracking) } else { @() }

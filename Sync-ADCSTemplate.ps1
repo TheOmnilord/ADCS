@@ -1,11 +1,12 @@
 <#PSScriptInfo
-.VERSION 1.0.0
+.VERSION 1.0.1
 .GUID 689db74d-e668-410a-9a62-0b208179a369
 .AUTHOR Sveinung Svea
 .PROJECTURI https://github.com/TheOmnilord/ADCS
 .LICENSEURI https://github.com/TheOmnilord/ADCS/blob/main/LICENSE
 .TAGS ADCS PKI CertificateServices
 .RELEASENOTES
+1.0.1 - The template create is now -ErrorAction Stop with a returned-object check (a non-terminating New-ADObject failure previously printed a green "Created template" line with an empty DN, orphaned the companion OID object and exited 0); after the create the OID is re-queried and, if another template claimed it concurrently, the new template is rolled back and the run fails
 1.0.0 - Initial release
 #>
 
@@ -557,7 +558,7 @@ function New-TemplateOid {
     }
     else {
         $forestBaseOid = (Get-ADObject @ADParams -Identity $oidContainerDN `
-                -Properties 'msPKI-Cert-Template-OID').'msPKI-Cert-Template-OID'
+                -Properties 'msPKI-Cert-Template-OID' -ErrorAction Stop).'msPKI-Cert-Template-OID'
         if (-not $forestBaseOid) {
             throw "Could not read the enterprise OID base from '$oidContainerDN' - this forest has no PKI OID root (AD CS was never provisioned here). Use -OidHandling Preserve, GenerateRandom, or GenerateFromRoot instead."
         }
@@ -1036,23 +1037,67 @@ function Import-Template {
     # AD actually assigned, so the ACL step and cleanup always bind the real object rather than a
     # string-built DN that could diverge under RDN escaping.
     $oa['msPKI-Cert-Template-OID'] = $oidPlan.Oid
+    $createdObj = $null
     try {
+        # -ErrorAction Stop: AD-module failures are frequently NON-terminating. Without it a failed
+        # create (constraint violation, permissions, ADWS hiccup) would leave $createdObj $null,
+        # skip this catch and the companion rollback, print a green "Created template:" line with
+        # an empty DN and return $null - which the caller reads as "declined at the prompt": exit
+        # code 0 and an orphaned companion OID object. The returned object is checked as well.
         $createdObj = New-ADObject @ADParams -Path $templatesDN -Name $cn -DisplayName $displayName `
-            -Type 'pKICertificateTemplate' -OtherAttributes $oa -Confirm:$false -PassThru
+            -Type 'pKICertificateTemplate' -OtherAttributes $oa -Confirm:$false -PassThru -ErrorAction Stop
+        if (-not $createdObj -or -not $createdObj.DistinguishedName) {
+            throw "New-ADObject returned no object for template '$cn' - the create did not complete."
+        }
         $newTemplateDN = $createdObj.DistinguishedName
+
+        # Post-create uniqueness. The pre-flight OID search above is check-then-create: a
+        # concurrent import (or any other writer) could have created another template with this
+        # OID in between, and AD does not enforce msPKI-Cert-Template-OID uniqueness. Re-query on
+        # the same pinned server and fail if anything but this object carries the OID, rather
+        # than leave two templates sharing one OID (ambiguous authorization lookups in Windows and
+        # EJBCA). The catch below rolls the new template back for this - and for a failed re-query.
+        $carriers = @(Get-ADObject @ADParams -SearchBase $templatesDN -ErrorAction Stop `
+                -LDAPFilter "(msPKI-Cert-Template-OID=$($oidPlan.Oid))" |
+            Where-Object { $_.ObjectGUID -ne $createdObj.ObjectGUID })
+        if ($carriers.Count) {
+            throw "OID $($oidPlan.Oid) was claimed concurrently by another template ($(@($carriers | ForEach-Object { $_.DistinguishedName }) -join '; ')) - refusing to leave two templates sharing one OID."
+        }
     }
     catch {
-        # Best-effort rollback of a just-minted companion OID object (nothing to roll back otherwise).
-        if ($companionDN) {
+        $failure = $_
+        # Rollback, in dependency order. Whatever failed AFTER the create (the uniqueness re-query,
+        # a collision) must not leave the new template behind - without its ACL, and blocking a
+        # re-run through the cn pre-flight - so it is removed by the GUID captured at creation.
+        # The companion OID object is removed only once the template is gone (or was never
+        # created): a template that could not be removed keeps its companion, and both survivors
+        # are reported for manual cleanup instead of half of a pair being deleted.
+        $templateGone = $true
+        if ($createdObj) {
             try {
-                Remove-ADObject @ADParams -Identity $companionDN -Confirm:$false -ErrorAction Stop
-                Write-Warning "Template creation failed; rolled back the orphaned OID object."
+                Remove-ADObject @ADParams -Identity $createdObj.ObjectGUID -Confirm:$false -ErrorAction Stop
+                Write-Warning "Import failed after the template was created; rolled back the new template '$cn'."
             }
             catch {
-                Write-Warning "Template creation failed AND the companion OID object could not be removed. Clean up manually: $companionDN"
+                $templateGone = $false
+                Write-Warning "Import failed after the template was created AND the new template could not be removed ($($_.Exception.Message)). It remains WITHOUT its ACL - clean up manually: $newTemplateDN"
             }
         }
-        throw
+        if ($companionDN) {
+            if ($templateGone) {
+                try {
+                    Remove-ADObject @ADParams -Identity $companionDN -Confirm:$false -ErrorAction Stop
+                    Write-Warning "Rolled back the companion OID object."
+                }
+                catch {
+                    Write-Warning "The companion OID object could not be removed. Clean up manually: $companionDN"
+                }
+            }
+            else {
+                Write-Warning "The companion OID object was KEPT because the template it belongs to still exists: $companionDN"
+            }
+        }
+        throw $failure
     }
 
     Write-Host "Created template: $newTemplateDN" -ForegroundColor Green

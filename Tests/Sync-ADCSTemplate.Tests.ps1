@@ -102,6 +102,16 @@ Describe 'Sync-ADCSTemplate' {
                 Should -Not -Be (Get-AttrCanonical -Name 'x' -Value @('a', 'b'))
         }
 
+        It 'Get-AttrCanonical: a trailing backslash cannot forge the escaped separator' {
+            # The escape character itself is escaped first (\ -> \\), so a value ending in '\'
+            # followed by the joiner ('\\|') can never read as an escaped pipe ('\|'): @('a\','b')
+            # and @('a|b') must stay distinct. (A review once claimed -replace '\\','\\' was a
+            # no-op; .NET replacement strings do not process backslashes, so it does double them.)
+            (Get-AttrCanonical -Name 'x' -Value @('a\', 'b')) |
+                Should -Not -Be (Get-AttrCanonical -Name 'x' -Value @('a|b'))
+            (Get-AttrCanonical -Name 'x' -Value @('a\')) | Should -BeExactly 'a\\'
+        }
+
         It 'Compare-TemplateAttributes: a case-only difference is a mismatch (case-sensitive -ceq)' {
             # Get-AttrCanonical preserves case; the case-sensitive guarantee is the -ceq in
             # Compare-TemplateAttributes, so assert through it (Pester's -Be is case-insensitive).

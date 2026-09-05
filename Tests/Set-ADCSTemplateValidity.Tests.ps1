@@ -104,11 +104,15 @@ Describe 'Set-ADCSTemplateValidity' {
             ConvertFrom-PKIPeriodBytes -Bytes ([byte[]](1, 2, 3)) | Should -BeExactly 'N/A'
         }
 
-        It 'LDAP escaper protects metacharacters but PRESERVES the * and ? wildcards' {
+        It 'LDAP escaper protects metacharacters but PRESERVES the * wildcard' {
             ConvertTo-LdapFilterValue -Value 'a(b)c' | Should -BeExactly 'a\28b\29c'
             ConvertTo-LdapFilterValue -Value 'a\b'   | Should -BeExactly 'a\5cb'
             ConvertTo-LdapFilterValue -Value 'Web*'  | Should -BeExactly 'Web*'
+            # ? is NOT an LDAP wildcard (RFC 4515 has none for a single character): it passes
+            # through unescaped and the server matches it literally - so the help must not
+            # advertise it as one.
             ConvertTo-LdapFilterValue -Value 'U?er'  | Should -BeExactly 'U?er'
+            (Get-Help $script:Val -Parameter TemplateName | Out-String) | Should -Not -Match '\* and \?'
         }
     }
 

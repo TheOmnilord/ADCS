@@ -1,11 +1,12 @@
 ﻿<#PSScriptInfo
-.VERSION 1.0.0
+.VERSION 1.0.1
 .GUID 48b937ae-18bd-4710-9de9-5ae76f7c9a72
 .AUTHOR Sveinung Svea
 .PROJECTURI https://github.com/TheOmnilord/ADCS
 .LICENSEURI https://github.com/TheOmnilord/ADCS/blob/main/LICENSE
 .TAGS ADCS PKI CertificateServices
 .RELEASENOTES
+1.0.1 - A run in which any search or template update failed now ends with a terminating error (non-zero exit) after the summary, instead of exit 0 with errors only in the console; help no longer advertises ? as a wildcard (LDAP substring filters only know *, so ? always matched literally - documentation corrected)
 1.0.0 - Initial release
 #>
 
@@ -22,8 +23,9 @@
     After modifying templates, you may need to run 'certutil -pulse' on the CA server(s) to pick up changes.
 
 .PARAMETER TemplateName
-    One or more template CN names to match. Supports LDAP wildcards (* and ?).
-    Examples: "WebServer", "User*", "*VPN*"
+    One or more template CN names to match. Supports the LDAP wildcard * (any run of characters,
+    including none). There is no single-character wildcard in LDAP filters: a ? matches a literal
+    question mark. Examples: "WebServer", "User*", "*VPN*"
 
 .PARAMETER ValidityPeriod
     The numeric value for the new validity period (1–9999).
@@ -134,7 +136,9 @@ begin {
     }
 
     function ConvertTo-LdapFilterValue {
-        # Escapes RFC 4515 filter metacharacters while preserving * and ? wildcards
+        # Escapes RFC 4515 filter metacharacters while preserving the * wildcard. ? is not an
+        # LDAP metacharacter (RFC 4515 has no single-character wildcard), so it needs no escaping
+        # and is matched literally by the server.
         param([string]$Value)
         $Value -replace '\\', '\5c' -replace '\(', '\28' -replace '\)', '\29' -replace "`0", '\00'
     }
@@ -364,5 +368,12 @@ end {
         if ($modifiedCount -gt 0) {
             Write-Host "  Run 'certutil -pulse' on CA server(s) to refresh." -ForegroundColor Cyan
         }
+    }
+    # Per-template and per-pattern failures are reported as they happen (Write-Error, non-
+    # terminating, so the remaining templates are still processed) and counted. Automation
+    # gates on the exit code, not on a colored summary line - so a run in which anything failed
+    # must end as a failure, after the structured output and the summary are complete.
+    if ($errorCount -gt 0) {
+        throw "$errorCount search/update error(s) occurred - see the errors above. Templates that did not fail were updated."
     }
 }

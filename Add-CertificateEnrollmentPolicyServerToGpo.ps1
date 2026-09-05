@@ -1,11 +1,12 @@
 <#PSScriptInfo
-.VERSION 1.0.0
+.VERSION 1.0.1
 .GUID 54763db6-2359-401f-8960-ef0de5911aaf
 .AUTHOR Sveinung Svea
 .PROJECTURI https://github.com/TheOmnilord/ADCS
 .LICENSEURI https://github.com/TheOmnilord/ADCS/blob/main/LICENSE
 .TAGS ADCS PKI CertificateServices
 .RELEASENOTES
+1.0.1 - The domain objectGUID for the AD Enrollment Policy row is resolved BEFORE any GPO write and a lookup failure now aborts the run (previously the CEP entry was written first and the failure became a warning, leaving a GPO that removes the AD enrollment policy from every client in scope); a GUID-shaped -GpoName falls back to the GPO ID only after an independent listing proves no GPO carries that display name (any other name-lookup failure is rethrown); registry.pol reads validate the PReg header, refuse oversized files and trailing junk, and return the EFFECTIVE value (records replayed in file order: last write wins, **del./**delvals./**DeleteValues honoured) instead of the first matching record; the deletion-order damage check is judged per value, so a deletion between an obsolete record and its replacement no longer raises a false DAMAGED warning
 1.0.0 - Initial release
 #>
 
@@ -244,12 +245,21 @@ if ($Domain) { $domParams.Domain = $Domain }
 if ($Server) { $domParams.Server = $Server }
 $gpo = $null
 try { $gpo = Get-GPO @domParams -Name $GpoName } catch {
+    $nameError = $_
     $guid = [Guid]::Empty
-    if ([Guid]::TryParse($GpoName, [ref]$guid)) {
-        try { $gpo = Get-GPO @domParams -Guid $guid } catch {
-            throw "No GPO found with display name '$GpoName', and no GPO has that ID either."
-        }
-    } else { throw }
+    if (-not [Guid]::TryParse($GpoName, [ref]$guid)) { throw }
+    # "Not found by name" is the ONLY failure that makes the GUID reading legitimate - not an
+    # authorization error, a transient RPC/SYSVOL failure or a PS7 remoting quirk, any of which
+    # would otherwise silently retarget the run at whatever GPO happens to carry that ID. Prove
+    # the absence with an independent listing: a GPO that DOES carry this display name means the
+    # name lookup failed for another reason, and the GUID must not paper over it.
+    $sameName = @(Get-GPO @domParams -All | Where-Object { $_.DisplayName -eq $GpoName })
+    if ($sameName.Count) {
+        throw "A GPO named '$GpoName' exists but could not be read by name ($($nameError.Exception.Message)); refusing to reinterpret the value as a GPO ID."
+    }
+    try { $gpo = Get-GPO @domParams -Guid $guid } catch {
+        throw "No GPO found with display name '$GpoName', and no GPO has that ID either."
+    }
 }
 $wr = @{ Guid = $gpo.Id } + $domParams          # every write targets the resolved GPO by ID
 $gpoLabel = "GPO '$($gpo.DisplayName)' ($($gpo.Id))"
@@ -301,6 +311,10 @@ function Read-PolRecords {
     param([string]$Path)
     $recs = New-Object System.Collections.Generic.List[object]
     if (-not (Test-Path -LiteralPath $Path)) { return $recs }
+    # Bound the work before reading: a registry.pol is kilobytes; anything approaching the cap is
+    # not a policy file this script should load into an elevated process and walk record by record.
+    $fileLen = (Get-Item -LiteralPath $Path).Length
+    if ($fileLen -gt 64MB) { throw "registry.pol at $Path is $fileLen bytes - far beyond any plausible policy file; refusing to parse it. Inspect the GPO before using this script." }
     $b = $null
     for ($try = 1; $try -le 3; $try++) {
         try { $b = [System.IO.File]::ReadAllBytes($Path); break }
@@ -310,10 +324,15 @@ function Read-PolRecords {
         }
     }
     if ($b.Length -lt 8) { return $recs }
+    # [MS-GPREG] header: the 'PReg' signature followed by version 1. Anything else is not a
+    # Registry.pol (or a damaged one) and is refused rather than parsed on a best-effort basis.
+    if ($b[0] -ne 0x50 -or $b[1] -ne 0x52 -or $b[2] -ne 0x65 -or $b[3] -ne 0x67 -or [BitConverter]::ToUInt32($b, 4) -ne 1) {
+        throw "registry.pol at $Path does not carry the PReg/version-1 header - not a Registry.pol file, or corrupt. Repair or re-author the GPO before using this script."
+    }
     $pos = 8
     $corrupt = { throw "registry.pol at $Path appears truncated or corrupt (offset $pos). Repair or re-author the GPO before using this script." }
     while ($pos -le $b.Length - 2) {
-        if ([BitConverter]::ToUInt16($b, $pos) -ne 0x5B) { break }   # '['
+        if ([BitConverter]::ToUInt16($b, $pos) -ne 0x5B) { & $corrupt }   # every record opens with '['; trailing junk is corruption, not padding
         $pos += 2
         $sb = New-Object System.Text.StringBuilder
         while ($true) {
@@ -351,36 +370,93 @@ function Read-PolRecords {
 }
 $relBase = 'Software\Policies\Microsoft\Cryptography\PolicyServers'
 $relAe   = 'Software\Policies\Microsoft\Cryptography\AutoEnrollment'
-function Get-PolEntries([object[]]$Recs) {
-    $byKey = @{}
+function Get-PolEffectiveValues([object[]]$Recs, [string]$RelKey) {
+    # Replays the records of ONE key in file order - the order the client Registry CSE applies
+    # them - and returns what a client ends up with: @{ Values = name -> data of the values that
+    # survive; Deleted = names that were written and then deleted by a LATER record }.
+    #   plain value        a later record for the same name replaces an earlier one
+    #   **del.<name>       deletes that one value
+    #   **delvals.         deletes every value written so far under the key
+    #   **DeleteValues     deletes each name in its ';'-separated data
+    #   **DeleteKeys       deletes whole keys: its ';'-separated data lists FULL key paths (without
+    #                      the hive) and the record's own key field is IGNORED by the Group Policy
+    #                      engine (contrary to Microsoft's documentation; verified by the LGPO
+    #                      author's corrections) - so an item naming this key, or an ancestor of
+    #                      it, wipes every value written so far, wherever the record sits
+    #   **soft.<name>      writes <name> only if no value of that name exists yet
+    #   **Comment: ...     a comment; **SecureKey a permissions instruction - neither is a value
+    # Any other **-prefixed instruction is unknown to this evaluator and makes it FAIL CLOSED:
+    # guessing would let a deleted endpoint look present to the prerequisite and replacement guards.
+    # Value names compare case-insensitively (registry semantics). Only the first/older record
+    # would be seen by a naive first-match read - and that can be the obsolete one.
+    $values = @{}; $deleted = @{}
+    $relLower = $RelKey.ToLowerInvariant().Trim('\')
     foreach ($r in $Recs) {
-        if ($r.ValueName -like '**del*') { continue }     # GP deletion instructions are not values
-        if ($r.Key -match ('^(?i)' + [regex]::Escape($relBase) + '\\([0-9a-f]{40})$')) {
-            $leaf = $Matches[1].ToLowerInvariant()
-            if (-not $byKey.ContainsKey($leaf)) { $byKey[$leaf] = @{} }
-            $byKey[$leaf][$r.ValueName] = $r.Data
+        $vn = "$($r.ValueName)"
+        if ($vn -match '^(?i)\*\*deletekeys$') {
+            # Key field ignored on purpose (see above). An item deletes this key when it IS this
+            # key or an ancestor of it (then this key goes with it).
+            foreach ($item in @("$($r.Data)" -split ';' | ForEach-Object { $_.Trim().Trim('\') } | Where-Object { $_ })) {
+                $i = $item.ToLowerInvariant()
+                if ($relLower -eq $i -or $relLower.StartsWith($i + '\')) { foreach ($k in @($values.Keys)) { $deleted[$k] = $true }; $values.Clear(); break }
+            }
+            continue
         }
+        if ($r.Key -notmatch ('^(?i)' + [regex]::Escape($RelKey) + '$')) { continue }
+        if ($vn.StartsWith('**')) {
+            # Anchored checks, NOT -like '**del*': in -like the asterisks are wildcards, so that
+            # pattern also matches an ordinary value whose name merely contains "del".
+            if ($vn -match '^(?i)\*\*(comment:|securekey)') { continue }
+            if ($vn -match '^(?i)\*\*soft\.(.+)$') {
+                if (-not $values.ContainsKey($Matches[1])) { $values[$Matches[1]] = $r.Data }
+                continue
+            }
+            $targets = @()
+            if     ($vn -match '^(?i)\*\*del\.(.+)$')      { $targets = @($Matches[1]) }
+            elseif ($vn -match '^(?i)\*\*delvals\.?$')     { $targets = @($values.Keys) }
+            elseif ($vn -match '^(?i)\*\*deletevalues$')   { $targets = @("$($r.Data)" -split ';' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
+            else { throw "registry.pol carries a policy instruction this script does not understand ('$vn' under '$($r.Key)'); refusing to reason about the GPO's effective state. Inspect the GPO in GPME before using this script." }
+            foreach ($t in $targets) {
+                if ($values.ContainsKey($t)) { $values.Remove($t); $deleted[$t] = $true }
+            }
+            continue
+        }
+        $values[$vn] = $r.Data
+        if ($deleted.ContainsKey($vn)) { $deleted.Remove($vn) }   # re-written after a deletion: it survives
     }
-    foreach ($leaf in $byKey.Keys) {
-        [pscustomobject]@{ Key = $leaf; URL = $byKey[$leaf]['URL']; PolicyID = $byKey[$leaf]['PolicyID'] }
+    @{ Values = $values; Deleted = $deleted }
+}
+function Get-PolEntries([object[]]$Recs) {
+    # One entry per 40-hex subkey, built from the EFFECTIVE values (last record wins, deletions
+    # honoured) so an entry a client would not end up with is not reported as present.
+    $leaves = @($Recs | ForEach-Object {
+            if ($_.Key -match ('^(?i)' + [regex]::Escape($relBase) + '\\([0-9a-f]{40})$')) { $Matches[1].ToLowerInvariant() }
+        } | Sort-Object -Unique)
+    foreach ($leaf in $leaves) {
+        $eff = (Get-PolEffectiveValues $Recs "$relBase\$leaf").Values
+        if (-not $eff.Count) { continue }
+        [pscustomobject]@{ Key = $leaf; URL = $eff['URL']; PolicyID = $eff['PolicyID'] }
     }
 }
+function Test-EntryRecordsPresent([object[]]$Recs, [string]$RelKey) {
+    # PHYSICAL presence: does registry.pol carry ANY record at this key (values or deletion
+    # instructions)? Used by -Remove, which must be able to clear a key whose values a later
+    # **delvals. wiped (no EFFECTIVE values, but records to remove all the same).
+    @($Recs | Where-Object { $_.Key -match ('^(?i)' + [regex]::Escape($RelKey) + '$') }).Count -gt 0
+}
 function Get-PolValue([object[]]$Recs, [string]$RelKey, [string]$ValueName) {
-    foreach ($r in $Recs) { if ($r.Key -match ('^(?i)' + [regex]::Escape($RelKey) + '$') -and $r.ValueName -ceq $ValueName) { return $r.Data } }
+    $eff = (Get-PolEffectiveValues $Recs $RelKey).Values
+    if ($eff.ContainsKey($ValueName)) { return $eff[$ValueName] }
     return $null
 }
 function Test-PolDeletionOrder([object[]]$Recs, [string]$RelKey, [string]$Label) {
-    # A **del./**delVals. record ORDERED AFTER a key's values makes the client CSE write the
-    # values and then delete them - the key ends up empty on every client.
-    $keyRecs = @($Recs | Where-Object { $_.Key -match ('^(?i)' + [regex]::Escape($RelKey) + '$') })
-    $vals = @($keyRecs | Where-Object { $_.ValueName -notlike '**del*' })
-    $dels = @($keyRecs | Where-Object { $_.ValueName -like '**del*' })
-    if ($vals.Count -and $dels.Count) {
-        $minVal = ($vals | Measure-Object -Property Index -Minimum).Minimum
-        $maxDel = ($dels | Measure-Object -Property Index -Maximum).Maximum
-        if ($maxDel -gt $minVal) {
-            $notes.Add("DAMAGED registry.pol ordering for ${Label}: a GP deletion record (**del*) appears AFTER its values, so clients will DELETE these values when applying the GPO. Fix by re-authoring the entry: run -Remove for it, then add it again.")
-        }
+    # A **del./**delVals. record ORDERED AFTER a value's last record makes the client CSE write
+    # the value and then delete it - it is absent on every client. Judged per value, in file
+    # order: a deletion BETWEEN an obsolete record and its replacement is legitimate (the
+    # replacement survives), so only values that are actually lost are reported.
+    $lost = @((Get-PolEffectiveValues $Recs $RelKey).Deleted.Keys | ForEach-Object { if ($_ -eq '') { '(Default)' } else { $_ } } | Sort-Object)
+    if ($lost.Count) {
+        $notes.Add("DAMAGED registry.pol ordering for ${Label}: a GP deletion record (**del*) follows the value(s) $($lost -join ', '), so clients will DELETE them when applying the GPO. Fix by re-authoring the entry: run -Remove for it, then add it again.")
     }
 }
 function Test-GpoEntry([string]$K, [hashtable]$Expect) {
@@ -432,13 +508,22 @@ if ($PSCmdlet.ParameterSetName -eq 'Remove') {
     $entries0 = @(Get-PolEntries $preRecs)
     $mine = $entries0 | Where-Object { $_.Key -eq $hash } | Select-Object -First 1
     $marker0 = Get-PolValue $preRecs $relBase ''
-    if (-not $mine) {
+    # Removal is about the PHYSICAL records at the hashed key, not the effective client state: an
+    # entry whose values were later wiped by a **delvals. (the damaged ordering this script warns
+    # about) is invisible to clients, yet its records still occupy the key and the documented
+    # recovery - run -Remove, then add it again - has to be able to clear them.
+    if (-not (Test-EntryRecordsPresent $preRecs "$relBase\$hash")) {
         $notes.Add("No entry for this URL (key $hash) in $gpoLabel ($Scope scope) - nothing to remove.")
     } else {
-        $entryPid = $mine.PolicyID
+        # Identity for the marker logic and the prompt: the effective values when the entry is
+        # live, else the last raw record of each (a damaged entry still names what it was).
+        $rawOf = { param($name) @($preRecs | Where-Object { $_.Key -match ('^(?i)' + [regex]::Escape("$relBase\$hash") + '$') -and $_.ValueName -eq $name } | Select-Object -Last 1 -ExpandProperty Data) }
+        $entryPid = if ($mine) { $mine.PolicyID } else { & $rawOf 'PolicyID' }
+        $entryUrl = if ($mine) { $mine.URL }      else { & $rawOf 'URL' }
+        if (-not $mine) { $notes.Add("The entry at key $hash has no EFFECTIVE values (its records are followed by a deletion instruction - clients never see it); removing its physical records.") }
         $markerMatches = $marker0 -and ("$marker0" -eq "$entryPid")
         $survivorServes = @($entries0 | Where-Object { $_.Key -ne $hash -and "$($_.PolicyID)" -eq "$marker0" }).Count -gt 0
-        if ($PSCmdlet.ShouldProcess($gpoLabel, "Remove CEP entry $entryKey (URL=$($mine.URL), PolicyID=$entryPid)")) {
+        if ($PSCmdlet.ShouldProcess($gpoLabel, "Remove CEP entry $entryKey (URL=$entryUrl, PolicyID=$entryPid)")) {
             Invoke-GPWrite -TolerateNotFound { Remove-GPRegistryValue @wr -Key $entryKey | Out-Null }
             $removedEntry = $true
         }
@@ -491,7 +576,91 @@ if ($AllowUntrustedIssuer) { $flags = $flags -bor 0x20 }  # PsfAllowUnTrustedCA
 
 $entryApplied = $false; $adRow = 'pending'; $defaultChanged = $false; $aeApplied = $false; $dupRemoved = @()
 
-# ---- 1. the CEP entry (individual writes - the cmdlet's list form plants **delVals.) -------
+# ---- 0. prerequisite for the AD enrollment policy row - resolved BEFORE any write ----------
+# A GPO that delivers a CEP entry but no LDAP: row takes the AD enrollment policy away from every
+# client in scope (see -SkipADPolicy). The domain objectGUID that row needs is therefore resolved
+# first, and a lookup failure aborts the run while NOTHING has been written - it must not become
+# a warning issued after the CEP entry already exists in a published GPO.
+$adPid = $null
+if (-not $SkipADPolicy) {
+    try {
+        $ldapBase = if ($Server) { "LDAP://$Server/RootDSE" } elseif ($Domain) { "LDAP://$Domain/RootDSE" } else { 'LDAP://RootDSE' }
+        $dn  = ([ADSI]$ldapBase).defaultNamingContext.Value
+        if (-not $dn) { throw 'RootDSE returned no defaultNamingContext' }
+        $domPath = if ($Server) { "LDAP://$Server/$dn" } else { "LDAP://$dn" }
+        $dom = [ADSI]$domPath
+        $adPid = '{' + (New-Object Guid (, ([byte[]]$dom.Properties['objectGUID'][0]))).ToString().ToUpper() + '}'
+    } catch {
+        throw "Could not resolve the domain objectGUID needed for the AD Enrollment Policy row ($_). Nothing was written. Without that row, clients applying this GPO would LOSE the AD enrollment policy (autoenrollment against AD-published templates stops), so the run stops here: fix the lookup (-Server / -Domain, connectivity, permissions), or pass -SkipADPolicy to omit the row deliberately."
+    }
+}
+
+# ---- 1. AD enrollment policy row FIRST (prevents losing the AD default policy fleet-wide) --
+# Written and verified before the CEP entry: the GPO must never be published in the state "CEP
+# entry present, LDAP: row absent" - not through a write failure (which now aborts before the CEP
+# entry exists) and not through a declined confirmation (the CEP step below refuses to run then).
+# "Already present" means a COMPLETE, correct row: URL 'LDAP:' AND the PolicyID this domain
+# actually has. A half-written row (an interrupted earlier run) or one carrying another domain's
+# GUID would not restore the AD enrollment policy on clients and must not satisfy the prerequisite.
+$adRowPresent = $null -ne $adPid -and @(Get-PolEntries $preRecs | Where-Object {
+        $_.Key -eq $AD_KEY -and "$($_.URL)" -eq 'LDAP:' -and "$($_.PolicyID)" -eq "$adPid" }).Count -gt 0
+if ($SkipADPolicy) { $adRow = 'skipped (-SkipADPolicy)' }
+else {
+    $adTarget = "$baseKey\$AD_KEY"
+    if ($PSCmdlet.ShouldProcess($gpoLabel, "Ensure AD Enrollment Policy row under $adTarget (URL=LDAP:, PolicyID=$adPid, Flags=0x14, Cost=0xFFFFFFFF)")) {
+        try {
+            Invoke-GPWrite {
+                Set-GPRegistryValue @wr -Key $adTarget -ValueName URL          -Type String -Value 'LDAP:' | Out-Null
+                Set-GPRegistryValue @wr -Key $adTarget -ValueName PolicyID     -Type String -Value $adPid | Out-Null
+                Set-GPRegistryValue @wr -Key $adTarget -ValueName FriendlyName -Type String -Value 'Active Directory Enrollment Policy' | Out-Null
+                Set-GPRegistryValue @wr -Key $adTarget -ValueName Flags        -Type DWord -Value 0x14 | Out-Null
+                Set-GPRegistryValue @wr -Key $adTarget -ValueName AuthFlags    -Type DWord -Value 2 | Out-Null
+                Set-GPRegistryValue @wr -Key $adTarget -ValueName Cost         -Type DWord -Value ([uint32]4294967295) | Out-Null
+            }
+        } catch { throw "AD policy row write to $gpoLabel failed: $_ (the CEP entry was NOT written)" }
+        Test-GpoEntry $adTarget @{ URL = 'LDAP:'; PolicyID = $adPid; Flags = 0x14; AuthFlags = 2; Cost = [uint32]4294967295 }
+        $adRow = 'applied'
+    } else { $adRow = 'not run' }
+}
+
+function New-AddSummary([object[]]$Recs, [string]$RootApplied, [string[]]$Removed) {
+    # The Add-mode result object, built from whichever registry.pol snapshot is current: the
+    # final one after a full run, or the pre-run one when the run stopped at the prerequisite.
+    [pscustomobject]@{
+        Mode            = 'Add'
+        Gpo             = $gpo.DisplayName
+        GpoId           = $gpo.Id
+        Scope           = $Scope
+        Key             = $entryKey
+        Url             = $Url
+        PolicyID        = $PolicyId
+        FriendlyName    = $PolicyName
+        Flags           = '0x{0:X}' -f $flags
+        Authentication  = '{0} (0x{1:X})' -f $Authentication, $authFlags
+        Cost            = '0x{0:X}' -f $Cost
+        EntryApplied    = $entryApplied
+        ADPolicyRow     = $adRow
+        RootFlags       = '{0} ({1})' -f (Get-RootFlagsDisplay $Recs), $RootApplied
+        DefaultMarker   = "$(Get-PolValue $Recs $relBase '')"
+        DefaultChanged  = $defaultChanged
+        AutoEnrollment  = if ($EnableAutoEnrollmentPolicy) { "AEPolicy=$AEPolicy, $AEExpirationPercent%, '$AEStore' (applied=$aeApplied)" } else { 'not touched' }
+        DuplicatesRemoved = @($Removed)
+        Notes           = @($notes)
+    }
+}
+
+# ---- 2. the CEP entry (individual writes - the cmdlet's list form plants **delVals.) -------
+# Dependent on step 1: without an LDAP: row in the GPO (just written, already present, or
+# deliberately omitted with -SkipADPolicy) the entry is NOT written and the Add workflow STOPS
+# here - a declined AD-row prompt therefore declines the CEP entry and everything that builds on
+# it (root Flags, (Default) marker, Auto-Enrollment, sibling cleanup). -WhatIf previews all
+# steps regardless (nothing is written).
+$adRowSatisfied = $SkipADPolicy -or $adRow -eq 'applied' -or $adRowPresent
+if (-not $adRowSatisfied -and -not $WhatIfPreference) {
+    $notes.Add("CEP entry NOT written and the run stopped here: the AD Enrollment Policy row was declined and $gpoLabel carries none. Publishing the entry without it would make clients in scope LOSE the AD enrollment policy (autoenrollment against AD-published templates stops). Nothing else was changed. Re-run and accept the AD row, or pass -SkipADPolicy to omit it deliberately.")
+    foreach ($n in $notes) { Write-Warning $n }
+    return New-AddSummary -Recs $preRecs -RootApplied 'unchanged' -Removed @()
+}
 $action = "Write CEP entry '{0}' under {1} (URL={2}, PolicyID={3}, Flags=0x{4:X}, AuthFlags=0x{5:X} {6}, Cost=0x{7:X})" -f `
           $PolicyName, $entryKey, $Url, $PolicyId, $flags, $authFlags, $Authentication, $Cost
 if ($PSCmdlet.ShouldProcess($gpoLabel, $action)) {
@@ -508,39 +677,38 @@ if ($PSCmdlet.ShouldProcess($gpoLabel, $action)) {
     Test-GpoEntry $entryKey @{ URL = $Url; PolicyID = $PolicyId; FriendlyName = $PolicyName; Flags = [int]$flags; AuthFlags = [int]$authFlags; Cost = [uint32]$Cost }
     $entryApplied = $true
 }
-
-# ---- 2. AD enrollment policy row (prevents losing the AD default policy fleet-wide) --------
-if ($SkipADPolicy) { $adRow = 'skipped (-SkipADPolicy)' }
-else {
-    $adPid = $null
-    try {
-        $ldapBase = if ($Server) { "LDAP://$Server/RootDSE" } elseif ($Domain) { "LDAP://$Domain/RootDSE" } else { 'LDAP://RootDSE' }
-        $dn  = ([ADSI]$ldapBase).defaultNamingContext.Value
-        $domPath = if ($Server) { "LDAP://$Server/$dn" } else { "LDAP://$dn" }
-        $dom = [ADSI]$domPath
-        $adPid = '{' + (New-Object Guid (, ([byte[]]$dom.Properties['objectGUID'][0]))).ToString().ToUpper() + '}'
-    } catch {
-        Write-Warning "Could not resolve the domain objectGUID for the AD policy row; skipping it. Clients applying this GPO will NOT see the AD enrollment policy. ($_)"
-        $adRow = 'skipped (lookup failed)'
-    }
-    if ($adPid) {
-        $adTarget = "$baseKey\$AD_KEY"
-        if ($PSCmdlet.ShouldProcess($gpoLabel, "Ensure AD Enrollment Policy row under $adTarget (URL=LDAP:, PolicyID=$adPid, Flags=0x14, Cost=0xFFFFFFFF)")) {
-            try {
-                Invoke-GPWrite {
-                    Set-GPRegistryValue @wr -Key $adTarget -ValueName URL          -Type String -Value 'LDAP:' | Out-Null
-                    Set-GPRegistryValue @wr -Key $adTarget -ValueName PolicyID     -Type String -Value $adPid | Out-Null
-                    Set-GPRegistryValue @wr -Key $adTarget -ValueName FriendlyName -Type String -Value 'Active Directory Enrollment Policy' | Out-Null
-                    Set-GPRegistryValue @wr -Key $adTarget -ValueName Flags        -Type DWord -Value 0x14 | Out-Null
-                    Set-GPRegistryValue @wr -Key $adTarget -ValueName AuthFlags    -Type DWord -Value 2 | Out-Null
-                    Set-GPRegistryValue @wr -Key $adTarget -ValueName Cost         -Type DWord -Value ([uint32]4294967295) | Out-Null
-                }
-            } catch { throw "AD policy row write to $gpoLabel failed: $_" }
-            Test-GpoEntry $adTarget @{ URL = 'LDAP:'; PolicyID = $adPid; Flags = 0x14; AuthFlags = 2; Cost = [uint32]4294967295 }
-            $adRow = 'applied'
-        } else { $adRow = 'not run' }
-    }
+# The steps that point AT the entry - the (Default) marker and the removal of the entry's stale
+# siblings - are only meaningful when an entry for THIS URL that serves THIS PolicyID exists:
+# written just now, or already present in the GPO from an earlier run with the same PolicyID. A
+# declined CEP prompt must not leave a marker pointing at nothing, and an existing entry that
+# still serves a DIFFERENT PolicyID (the declined update would have changed it) must not let the
+# marker or the sibling cleanup act for the requested one. (-WhatIf still previews them.)
+# A pre-existing entry counts only when COMPLETE for this request - URL and PolicyID both as
+# requested (an interrupted earlier write can leave a key with a PolicyID but no URL, which no
+# client can use). Re-evaluated from a fresh registry.pol read right before the sibling cleanup.
+function Test-EntryComplete([object[]]$Recs) {
+    @(Get-PolEntries $Recs | Where-Object { $_.Key -eq $hash -and "$($_.URL)" -eq $Url -and "$($_.PolicyID)" -eq "$PolicyId" }).Count -gt 0
 }
+function Test-SiblingStillSuperseded([string]$LeafKey) {
+    # Live (GPMC API) check that a candidate for -ReplaceExisting removal is still what made it a
+    # candidate: a different key than ours, serving the requested PolicyID under a DIFFERENT URL.
+    if ($LeafKey -eq $hash -or $LeafKey -eq $AD_KEY) { return $false }
+    try {
+        $vals = Get-GPRegistryValue @wr -Key "$baseKey\$LeafKey" -ErrorAction Stop
+        $map = @{}; foreach ($v in $vals) { $map[$v.ValueName] = $v.Value }
+        return ("$($map['PolicyID'])" -eq "$PolicyId") -and ("$($map['URL'])" -ne $Url)
+    } catch { return $false }
+}
+function Test-EntryCompleteLive {
+    # Same test, but against the GPO as the GroupPolicy cmdlets see it RIGHT NOW (the API the
+    # writes went through) rather than a registry.pol snapshot - used before destructive cleanup.
+    try {
+        $vals = Get-GPRegistryValue @wr -Key $entryKey -ErrorAction Stop
+        $map = @{}; foreach ($v in $vals) { $map[$v.ValueName] = $v.Value }
+        return ("$($map['URL'])" -eq $Url) -and ("$($map['PolicyID'])" -eq "$PolicyId")
+    } catch { return $false }
+}
+$entryExists = $entryApplied -or $WhatIfPreference -or (Test-EntryComplete $preRecs)
 
 # ---- 3. root Flags (DISABLE bits; existing bits preserved; bit-safe for high-bit values) ---
 $existingRoot = Get-PolValue $preRecs $relBase 'Flags'
@@ -563,7 +731,10 @@ if (($null -eq $existingRoot) -or ([int64]$existingRoot -ne $newRoot)) {
 
 # ---- 4. (Default) marker -------------------------------------------------------------------
 if ($SetAsDefault) {
-    if ($PSCmdlet.ShouldProcess($gpoLabel, "Set (Default) marker = $PolicyId on $baseKey (default enrollment policy = '$PolicyName')")) {
+    if (-not $entryExists) {
+        $notes.Add("(Default) marker NOT set: the CEP entry was declined and does not exist in this GPO scope, so the marker would point at nothing.")
+    }
+    elseif ($PSCmdlet.ShouldProcess($gpoLabel, "Set (Default) marker = $PolicyId on $baseKey (default enrollment policy = '$PolicyName')")) {
         Invoke-GPWrite { Set-GPRegistryValue @wr -Key $baseKey -ValueName '' -Type String -Value $PolicyId | Out-Null }
         $defaultChanged = $true
     }
@@ -596,10 +767,31 @@ if ($EnableAutoEnrollmentPolicy) {
 # ---- 6. consistency: stale duplicates, orphaned (Default), damaged deletion ordering -------
 $postRecs = Read-PolRecords -Path $polPath
 $entries = @(Get-PolEntries $postRecs)
+# Sibling removal is judged on the state as it is NOW, read back through the same GPMC API the
+# write went through: the replacing entry must be complete at this moment - "written and verified
+# earlier this run" does not count, because another writer may have removed or changed it since -
+# or the "superseded" siblings are the only working endpoints for this PolicyID and must stay.
+$entryExists = $WhatIfPreference -or (Test-EntryCompleteLive)
 $dups = @($entries | Where-Object { "$($_.PolicyID)" -eq "$PolicyId" -and $_.Key -ne $hash -and $_.Key -ne $AD_KEY })
 foreach ($d in $dups) {
-    if ($ReplaceExisting) {
+    if ($ReplaceExisting -and -not $entryExists) {
+        $notes.Add("Superseded entry '$($d.URL)' (key $($d.Key)) NOT removed: the replacing CEP entry was declined and does not exist, so removing it would leave no endpoint for PolicyID $PolicyId.")
+    }
+    elseif ($ReplaceExisting) {
         if ($PSCmdlet.ShouldProcess($gpoLabel, "Remove superseded entry $baseKey\$($d.Key) (same PolicyID, URL=$($d.URL))")) {
+            # Re-validate AFTER the approval - a -Confirm prompt can stay open for any length of
+            # time, and another writer may have acted meanwhile: the replacement must still be
+            # complete, and this sibling must still serve the requested PolicyID under a different
+            # URL, both as the GPMC API sees them right now. (Invoke-GPWrite's retries only re-run
+            # the removal itself, sub-second, on transient errors.)
+            if (-not (Test-EntryCompleteLive)) {
+                $notes.Add("Superseded entry '$($d.URL)' (key $($d.Key)) NOT removed: the replacing CEP entry is no longer complete in the GPO (changed or removed while the prompt was open).")
+                continue
+            }
+            if (-not (Test-SiblingStillSuperseded -LeafKey $d.Key)) {
+                $notes.Add("Entry at key $($d.Key) NOT removed: it no longer serves PolicyID $PolicyId under a different URL (changed or removed while the prompt was open).")
+                continue
+            }
             Invoke-GPWrite -TolerateNotFound { Remove-GPRegistryValue @wr -Key "$baseKey\$($d.Key)" | Out-Null }
             $dupRemoved += $d.URL
         }
@@ -622,24 +814,4 @@ if ($marker) {
 }
 foreach ($n in $notes) { Write-Warning $n }
 
-[pscustomobject]@{
-    Mode            = 'Add'
-    Gpo             = $gpo.DisplayName
-    GpoId           = $gpo.Id
-    Scope           = $Scope
-    Key             = $entryKey
-    Url             = $Url
-    PolicyID        = $PolicyId
-    FriendlyName    = $PolicyName
-    Flags           = '0x{0:X}' -f $flags
-    Authentication  = '{0} (0x{1:X})' -f $Authentication, $authFlags
-    Cost            = '0x{0:X}' -f $Cost
-    EntryApplied    = $entryApplied
-    ADPolicyRow     = $adRow
-    RootFlags       = '{0} ({1})' -f (Get-RootFlagsDisplay $finalRecs), $rootApplied
-    DefaultMarker   = "$marker"
-    DefaultChanged  = $defaultChanged
-    AutoEnrollment  = if ($EnableAutoEnrollmentPolicy) { "AEPolicy=$AEPolicy, $AEExpirationPercent%, '$AEStore' (applied=$aeApplied)" } else { 'not touched' }
-    DuplicatesRemoved = @($dupRemoved)
-    Notes           = @($notes)
-}
+New-AddSummary -Recs $finalRecs -RootApplied $rootApplied -Removed $dupRemoved

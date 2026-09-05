@@ -67,7 +67,7 @@ Describe 'Add-CertificateEnrollmentPolicyServerToGpo' {
         # (The script has mandatory params and '#Requires -Modules GroupPolicy', so it cannot be
         # dot-sourced wholesale; extracting the function bodies runs them with no side effects.)
         $ast = [System.Management.Automation.Language.Parser]::ParseFile($script:Gpo, [ref]$null, [ref]$null)
-        foreach ($name in 'Read-PolRecords', 'Get-PolEntries', 'Get-PolValue') {
+        foreach ($name in 'Read-PolRecords', 'Get-PolEffectiveValues', 'Get-PolEntries', 'Get-PolValue', 'Test-EntryRecordsPresent') {
             $def = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name }, $false)
             if ($def) { . ([scriptblock]::Create($def[0].Extent.Text)) }
         }
@@ -124,6 +124,19 @@ Describe 'Add-CertificateEnrollmentPolicyServerToGpo' {
             @(Read-PolRecords -Path (Join-Path $TestDrive 'nope.pol')).Count | Should -Be 0
         }
 
+        It 'Read-PolRecords refuses a file without the PReg/version-1 header, and trailing junk after the records' {
+            $bad = Join-Path $TestDrive 'bad-header.pol'
+            [System.IO.File]::WriteAllBytes($bad, [byte[]](0x4D, 0x5A, 0, 0, 1, 0, 0, 0) + [byte[]](1..16))
+            { Read-PolRecords -Path $bad } | Should -Throw -ExpectedMessage '*PReg*'
+            $junk = Join-Path $TestDrive 'trailing-junk.pol'
+            [System.IO.File]::WriteAllBytes($junk, [System.IO.File]::ReadAllBytes($script:PolPath) + [byte[]](0x41, 0x00, 0x42, 0x00))
+            { Read-PolRecords -Path $junk } | Should -Throw -ExpectedMessage '*truncated or corrupt*'
+            # a header-only file is a legitimately EMPTY policy, not an error
+            $empty = Join-Path $TestDrive 'empty.pol'
+            [System.IO.File]::WriteAllBytes($empty, [byte[]](0x50, 0x52, 0x65, 0x67, 1, 0, 0, 0))
+            @(Read-PolRecords -Path $empty).Count | Should -Be 0
+        }
+
         It 'Get-PolEntries groups values into one entry per 40-hex subkey' {
             $recs = Read-PolRecords -Path $script:PolPath
             $entries = @(Get-PolEntries $recs)
@@ -140,11 +153,101 @@ Describe 'Add-CertificateEnrollmentPolicyServerToGpo' {
             @(Get-PolEntries $recs).Count | Should -Be 1
         }
 
-        It 'Get-PolValue reads a root value and is case-sensitive on the value name' {
+        It 'Get-PolValue reads a root value; value names compare case-insensitively (registry semantics)' {
             $recs = Read-PolRecords -Path $script:PolPath
             (Get-PolValue $recs $script:relBase '')      | Should -BeExactly '241064013'   # (Default) marker
             [uint32](Get-PolValue $recs $script:relBase 'Flags') | Should -Be 0x4
-            (Get-PolValue $recs $script:relBase 'flags') | Should -BeNullOrEmpty            # wrong case -> no match
+            [uint32](Get-PolValue $recs $script:relBase 'flags') | Should -Be 0x4          # the registry is case-insensitive on value names
+            (Get-PolValue $recs $script:relBase 'Nope')  | Should -BeNullOrEmpty
+        }
+
+        It 'Get-PolValue returns the EFFECTIVE (last) record when a value appears more than once' {
+            # Registry.pol is applied in order: a later record for the same name replaces the
+            # earlier one, so state decisions must not be based on the obsolete first record.
+            $recs = @(Read-PolRecords -Path $script:PolPath) + [pscustomobject]@{
+                Key = $script:relBase; ValueName = 'Flags'; Type = 4; Data = [uint32]0; Index = 99
+            }
+            [uint32](Get-PolValue $recs $script:relBase 'Flags') | Should -Be 0
+        }
+
+        It 'Get-PolValue honours a later **del.<name> / **delvals. record (value deleted -> $null)' {
+            $base = @(Read-PolRecords -Path $script:PolPath)
+            $del1 = $base + [pscustomobject]@{ Key = $script:relBase; ValueName = '**del.Flags'; Type = 1; Data = ' '; Index = 99 }
+            (Get-PolValue $del1 $script:relBase 'Flags') | Should -BeNullOrEmpty
+            (Get-PolValue $del1 $script:relBase '')      | Should -BeExactly '241064013'   # untouched sibling survives
+            $del2 = $base + [pscustomobject]@{ Key = $script:entryKey; ValueName = '**delvals.'; Type = 1; Data = ' '; Index = 99 }
+            (Get-PolValue $del2 $script:entryKey 'URL')  | Should -BeNullOrEmpty
+            @(Get-PolEntries $del2).Count | Should -Be 0 -Because 'an entry whose values are all deleted later is not one a client ends up with'
+        }
+
+        It 'Get-PolEffectiveValues honours **DeleteKeys as the GP engine does: FULL key paths in the data, record key ignored' {
+            # Semantics per the LGPO author's corrections to MS-GPREG: the data is a ';'-separated
+            # list of full key paths (no hive); the record's own key field is ignored entirely.
+            $base = @(Read-PolRecords -Path $script:PolPath)
+            # full path of this entry, recorded under an unrelated key (even an empty one)
+            $byPath = $base + [pscustomobject]@{ Key = ''; ValueName = '**DeleteKeys'; Type = 1; Data = "Software\Policies\Other;$script:entryKey"; Index = 99 }
+            (Get-PolValue $byPath $script:entryKey 'URL') | Should -BeNullOrEmpty
+            @(Get-PolEntries $byPath).Count | Should -Be 0 -Because 'a client applying this file ends up without the entry'
+            (Get-PolValue $byPath $script:relBase 'Flags') | Should -Not -BeNullOrEmpty -Because 'the PolicyServers key itself is not named'
+            # naming an ANCESTOR (the whole PolicyServers key) deletes the entry and the root values
+            $byAncestor = $base + [pscustomobject]@{ Key = 'whatever'; ValueName = '**DeleteKeys'; Type = 1; Data = $script:relBase; Index = 99 }
+            (Get-PolValue $byAncestor $script:entryKey 'URL') | Should -BeNullOrEmpty
+            (Get-PolValue $byAncestor $script:relBase 'Flags') | Should -BeNullOrEmpty
+            # the documented-but-wrong parent-relative reading must NOT delete anything: a bare leaf
+            # name is the key "<leaf>" at the hive root, not our entry
+            $bareLeaf = $base + [pscustomobject]@{ Key = $script:relBase; ValueName = '**DeleteKeys'; Type = 1; Data = $script:leaf; Index = 99 }
+            (Get-PolValue $bareLeaf $script:entryKey 'URL') | Should -Not -BeNullOrEmpty
+            # a path that merely PREFIXES ours is not an ancestor (PolicyServers2 vs PolicyServers)
+            $prefix = $base + [pscustomobject]@{ Key = ''; ValueName = '**DeleteKeys'; Type = 1; Data = "${script:relBase}2"; Index = 99 }
+            (Get-PolValue $prefix $script:entryKey 'URL') | Should -Not -BeNullOrEmpty
+            # ...and a DeleteKeys BEFORE the entry's records does not delete what is written afterwards
+            $before = @([pscustomobject]@{ Key = ''; ValueName = '**DeleteKeys'; Type = 1; Data = $script:entryKey; Index = -1 }) + $base
+            (Get-PolValue $before $script:entryKey 'URL') | Should -Not -BeNullOrEmpty
+        }
+
+        It 'Get-PolEffectiveValues skips **Comment:/**SecureKey and applies **soft. only when the value is absent' {
+            $base = @(Read-PolRecords -Path $script:PolPath)
+            $recs = $base + @(
+                [pscustomobject]@{ Key = $script:entryKey; ValueName = '**Comment: from GPO X'; Type = 1; Data = ' '; Index = 90 }
+                [pscustomobject]@{ Key = $script:entryKey; ValueName = '**SecureKey';           Type = 4; Data = 1;   Index = 91 }
+                [pscustomobject]@{ Key = $script:entryKey; ValueName = '**soft.URL';            Type = 1; Data = 'https://soft.example/'; Index = 92 }   # URL exists -> ignored
+                [pscustomobject]@{ Key = $script:entryKey; ValueName = '**soft.Cost';           Type = 4; Data = [uint32]5; Index = 93 }                 # Cost absent -> written
+            )
+            $eff = (Get-PolEffectiveValues $recs $script:entryKey).Values
+            $eff['URL']  | Should -BeExactly 'https://pki.example.net/ejbca/msae/CEPService?alias'
+            [uint32]$eff['Cost'] | Should -Be 5
+            @($eff.Keys | Where-Object { $_ -like '`*`**' }).Count | Should -Be 0 -Because 'instructions never surface as values'
+        }
+
+        It 'Test-EntryRecordsPresent sees a damaged entry (values wiped by a later **delvals.) that the effective view hides - so -Remove can clear it' {
+            $damaged = @(Read-PolRecords -Path $script:PolPath) + [pscustomobject]@{ Key = $script:entryKey; ValueName = '**delvals.'; Type = 1; Data = ' '; Index = 99 }
+            @(Get-PolEntries $damaged).Count | Should -Be 0 -Because 'clients never see the entry'
+            Test-EntryRecordsPresent $damaged $script:entryKey | Should -BeTrue -Because 'its records still occupy the key and must be removable'
+            Test-EntryRecordsPresent $damaged "$script:relBase\ffffffffffffffffffffffffffffffffffffffff" | Should -BeFalse
+            Test-EntryRecordsPresent @() $script:entryKey | Should -BeFalse
+        }
+
+        It 'Get-PolEffectiveValues fails CLOSED on a deletion instruction it does not understand' {
+            $recs = @(Read-PolRecords -Path $script:PolPath) + [pscustomobject]@{ Key = $script:entryKey; ValueName = '**delsomethingnew'; Type = 1; Data = ' '; Index = 99 }
+            { Get-PolValue $recs $script:entryKey 'URL' } | Should -Throw -ExpectedMessage '*does not understand*'
+        }
+
+        It 'Get-PolEffectiveValues: a deletion BETWEEN an obsolete record and its replacement loses nothing' {
+            # old value -> **del.Flags -> new value: the client ends with the new value. Only a
+            # deletion AFTER a value's last record is damage (the Deleted set drives the warning).
+            $recs = @(
+                [pscustomobject]@{ Key = $script:relBase; ValueName = 'Flags';       Type = 4; Data = [uint32]4; Index = 0 }
+                [pscustomobject]@{ Key = $script:relBase; ValueName = '**del.Flags'; Type = 1; Data = ' ';       Index = 1 }
+                [pscustomobject]@{ Key = $script:relBase; ValueName = 'Flags';       Type = 4; Data = [uint32]0; Index = 2 }
+            )
+            $eff = Get-PolEffectiveValues $recs $script:relBase
+            [uint32]$eff.Values['Flags'] | Should -Be 0
+            $eff.Deleted.Count | Should -Be 0 -Because 'the replacement survives, so nothing is lost'
+
+            # ...whereas a deletion after the LAST record really does lose the value.
+            $eff2 = Get-PolEffectiveValues ($recs[2], $recs[1]) $script:relBase
+            $eff2.Values.ContainsKey('Flags') | Should -BeFalse
+            @($eff2.Deleted.Keys) | Should -Contain 'Flags'
         }
     }
 
