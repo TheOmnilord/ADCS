@@ -1,11 +1,12 @@
 ﻿<#PSScriptInfo
-.VERSION 1.0.1
+.VERSION 1.0.2
 .GUID 48b937ae-18bd-4710-9de9-5ae76f7c9a72
 .AUTHOR Sveinung Svea
 .PROJECTURI https://github.com/TheOmnilord/ADCS
 .LICENSEURI https://github.com/TheOmnilord/ADCS/blob/main/LICENSE
 .TAGS ADCS PKI CertificateServices
 .RELEASENOTES
+1.0.2 - When the overlap is not being set, a template whose EXISTING renewal overlap is not shorter than the new validity is reported as an error and left unchanged (previously the validity was shortened beneath the retained overlap, an invalid pair; the begin-block check only covered an explicitly supplied overlap)
 1.0.1 - A run in which any search or template update failed now ends with a terminating error (non-zero exit) after the summary, instead of exit 0 with errors only in the console; help no longer advertises ? as a wildcard (LDAP substring filters only know *, so ? always matched literally - documentation corrected)
 1.0.0 - Initial release
 #>
@@ -135,6 +136,15 @@ begin {
         return "$([int]$days) day(s)"
     }
 
+    function ConvertFrom-PKIPeriodBytesToDays {
+        # The exact length in days (fractional for hour-based periods) of a pKI*Period value, or
+        # $null when the attribute is absent or malformed. ConvertFrom-PKIPeriodBytes renders
+        # display text in the largest clean unit; this one is for comparisons.
+        param([byte[]]$Bytes)
+        if ($null -eq $Bytes -or $Bytes.Length -ne 8) { return $null }
+        [Math]::Abs([System.BitConverter]::ToInt64($Bytes, 0)) / (24.0 * 60 * 60 * 1e7)
+    }
+
     function ConvertTo-LdapFilterValue {
         # Escapes RFC 4515 filter metacharacters while preserving the * wildcard. ? is not an
         # LDAP metacharacter (RFC 4515 has no single-character wildcard), so it needs no escaping
@@ -152,8 +162,8 @@ begin {
         throw 'OverlapPeriod and OverlapPeriodUnit must both be specified together.'
     }
 
+    $validityDays = ConvertTo-PKIPeriodDays -Period $ValidityPeriod -PeriodUnit $ValidityPeriodUnit
     if ($setOverlap) {
-        $validityDays = ConvertTo-PKIPeriodDays -Period $ValidityPeriod -PeriodUnit $ValidityPeriodUnit
         $overlapDays = ConvertTo-PKIPeriodDays -Period $OverlapPeriod -PeriodUnit $OverlapPeriodUnit
         if ($overlapDays -ge $validityDays) {
             throw "OverlapPeriod ($OverlapPeriod $OverlapPeriodUnit) must be shorter than ValidityPeriod ($ValidityPeriod $ValidityPeriodUnit)."
@@ -271,6 +281,29 @@ process {
                     }
                     $alreadySetCount++
                     continue
+                }
+
+                # The renewal overlap must stay shorter than the validity. When the overlap is not
+                # being set, the template's EXISTING overlap is kept - and shortening the validity
+                # beneath it (30 days over a stock 6-week overlap) would leave an invalid pair that
+                # the -OverlapPeriod check in begin{} never sees. Such a template is reported as an
+                # error (counted in the exit code) and left untouched; pass a shorter -OverlapPeriod.
+                if (-not $setOverlap) {
+                    $currentOverlapDays = ConvertFrom-PKIPeriodBytesToDays -Bytes $currentOverlapBytes
+                    if ($null -ne $currentOverlapDays -and $currentOverlapDays -ge $validityDays) {
+                        Write-Error "Template '$cn': its existing renewal overlap ($currentOverlap) is not shorter than the new validity ($newValidityDisplay); left unchanged. Pass -OverlapPeriod/-OverlapPeriodUnit with a value shorter than the validity to change both together."
+                        $errorCount++
+                        [PSCustomObject]@{
+                            TemplateName     = $cn
+                            DisplayName      = $displayName
+                            PreviousValidity = $currentValidity
+                            NewValidity      = $newValidityDisplay
+                            PreviousOverlap  = $currentOverlap
+                            NewOverlap       = $newOverlapDisplay
+                            Status           = 'Error: existing overlap not shorter than the new validity'
+                        }
+                        continue
+                    }
                 }
 
                 $target = "'$cn' ($displayName) -Validity: $currentValidity -> $newValidityDisplay"

@@ -1,11 +1,12 @@
 <#PSScriptInfo
-.VERSION 1.0.3
+.VERSION 1.0.4
 .GUID 6f98f16e-0c56-4a72-ba31-443938175c06
 .AUTHOR Sveinung Svea
 .PROJECTURI https://github.com/TheOmnilord/ADCS
 .LICENSEURI https://github.com/TheOmnilord/ADCS/blob/main/LICENSE
 .TAGS ADCS PKI CertificateServices
 .RELEASENOTES
+1.0.4 - Certificate file names are allocated up front and must be unique within the batch and against the destinations already recorded for other request files (prod.req / prod.csr / prod.req.txt no longer map two requests onto one .cer); the tracking file is read with -LiteralPath (a name with [ ] was reported absent and its whole history resubmitted); a nonexistent or non-folder -InputPath is a terminating error instead of an empty batch; every row records the CA it was submitted to (CAConfig) and -Mode Retrieve refuses rows submitted to a different CA; a submission certreq reports as successful but whose reply yields neither a RequestID nor a certificate is recorded as Unknown and never resubmitted automatically; a run with failed or attention-needing rows ends with a terminating error (non-zero exit); log messages fold CR/LF and control characters so a tracking field cannot forge log lines; Export-Csv column loss with mixed old/new rows prevented
 1.0.3 - The delivery folder is also judged on what its ACL hands to the FILES created inside it: an inheritable "files" entry (inherit-only or not) granting an untrusted principal write, append, delete, write-attributes or re-permission rights is refused (a warning under -AllowUnprotectedOutputFolder; -TrustedOutputPrincipal applies), because certreq's staging file and the delivered certificate inherit it while the folder-swap checks rightly ignore inherit-only entries - previously such a user could alter the certificate's bytes before or after delivery with every folder check passing. CREATOR OWNER / OWNER RIGHTS placeholders resolve to the running account and are trusted; CREATOR GROUP is not
 1.0.2 - A retrieval that reports Issued without producing the .cer file is recorded as Error (retried next Retrieve) instead of a final Issued; certreq exit code + .cer presence now decide Issued independently of certreq's (localized) wording; certificates are written to a private staging file inside the destination folder and delivered with a no-overwrite rename (an existing file is moved aside as <name>.superseded-<stamp>.cer, never deleted); every folder from the destination to the volume root is checked for reparse points and untrusted owners/writers before delivery (new -AllowUnprotectedOutputFolder and -TrustedOutputPrincipal); a tracking row's OutputCertFile must resolve beneath the tracking folder or -OutputFolder; an issued certificate that cannot be delivered gets the new Undelivered status (never resubmitted); values that reach the certreq command line are validated; concurrent runs on one tracking file are refused (exclusive <TrackingFile>.lock) and the tracking file is replaced via a unique temp file; cmdlets inside an approved action no longer raise their own -Confirm prompts
 1.0.1 - Retrieve mode honours an explicit -OutputFolder (previously the path recorded at submit time was always used)
@@ -596,6 +597,10 @@ function Write-BatchLog {
         [string]$Level = 'Info'
     )
 
+    # Fields from the tracking CSV and certreq output are interpolated into messages. A CR/LF (or
+    # other control character) inside one would let an edited row forge extra, attacker-chosen
+    # log lines; they are folded into the line so one message is always exactly one record.
+    $Message = ($Message -replace '\r\n|\r|\n', ' | ') -replace '[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', '?'
     $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
     $entry = "[$timestamp] [$Level] $Message"
 
@@ -643,14 +648,14 @@ function Test-CAConnectivity {
 function Get-RequestFiles {
     param([string]$Path)
 
-    if (-not (Test-Path $Path)) {
-        Write-BatchLog "InputPath does not exist: $Path" -Level Error
-        return @()
+    # A misconfigured drop folder is an error, not an empty batch: returning @() here read as
+    # "Nothing to submit" and a scheduled run exited 0 with a reachable CA and no work done. An
+    # EXISTING empty folder is still a legitimate empty batch.
+    if (-not (Test-Path -LiteralPath $Path)) {
+        throw "InputPath does not exist: $Path"
     }
-
-    if (-not (Get-Item $Path).PSIsContainer) {
-        Write-BatchLog "InputPath must be a folder, not a file: $Path" -Level Error
-        return @()
+    if (-not (Get-Item -LiteralPath $Path).PSIsContainer) {
+        throw "InputPath must be a folder, not a file: $Path"
     }
 
     $files = @(
@@ -730,11 +735,81 @@ function Get-FriendlyErrorHint {
     return $hints
 }
 
+function Resolve-CertificateOutputNames {
+    # One .cer NAME per request file, unique across the batch AND against the destinations already
+    # recorded in the tracking file for OTHER request files. The natural name is <base>.cer; two
+    # request files whose names differ only by extension (a.req + a.csr) would share it, so those
+    # fall back to <full file name>.cer. That fallback can itself collide (prod.req -> prod.req.cer,
+    # while prod.req.txt has the BASE name 'prod.req' -> prod.req.cer), and a base name can collide
+    # with a destination an EARLIER run recorded for a different file; both are detected here,
+    # before anything is submitted, because delivery moves an occupant of the destination aside
+    # and would otherwise let one request's certificate silently replace another's. Returns
+    # @{ <full request path> = <.cer file name> }; throws when no unique assignment exists.
+    param([string[]]$RequestPaths, [object[]]$ExistingRows)
+    # cer name (lower-case) -> EVERY request path whose row recorded it. A pre-1.0.4 run could
+    # record one name for two files; a candidate is refused when ANY recorded owner is another file.
+    $taken = @{}
+    foreach ($row in @($ExistingRows | Where-Object { $_ -and "$($_.OutputCertFile)" })) {
+        $leaf = [System.IO.Path]::GetFileName("$($row.OutputCertFile)").ToLowerInvariant()
+        if (-not $leaf) { continue }
+        if (-not $taken.ContainsKey($leaf)) { $taken[$leaf] = @() }
+        if ("$($row.RequestFile)" -notin $taken[$leaf]) { $taken[$leaf] += "$($row.RequestFile)" }
+    }
+    function Test-TakenByOther([string]$Key, [string]$Path) {
+        $taken.ContainsKey($Key) -and @($taken[$Key] | Where-Object { -not $_.Equals($Path, [System.StringComparison]::OrdinalIgnoreCase) }).Count -gt 0
+    }
+    $candidates = @{}
+    foreach ($p in $RequestPaths) { $candidates[$p] = [System.IO.Path]::GetFileNameWithoutExtension($p) + '.cer' }
+    # A name claimed by another request file in this batch, or by a DIFFERENT file's tracking row,
+    # is not usable: that file falls back to its full name. Repeated until stable, because one
+    # file's fallback (prod.req -> prod.req.cer) can be another file's natural name (prod.req.txt
+    # has the base name 'prod.req'), which must then fall back as well (-> prod.req.txt.cer).
+    $names = @{}
+    foreach ($p in $RequestPaths) { $names[$p] = $candidates[$p] }
+    $full = @{}
+    for ($round = 0; $round -le $RequestPaths.Count; $round++) {
+        $owners = @{}
+        foreach ($p in $RequestPaths) {
+            $k = $names[$p].ToLowerInvariant()
+            if (-not $owners.ContainsKey($k)) { $owners[$k] = @() }
+            $owners[$k] += $p
+        }
+        $changed = $false
+        foreach ($p in $RequestPaths) {
+            $k = $names[$p].ToLowerInvariant()
+            $clash = ($owners[$k].Count -gt 1) -or (Test-TakenByOther $k $p)
+            if ($clash -and -not $full.ContainsKey($p)) {
+                $names[$p] = [System.IO.Path]::GetFileName($p) + '.cer'
+                $full[$p] = $true
+                $changed = $true
+            }
+        }
+        if (-not $changed) { break }
+    }
+    # The result must be unique - within the batch and against other files' recorded rows. Files
+    # already on their full name that still collide cannot be separated by renaming here.
+    $seen = @{}
+    foreach ($p in $RequestPaths) {
+        $k = $names[$p].ToLowerInvariant()
+        if ($seen.ContainsKey($k)) {
+            throw "Request files '$($seen[$k])' and '$p' would both produce the certificate name '$($names[$p])'. Rename one of them; two requests must never share a destination."
+        }
+        if (Test-TakenByOther $k $p) {
+            throw "Request file '$p' would produce the certificate name '$($names[$p])', which the tracking file already records for '$(@($taken[$k]) -join ''', ''')'. Rename the request file; two requests must never share a destination."
+        }
+        $seen[$k] = $p
+    }
+    $names
+}
+
 function Import-TrackingData {
     param([string]$Path)
 
-    if (Test-Path $Path) {
-        return @(Import-Csv -Path $Path -Encoding utf8)
+    # -LiteralPath throughout: the tracking-file name is canonicalized and locked LITERALLY, so a
+    # wildcard-aware Test-Path ('tracking[1].csv' -> looks for 'tracking1.csv') would report an
+    # existing file absent, return an empty history, and let every request be resubmitted.
+    if (Test-Path -LiteralPath $Path -PathType Leaf) {
+        return @(Import-Csv -LiteralPath $Path -Encoding utf8)
     }
     return @()
 }
@@ -757,7 +832,13 @@ function Export-TrackingData {
     try {
         # -Confirm:$false: the checkpoint is a mandatory part of an already-approved submission,
         # never a separately declinable prompt (see Write-BatchLog).
-        $filtered | Export-Csv -Path $tempFile -NoTypeInformation -Encoding utf8 -Confirm:$false
+        # Export-Csv takes its columns from the FIRST object. Rows read from an older tracking file
+        # lack CAConfig, and a mixed list led by one of them would silently drop that column - and
+        # with it the CA binding of every newer row. Every row is projected onto the full schema
+        # (plus any extra column an operator added), so the file always carries every field.
+        $columns = [System.Collections.Generic.List[string]]@('RequestFile', 'RequestID', 'SubmitTime', 'Status', 'OutputCertFile', 'LastCheckTime', 'ErrorMessage', 'CAConfig')
+        foreach ($r in $filtered) { foreach ($pn in $r.PSObject.Properties.Name) { if ($pn -notin $columns) { $columns.Add($pn) } } }
+        $filtered | Select-Object -Property $columns | Export-Csv -Path $tempFile -NoTypeInformation -Encoding utf8 -Confirm:$false
         # File.Replace / File.Move rather than Move-Item -Force: both fail if the tracking-file
         # name is occupied by a folder or a link (Move-Item would move the CSV INTO a folder).
         if (Test-Path -LiteralPath $Path -PathType Leaf) { [System.IO.File]::Replace($tempFile, $Path, $null) }
@@ -869,6 +950,15 @@ function Submit-SingleRequest {
             $errorMsg = if ($errorMsg) { "$errorMsg $note" } else { $note }
             Write-BatchLog "  $note" -Level Warning
         }
+        elseif ($proc.ExitCode -eq 0) {
+            # certreq reported SUCCESS, yet neither a RequestID nor a certificate can be read from
+            # what it left behind (localized output?). The CA may well hold this request, so the
+            # row must not be resubmitted automatically: 'Unknown' without a RequestID counts as
+            # submitted (a later Submit asks, or needs -Force) and is listed for reconciliation.
+            $disposition = 'Unknown'
+            $errorMsg = "certreq returned success but neither a RequestID nor a certificate file could be read (localized wording?). The CA may hold this request - check its database before resubmitting (-Force). Output: $($stdout -join ' ')"
+            Write-BatchLog "  $errorMsg" -Level Warning
+        }
         else {
             Write-BatchLog "  Could not parse RequestID from output" -Level Warning
             $disposition = 'Error'
@@ -891,6 +981,7 @@ function Submit-SingleRequest {
             OutputCertFile = $CerPath
             LastCheckTime  = (Get-Date -Format 'o')
             ErrorMessage   = $errorMsg
+            CAConfig       = $CAConfig
         }
     }
     finally {
@@ -1098,6 +1189,9 @@ try {   # the lock is released in the finally at the end of the run, on every ex
     # same rule Assert-CertificateOutputPath applies per destination (fail closed; the operator
     # can accept the risk explicitly with -AllowUnprotectedOutputFolder). Only the create-subfolder
     # right on its own is reported for awareness rather than refused.
+    # Rows that failed or need attention in THIS run. Automation gates on the exit code, so a run
+    # with any of them ends with a terminating error after the summary (Pending is not a failure).
+    $script:FailureCount = 0
     $script:AllowUnprotectedOutput = [bool]$AllowUnprotectedOutputFolder
     $script:TrustedSids = Get-TrustedPrincipalSet -Extra $TrustedOutputPrincipal
     $retrieveRoots = @([System.IO.Path]::GetDirectoryName($TrackingFile), $OutputFolder)
@@ -1132,19 +1226,16 @@ try {   # the lock is released in the finally at the end of the run, on every ex
             $tracking = [System.Collections.ArrayList]@($existingData)
 
             # A file counts as submitted when its row carries a RequestID - or records an issuance
-            # without one (Issued / Undelivered with the RequestId line not parsed): resubmitting
-            # any of these duplicates the request at the CA.
-            $alreadySubmitted = @($tracking | Where-Object { $_.RequestID -or $_.Status -in 'Issued', 'Undelivered' } | Select-Object -ExpandProperty RequestFile)
+            # without one (Issued / Undelivered with the RequestId line not parsed), or a
+            # submission certreq reported as successful but whose reply could not be read
+            # (Unknown): resubmitting any of these can duplicate the request at the CA.
+            $alreadySubmitted = @($tracking | Where-Object { $_.RequestID -or $_.Status -in 'Issued', 'Undelivered', 'Unknown' } | Select-Object -ExpandProperty RequestFile)
             $runResults = [System.Collections.ArrayList]@()
 
-            # Files sharing a base name (a.req + a.csr) would collide on a.cer;
-            # those keep the full file name in their .cer name instead
-            $duplicateBaseNames = @(
-                $requestFiles |
-                    Group-Object { [System.IO.Path]::GetFileNameWithoutExtension($_.Name) } |
-                    Where-Object { $_.Count -gt 1 } |
-                    Select-Object -ExpandProperty Name
-            )
+            # One unique .cer name per request file - unique within this batch and against the
+            # destinations already recorded for OTHER files (see Resolve-CertificateOutputNames) -
+            # decided up front, so a collision aborts before anything is submitted.
+            $cerNames = Resolve-CertificateOutputNames -RequestPaths @($requestFiles | ForEach-Object { $_.FullName }) -ExistingRows $tracking
 
             Write-BatchLog "Found $($requestFiles.Count) request file(s) in $InputPath"
 
@@ -1159,7 +1250,7 @@ try {   # the lock is released in the finally at the end of the run, on every ex
                 }
 
                 if ($file.FullName -in $alreadySubmitted) {
-                    $existing = @($tracking | Where-Object { $_.RequestFile -eq $file.FullName -and ($_.RequestID -or $_.Status -in 'Issued', 'Undelivered') }) |
+                    $existing = @($tracking | Where-Object { $_.RequestFile -eq $file.FullName -and ($_.RequestID -or $_.Status -in 'Issued', 'Undelivered', 'Unknown') }) |
                                 Select-Object -Last 1
                     $prevId = $existing.RequestID
                     $prevStatus = $existing.Status
@@ -1187,9 +1278,7 @@ try {   # the lock is released in the finally at the end of the run, on every ex
                     }
                 }
 
-                $baseName = [System.IO.Path]::GetFileNameWithoutExtension($file.Name)
-                $cerName = if ($baseName -in $duplicateBaseNames) { "$($file.Name).cer" } else { "$baseName.cer" }
-                $cerPath = Join-Path $OutputFolder $cerName
+                $cerPath = Join-Path $OutputFolder $cerNames[$file.FullName]
 
                 try {
                     $result = Submit-SingleRequest -RequestFile $file `
@@ -1209,10 +1298,12 @@ try {   # the lock is released in the finally at the end of the run, on every ex
                         OutputCertFile = ''
                         LastCheckTime  = (Get-Date -Format 'o')
                         ErrorMessage   = $_.ToString()
+                        CAConfig       = $CAConfig
                     }
                 }
 
                 [void]$tracking.Add($result)
+                if ($result.Status -in 'Error', 'Denied', 'Undelivered', 'Unknown') { $script:FailureCount++ }
                 [void]$runResults.Add($result)
 
                 # Persist after every file so request IDs survive a mid-batch crash
@@ -1238,8 +1329,9 @@ try {   # the lock is released in the finally at the end of the run, on every ex
             # Issued-but-undelivered rows WITHOUT a RequestID cannot be fetched again; they are
             # never resubmitted either, so they need the operator: the certificate itself is still
             # in its staging file (path in ErrorMessage) and the ID can be found in the CA database.
-            foreach ($orphan in @($tracking | Where-Object { -not $_.RequestID -and $_.Status -eq 'Undelivered' })) {
-                Write-BatchLog "Needs manual reconciliation: '$($orphan.RequestFile)' was issued but never delivered and has no RequestID. $($orphan.ErrorMessage)" -Level Warning
+            foreach ($orphan in @($tracking | Where-Object { -not $_.RequestID -and $_.Status -in 'Undelivered', 'Unknown' })) {
+                Write-BatchLog "Needs manual reconciliation: '$($orphan.RequestFile)' has no RequestID (Status $($orphan.Status)) and cannot be fetched - the CA may hold it. $($orphan.ErrorMessage)" -Level Warning
+                $script:FailureCount++
             }
 
             $runResults = [System.Collections.ArrayList]@()
@@ -1258,7 +1350,24 @@ try {   # the lock is released in the finally at the end of the run, on every ex
                 # refused for this row rather than passed on. The row is left as it is and skipped.
                 if ("$($record.RequestID)" -notmatch '^\d+$') {
                     Write-BatchLog "Skipping row for '$($record.RequestFile)': RequestID '$($record.RequestID)' is not numeric (edited tracking file?)." -Level Error
+                    $script:FailureCount++
                     continue
+                }
+
+                # RequestIDs are per CA. A row submitted to CA-A must not be retrieved from CA-B
+                # (a CA migration, a wrong -CAConfig): CA-B's request with the same number is an
+                # unrelated certificate that would be delivered under this row's name as Issued.
+                # Set-StrictMode: a row from an older tracking file has no CAConfig PROPERTY, and
+                # reading it would throw before the legacy-row branch below is reached.
+                $rowCa = if ($record.PSObject.Properties['CAConfig']) { "$($record.CAConfig)".Trim() } else { '' }
+                if ($rowCa -and -not $rowCa.Equals($CAConfig.Trim(), [System.StringComparison]::OrdinalIgnoreCase)) {
+                    Write-BatchLog "Skipping RequestID $($record.RequestID): the row was submitted to CA '$rowCa', but this run targets '$CAConfig'. Retrieve it with -CAConfig '$rowCa'." -Level Error
+                    $script:FailureCount++
+                    continue
+                }
+                if (-not $rowCa) {
+                    Write-BatchLog "RequestID $($record.RequestID): the row records no CA (tracking file written by an older version); assuming '$CAConfig' and recording it." -Level Warning
+                    $record | Add-Member -NotePropertyName CAConfig -NotePropertyValue $CAConfig -Force
                 }
 
                 if ($redirectOutput) {
@@ -1273,6 +1382,7 @@ try {   # the lock is released in the finally at the end of the run, on every ex
 
                 if (-not $record.OutputCertFile) {
                     Write-BatchLog "Skipping RequestID $($record.RequestID): the row has no OutputCertFile (pass -OutputFolder to redirect it)." -Level Error
+                    $script:FailureCount++
                     continue
                 }
                 try {
@@ -1280,6 +1390,7 @@ try {   # the lock is released in the finally at the end of the run, on every ex
                 }
                 catch {
                     Write-BatchLog "Skipping RequestID $($record.RequestID): $_" -Level Error
+                    $script:FailureCount++
                     continue
                 }
 
@@ -1294,6 +1405,7 @@ try {   # the lock is released in the finally at the end of the run, on every ex
                         $record.Status = 'Error'
                     }
                     [void]$runResults.Add($record)
+                    if ($record.Status -in 'Error', 'Denied', 'Undelivered', 'Unknown') { $script:FailureCount++ }
 
                     # Persist after every record so status updates survive a mid-batch crash
                     Export-TrackingData -Data $tracking -Path $TrackingFile
@@ -1309,6 +1421,13 @@ try {   # the lock is released in the finally at the end of the run, on every ex
     }
     else {
         Write-BatchLog "Done. Log file: $script:LogFile"
+    }
+
+    if ($script:FailureCount -gt 0) {
+        # After the summary and the final checkpoint, so nothing is lost - but a terminating error
+        # all the same: a scheduled run in which the CA rejected every CSR, or Retrieve skipped every
+        # row, previously reached "Done" with exit code 0 and was reported as a success.
+        throw "$($script:FailureCount) request(s) failed or need attention in this run - see the log and the tracking file. (Non-zero exit so automation does not treat a partial batch as success; Pending requests are not failures.)"
     }
 
 }

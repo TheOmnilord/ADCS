@@ -41,10 +41,15 @@ jobs:
       # for Sync-ADCSTemplate; GroupPolicy for Add-CertificateEnrollmentPolicyServerToGpo). Their
       # validation throws fire BEFORE any DC/GPO is contacted, so the modules are required but no
       # domain/DC is - the RSAT/GPMC features on the Server-based runner supply both. (GPMC brings
-      # the GroupPolicy module; without it the GPO Guard tier self-skips rather than failing.)
+      # the GroupPolicy module.) A Guard context whose module is missing SKIPS itself, so the
+      # feature result is checked here, both modules are imported in each engine before the run,
+      # and any skipped test fails the leg - missing coverage must never pass quietly.
       - name: Install RSAT ActiveDirectory module and GPMC (GroupPolicy module)
         shell: pwsh
-        run: Install-WindowsFeature RSAT-AD-PowerShell, GPMC | Out-Null
+        run: |
+          $r = Install-WindowsFeature RSAT-AD-PowerShell, GPMC
+          $r | Format-Table -AutoSize | Out-String | Write-Host
+          if (-not $r.Success) { throw "Feature installation did not succeed - the Guard tiers would self-skip." }
 
       # The two engines keep separate CurrentUser module paths, so Pester is installed per
       # engine, at an EXACT version (a floating minimum would let a new gallery release change
@@ -61,8 +66,13 @@ jobs:
           Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Scope CurrentUser | Out-Null
           Install-Module Pester -RequiredVersion 6.1.0 -Force -SkipPublisherCheck -Scope CurrentUser
           Import-Module Pester -RequiredVersion 6.1.0
+          # Both Guard-tier modules must be present in THIS engine; a Guard context self-skips otherwise.
+          Import-Module ActiveDirectory, GroupPolicy -ErrorAction Stop
           $result = Invoke-Pester -Path ./Tests -ExcludeTag Lab -Output Detailed -PassThru
           if ($result.FailedCount -gt 0) { throw "$($result.FailedCount) test(s) failed." }
+          # With Lab excluded by tag (NotRun, not Skipped), nothing in the Unit/Static/Guard tiers may
+          # skip: a skipped test here means a Guard context lost its module and covered nothing.
+          if ($result.SkippedCount -gt 0) { throw "$($result.SkippedCount) test(s) were skipped - required coverage is missing." }
           # FailedCount only counts failed It blocks. A discovery error, a container that fails
           # to load, or a BeforeAll/AfterAll throw fails the RUN without any failed test, so the
           # overall result is checked as well - the step must not go green on those.
@@ -77,8 +87,13 @@ jobs:
         run: |
           Install-Module Pester -RequiredVersion 6.1.0 -Force -SkipPublisherCheck -Scope CurrentUser
           Import-Module Pester -RequiredVersion 6.1.0
+          # Both Guard-tier modules must be present in THIS engine; a Guard context self-skips otherwise.
+          Import-Module ActiveDirectory, GroupPolicy -ErrorAction Stop
           $result = Invoke-Pester -Path ./Tests -ExcludeTag Lab -Output Detailed -PassThru
           if ($result.FailedCount -gt 0) { throw "$($result.FailedCount) test(s) failed." }
+          # With Lab excluded by tag (NotRun, not Skipped), nothing in the Unit/Static/Guard tiers may
+          # skip: a skipped test here means a Guard context lost its module and covered nothing.
+          if ($result.SkippedCount -gt 0) { throw "$($result.SkippedCount) test(s) were skipped - required coverage is missing." }
           # FailedCount only counts failed It blocks. A discovery error, a container that fails
           # to load, or a BeforeAll/AfterAll throw fails the RUN without any failed test, so the
           # overall result is checked as well - the step must not go green on those.

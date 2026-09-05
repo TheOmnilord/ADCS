@@ -54,7 +54,7 @@ Describe 'Set-ADCSTemplateValidity' {
         # (The script's begin block connects to AD, so it cannot be dot-sourced wholesale;
         # extracting the function bodies runs them with no side effects.)
         $ast = [System.Management.Automation.Language.Parser]::ParseFile($script:Val, [ref]$null, [ref]$null)
-        foreach ($name in 'ConvertTo-PKIPeriodDays', 'ConvertTo-PKIPeriodBytes', 'ConvertFrom-PKIPeriodBytes', 'ConvertTo-LdapFilterValue') {
+        foreach ($name in 'ConvertTo-PKIPeriodDays', 'ConvertTo-PKIPeriodBytes', 'ConvertFrom-PKIPeriodBytes', 'ConvertFrom-PKIPeriodBytesToDays', 'ConvertTo-LdapFilterValue') {
             $def = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name }, $false)
             if ($def) { . ([scriptblock]::Create($def[0].Extent.Text)) }
         }
@@ -102,6 +102,16 @@ Describe 'Set-ADCSTemplateValidity' {
         It 'decoder returns N/A for null or non-8-byte input' {
             ConvertFrom-PKIPeriodBytes -Bytes $null | Should -BeExactly 'N/A'
             ConvertFrom-PKIPeriodBytes -Bytes ([byte[]](1, 2, 3)) | Should -BeExactly 'N/A'
+        }
+
+        It 'ConvertFrom-PKIPeriodBytesToDays returns exact days for comparisons (6 weeks = 42, 1 year = 365, 12 hours = 0.5) and $null for bad input' {
+            ConvertFrom-PKIPeriodBytesToDays -Bytes (ConvertTo-PKIPeriodBytes -Period 6 -PeriodUnit Weeks)  | Should -Be 42
+            ConvertFrom-PKIPeriodBytesToDays -Bytes (ConvertTo-PKIPeriodBytes -Period 1 -PeriodUnit Years)  | Should -Be 365
+            ConvertFrom-PKIPeriodBytesToDays -Bytes (ConvertTo-PKIPeriodBytes -Period 12 -PeriodUnit Hours) | Should -Be 0.5
+            ConvertFrom-PKIPeriodBytesToDays -Bytes $null | Should -BeNullOrEmpty
+            ConvertFrom-PKIPeriodBytesToDays -Bytes ([byte[]](1, 2, 3)) | Should -BeNullOrEmpty
+            # the case the script now refuses: a stock 6-week overlap under a 30-day validity
+            (ConvertFrom-PKIPeriodBytesToDays -Bytes (ConvertTo-PKIPeriodBytes -Period 6 -PeriodUnit Weeks)) -ge (ConvertTo-PKIPeriodDays -Period 30 -PeriodUnit Days) | Should -BeTrue
         }
 
         It 'LDAP escaper protects metacharacters but PRESERVES the * wildcard' {

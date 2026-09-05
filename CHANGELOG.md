@@ -8,6 +8,38 @@ Each script also carries its own version in the `PSScriptInfo` header at the top
 Test-ScriptFileInfo .\Submit-CertificateRequests.ps1 | Select-Object Name, Version
 ```
 
+## [1.0.4] — 2026-09-06
+
+Findings of a full-repository adversarial review (Codex, gpt-6-astra, high effort) after v1.0.3, each verified against the code before fixing.
+
+### Fixed
+- **Submit-CertificateRequests.ps1 → 1.0.4**
+  - Certificate file names are allocated **before** anything is submitted and must be unique within the batch and against the destinations the tracking file already records for *other* request files. The old rule (files sharing a base name keep their full name) still mapped two requests onto one `.cer`: `prod.req.txt` has the base name `prod.req`, exactly what `prod.req` fell back to, so the later request's certificate replaced the earlier one's while both rows said `Issued`. A base name already recorded for a different request file is not reused either; an unresolvable clash aborts the run.
+  - The tracking file is read with `-LiteralPath`. Its name is canonicalized and locked literally, but the read used a wildcard-aware `Test-Path`, so `tracking[1].csv` was reported absent, its history came back empty, every request was resubmitted and the original file was replaced.
+  - Every row now records the CA it was submitted to (`CAConfig` column), and `-Mode Retrieve` refuses rows submitted to a different CA: RequestIDs are per CA, so during a migration CA-B's request 42 would have been delivered under CA-A's row as `Issued`. Rows from older files record no CA; they are assumed to belong to the run's `-CAConfig` and stamped. `Export-Csv` derives its columns from the first object, so a mixed old/new list led by an old row would have dropped the column silently; every row is now projected onto the full schema.
+  - A submission that certreq reports as *successful* but whose reply yields neither a RequestID nor a certificate (localized output) is recorded as `Unknown` and counts as submitted: it is never resubmitted automatically (a later Submit asks, or needs `-Force`) and Retrieve lists it for reconciliation. Previously it became an `Error` row with no RequestID, which the next run resubmitted as a duplicate request.
+  - A run in which any request failed or needs attention (`Error`, `Denied`, `Undelivered`, `Unknown`, or a Retrieve row skipped as invalid) now ends with a terminating error after the summary and the final checkpoint, in Submit and Retrieve alike. A nonexistent or non-folder `-InputPath` is a terminating error instead of an empty batch (an existing empty folder still is one). Previously a scheduled run in which the CA rejected every CSR, or Retrieve skipped every row, reached "Done" with exit code 0. `Pending` is not a failure.
+  - Log messages fold CR/LF and other control characters, so a tracking-file field containing a line break can no longer forge additional, attacker-chosen log records.
+- **Sync-ADCSTemplate.ps1 → 1.0.2**
+  - A `user@domain` value in `-EnrollPrincipals` resolves **only** as a UPN. `sAMAccountName` may legally contain `@`, and the lookup consulted it first, so an attacker with delegated account-creation rights could plant a principal whose sAMAccountName equals the victim's UPN and capture the grant. A different object carrying the string as its sAMAccountName is now refused as a planted or colliding account.
+  - `-UpgradeCompatibility` set `CT_FLAG_USE_LEGACY_PROVIDER` whenever `pKIDefaultCSPs` was populated, switching a schema-3 template that lists a KSP ("Microsoft Software Key Storage Provider") to legacy CryptoAPI key handling. The bit is now set only for a schema-2 source with a provider list (v2 knows only CSPs); a schema-3 source keeps its own bit.
+  - `-Mode Validate` ends with a terminating error when the throwaway template cannot be read back after a confirmed create (replication lag on a domain-name `-Server`). Previously a warning, and the run returned normally with exit 0 and nothing validated. The throwaway object is still removed by the cleanup.
+- **Add-CertificateEnrollmentPolicyServerToGpo.ps1 → 1.0.2**
+  - A `**`-prefixed registry.pol instruction (`**DeleteKeys`, `**DeleteValues`, `**del.`, `**delvals.`) decodes its data as a string whatever the record's type field says, as the Group Policy engine does; `**soft.<name>` keeps its declared type, since it writes a value. A `**DeleteKeys` typed e.g. REG_BINARY previously decoded to no data, deleted nothing in the model and let a deleted AD row satisfy the prerequisite while clients delete the key.
+  - A pre-existing AD-policy row or CEP entry counts as complete only with URL, PolicyID, FriendlyName and numeric Flags/AuthFlags/Cost present. URL + PolicyID alone is what an interrupted write leaves behind (the values are written in that order), and it satisfied the prerequisite and the gate that lets the `(Default)` marker be set and `-ReplaceExisting` delete the working siblings.
+- **Add-CertificateEnrollmentPolicyServerOffline.ps1 → 1.0.2** — the same completeness rule against the live registry (DWORD kinds checked).
+- **Set-ADCSTemplateValidity.ps1 → 1.0.2** — when the overlap is not being set, a template whose *existing* renewal overlap is not shorter than the new validity is reported as an error (counted in the exit code) and left unchanged. Previously a 30-day validity was written beneath a stock 6-week overlap; the begin-block check only covered an explicitly supplied overlap.
+- CI: the RSAT/GPMC feature result is checked, both Guard-tier modules are imported in each engine before Pester runs, and any skipped test fails the leg. A Guard context whose module is missing self-skips, and the run result stayed `Passed`.
+- Tests: the Lab-tier ACL tests assert the **complete** DACL as a normalized ACE set — exactly one Allow ACE per expected (principal, right, object GUID), no other principal, no inherited or deny entry, and no bit beyond the expected right on any ACE (a generic right expanded by the DS into its specific bits is tolerated; WriteProperty, WriteDacl, an unexpected extended right or Full Control is not) — instead of merely that the expected entries exist. Unit tests added for every fix above: output-name allocation, literal tracking path, mixed-schema export, log folding, KSP/legacy-provider upgrade, REG_BINARY `**DeleteKeys`, row completeness, and the exact-days period decoder.
+
+| Script | Version |
+|---|---|
+| Set-ADCSTemplateValidity.ps1 | **1.0.2** |
+| Submit-CertificateRequests.ps1 | **1.0.4** |
+| Sync-ADCSTemplate.ps1 | **1.0.2** |
+| Add-CertificateEnrollmentPolicyServerOffline.ps1 | **1.0.2** |
+| Add-CertificateEnrollmentPolicyServerToGpo.ps1 | **1.0.2** |
+
 ## [1.0.3] — 2026-09-05
 
 ### Fixed
@@ -97,6 +129,7 @@ Initial release.
 | Add-CertificateEnrollmentPolicyServerOffline.ps1 | 1.0.0 |
 | Add-CertificateEnrollmentPolicyServerToGpo.ps1 | 1.0.0 |
 
+[1.0.4]: https://github.com/TheOmnilord/ADCS/compare/v1.0.3...v1.0.4
 [1.0.3]: https://github.com/TheOmnilord/ADCS/compare/v1.0.2...v1.0.3
 [1.0.2]: https://github.com/TheOmnilord/ADCS/compare/v1.0.1...v1.0.2
 [1.0.1]: https://github.com/TheOmnilord/ADCS/compare/v1.0.0...v1.0.1

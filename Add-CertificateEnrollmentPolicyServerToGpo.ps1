@@ -1,11 +1,12 @@
 <#PSScriptInfo
-.VERSION 1.0.1
+.VERSION 1.0.2
 .GUID 54763db6-2359-401f-8960-ef0de5911aaf
 .AUTHOR Sveinung Svea
 .PROJECTURI https://github.com/TheOmnilord/ADCS
 .LICENSEURI https://github.com/TheOmnilord/ADCS/blob/main/LICENSE
 .TAGS ADCS PKI CertificateServices
 .RELEASENOTES
+1.0.2 - A **-prefixed registry.pol instruction (**DeleteKeys, **DeleteValues, **del., **delvals.) decodes its data as a string whatever its type field says (**soft.<name> keeps its declared type, since it writes a value), as the Group Policy engine does (a **DeleteKeys typed REG_BINARY previously decoded to no data and deleted nothing in the model, so a deleted entry could be reported as present); a pre-existing AD-policy row or CEP entry counts as complete only with URL, PolicyID, FriendlyName and numeric Flags/AuthFlags/Cost present (URL + PolicyID alone is what an interrupted write leaves), for the prerequisite, the (Default) marker and -ReplaceExisting alike
 1.0.1 - The domain objectGUID for the AD Enrollment Policy row is resolved BEFORE any GPO write and a lookup failure now aborts the run (previously the CEP entry was written first and the failure became a warning, leaving a GPO that removes the AD enrollment policy from every client in scope); a GUID-shaped -GpoName falls back to the GPO ID only after an independent listing proves no GPO carries that display name (any other name-lookup failure is rethrown); registry.pol reads validate the PReg header, refuse oversized files and trailing junk, and return the EFFECTIVE value (records replayed in file order: last write wins, **del./**delvals./**DeleteValues honoured) instead of the first matching record; the deletion-order damage check is judged per value, so a deletion between an obsolete record and its replacement no longer raises a false DAMAGED warning
 1.0.0 - Initial release
 #>
@@ -359,10 +360,23 @@ function Read-PolRecords {
         $data = New-Object byte[] $size
         if ($size -gt 0) { [Array]::Copy($b, $pos, $data, 0, $size) }
         $pos += $size + 2   # data + ']'
-        $val = switch ($type) {
-            1 { [System.Text.Encoding]::Unicode.GetString($data).TrimEnd([char]0) }
-            4 { if ($size -ge 4) { [BitConverter]::ToUInt32($data, 0) } else { $null } }
-            default { $null }
+        $val = if ($valName.StartsWith('**') -and $valName -notmatch '^(?i)\*\*soft\.') {
+            # A **-prefixed value name is a Group Policy INSTRUCTION (**del., **delvals., **DeleteKeys,
+            # **DeleteValues, ...), not a registry value: the engine reads its data as a string
+            # whatever the record's type field says, so it is decoded as one here as well. Judging
+            # it by type like an ordinary value would turn a **DeleteKeys typed e.g. REG_BINARY into
+            # an instruction with NO data - deleting nothing in this model while clients delete the
+            # named keys, so a deleted entry would be reported as present. The one exception is
+            # **soft.<name>: it WRITES <name> with the record's declared type (a DWORD Cost stays a
+            # number), so it is decoded like the ordinary value it becomes.
+            [System.Text.Encoding]::Unicode.GetString($data).TrimEnd([char]0)
+        }
+        else {
+            switch ($type) {
+                1 { [System.Text.Encoding]::Unicode.GetString($data).TrimEnd([char]0) }
+                4 { if ($size -ge 4) { [BitConverter]::ToUInt32($data, 0) } else { $null } }
+                default { $null }
+            }
         }
         $recs.Add([pscustomobject]@{ Key = $keyName; ValueName = $valName; Type = $type; Data = $val; Index = $recs.Count })
     }
@@ -437,6 +451,27 @@ function Get-PolEntries([object[]]$Recs) {
         if (-not $eff.Count) { continue }
         [pscustomobject]@{ Key = $leaf; URL = $eff['URL']; PolicyID = $eff['PolicyID'] }
     }
+}
+function Test-PolEntryUsable([hashtable]$Values, [string]$ExpectUrl, [string]$ExpectPolicyId) {
+    # A policy-server row a client can actually USE: URL and PolicyID as expected, plus the
+    # operational values every complete row carries - FriendlyName (string) and Flags, AuthFlags,
+    # Cost (numeric). URL + PolicyID alone are exactly what an interrupted earlier write leaves
+    # behind (the values are written in that order), and such a row must satisfy neither the
+    # AD-row prerequisite nor the "an entry for this URL exists" gate that lets the (Default)
+    # marker be set and -ReplaceExisting delete the working siblings.
+    if (-not $Values) { return $false }
+    if ("$($Values['URL'])" -ne $ExpectUrl -or "$($Values['PolicyID'])" -ne "$ExpectPolicyId") { return $false }
+    if (-not $Values.ContainsKey('FriendlyName') -or $null -eq $Values['FriendlyName']) { return $false }
+    foreach ($n in 'Flags', 'AuthFlags', 'Cost') {
+        # registry.pol yields UInt32; Get-GPRegistryValue yields a signed Int32 (Cost 0xFFFFFFFF
+        # reads as -1). Both are the DWORD the client needs; a REG_SZ - even one that spells a
+        # number, such as '20' - or a REG_QWORD (Int64 from GPMC) is a different registry type
+        # and not usable.
+        if (-not $Values.ContainsKey($n) -or $null -eq $Values[$n]) { return $false }
+        $v = $Values[$n]
+        if (-not ($v -is [int] -or $v -is [uint32])) { return $false }
+    }
+    return $true
 }
 function Test-EntryRecordsPresent([object[]]$Recs, [string]$RelKey) {
     # PHYSICAL presence: does registry.pol carry ANY record at this key (values or deletion
@@ -602,8 +637,7 @@ if (-not $SkipADPolicy) {
 # "Already present" means a COMPLETE, correct row: URL 'LDAP:' AND the PolicyID this domain
 # actually has. A half-written row (an interrupted earlier run) or one carrying another domain's
 # GUID would not restore the AD enrollment policy on clients and must not satisfy the prerequisite.
-$adRowPresent = $null -ne $adPid -and @(Get-PolEntries $preRecs | Where-Object {
-        $_.Key -eq $AD_KEY -and "$($_.URL)" -eq 'LDAP:' -and "$($_.PolicyID)" -eq "$adPid" }).Count -gt 0
+$adRowPresent = $null -ne $adPid -and (Test-PolEntryUsable (Get-PolEffectiveValues $preRecs "$relBase\$AD_KEY").Values 'LDAP:' "$adPid")
 if ($SkipADPolicy) { $adRow = 'skipped (-SkipADPolicy)' }
 else {
     $adTarget = "$baseKey\$AD_KEY"
@@ -687,7 +721,7 @@ if ($PSCmdlet.ShouldProcess($gpoLabel, $action)) {
 # requested (an interrupted earlier write can leave a key with a PolicyID but no URL, which no
 # client can use). Re-evaluated from a fresh registry.pol read right before the sibling cleanup.
 function Test-EntryComplete([object[]]$Recs) {
-    @(Get-PolEntries $Recs | Where-Object { $_.Key -eq $hash -and "$($_.URL)" -eq $Url -and "$($_.PolicyID)" -eq "$PolicyId" }).Count -gt 0
+    Test-PolEntryUsable (Get-PolEffectiveValues $Recs "$relBase\$hash").Values $Url "$PolicyId"
 }
 function Test-SiblingStillSuperseded([string]$LeafKey) {
     # Live (GPMC API) check that a candidate for -ReplaceExisting removal is still what made it a
@@ -705,7 +739,7 @@ function Test-EntryCompleteLive {
     try {
         $vals = Get-GPRegistryValue @wr -Key $entryKey -ErrorAction Stop
         $map = @{}; foreach ($v in $vals) { $map[$v.ValueName] = $v.Value }
-        return ("$($map['URL'])" -eq $Url) -and ("$($map['PolicyID'])" -eq "$PolicyId")
+        return (Test-PolEntryUsable $map $Url "$PolicyId")
     } catch { return $false }
 }
 $entryExists = $entryApplied -or $WhatIfPreference -or (Test-EntryComplete $preRecs)

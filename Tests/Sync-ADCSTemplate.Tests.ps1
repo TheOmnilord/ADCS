@@ -75,6 +75,50 @@ Describe 'Sync-ADCSTemplate' {
         # Get-AttrCanonical references $script:ByteAttributes - mirror the script's definition.
         $script:ByteAttributes = @('pKIExpirationPeriod', 'pKIKeyUsage', 'pKIOverlapPeriod')
 
+        # Asserts that a DACL is EXACTLY the expected grants: one Allow ACE per expected
+        # (SID, right, object GUID), nothing inherited, no deny, no ACE for any other principal, and
+        # no ACE carrying bits beyond its expected right - the DS may expand a generic right into
+        # its specific bits (GenericRead -> ReadProperty|ListChildren|ListObject|ReadControl, and
+        # GenericWrite -> WriteProperty|Self|ReadControl), which is tolerated; WriteDacl, WriteOwner,
+        # Delete, CreateChild, an unexpected ExtendedRight or anything else is not.
+        function script:Assert-ExactDacl {
+            param([object[]]$Rules, [object[]]$Expected)   # Expected: @{ Sid; Right ('read'|'write'|'enroll'|'autoenroll'|'fullcontrol') }
+            $enrollGuid     = [Guid]'0e10c968-78fb-11d2-90d4-00c04f79dc55'
+            $autoenrollGuid = [Guid]'a05b8cc2-17bc-4802-a710-e7c15ab866a2'
+            $spec = @{
+                read       = @{ Bits = [int][System.DirectoryServices.ActiveDirectoryRights]::GenericRead;    Allow = 0x80000000 -bor 0x20094; Guid = [Guid]::Empty }
+                write      = @{ Bits = [int][System.DirectoryServices.ActiveDirectoryRights]::GenericWrite;   Allow = 0x40000000 -bor 0x20028; Guid = [Guid]::Empty }
+                enroll     = @{ Bits = [int][System.DirectoryServices.ActiveDirectoryRights]::ExtendedRight;  Allow = 0x100;                  Guid = $enrollGuid }
+                autoenroll = @{ Bits = [int][System.DirectoryServices.ActiveDirectoryRights]::ExtendedRight;  Allow = 0x100;                  Guid = $autoenrollGuid }
+            }
+            $rules = @($Rules)
+            @($rules | Where-Object { $_.IsInherited }).Count | Should -Be 0 -Because 'the DACL is protected; nothing may be inherited'
+            @($rules | Where-Object { $_.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow }).Count | Should -Be 0
+            $expectedSids = @($Expected | ForEach-Object { $_.Sid } | Sort-Object -Unique)
+            @($rules | ForEach-Object { $_.IdentityReference.Value } | Sort-Object -Unique) | Should -Be $expectedSids -Because 'no principal beyond the expected ones may hold anything'
+            # The DS coalesces same-typed grants for one principal into ONE ACE (Domain Admins'
+            # read + write become a single GenericRead|GenericWrite entry), so the unit of
+            # comparison is (principal, object GUID): one ACE each, carrying exactly the union of
+            # the expected rights and nothing beyond their tolerated expansion.
+            $groups = @{}
+            foreach ($e in $Expected) {
+                $s = $spec[$e.Right]; $k = "$($e.Sid)|$($s.Guid)"
+                if (-not $groups.ContainsKey($k)) { $groups[$k] = @{ Sid = $e.Sid; Guid = $s.Guid; Bits = [int64]0; Allow = [int64]0; Rights = @() } }
+                $groups[$k].Bits   = $groups[$k].Bits  -bor (([int64]$s.Bits) -band 0xFFFFFFFF)
+                $groups[$k].Allow  = $groups[$k].Allow -bor ([int64]$s.Allow)
+                $groups[$k].Rights += $e.Right
+            }
+            $rules.Count | Should -Be $groups.Count -Because 'exactly one ACE per (principal, object type)'
+            foreach ($g in $groups.Values) {
+                $match = @($rules | Where-Object { $_.IdentityReference.Value -eq $g.Sid -and $_.ObjectType -eq $g.Guid })
+                $match.Count | Should -Be 1 -Because "exactly one ACE for $($g.Sid) / $($g.Guid)"
+                $bits = ([int64][int]$match[0].ActiveDirectoryRights) -band 0xFFFFFFFF
+                ($bits -band $g.Bits) | Should -Be $g.Bits -Because "the ACE for $($g.Sid) must carry $($g.Rights -join '+')"
+                $extra = $bits -band (-bnot $g.Allow)
+                $extra | Should -Be 0 -Because "the ACE for $($g.Sid) must carry no right beyond $($g.Rights -join '+') (extra bits 0x$('{0:X}' -f $extra))"
+            }
+        }
+
     }
 
     Context 'Unit: pure helpers' -Tag 'Unit' {
@@ -170,6 +214,22 @@ Describe 'Sync-ADCSTemplate' {
             $r.Upgraded | Should -BeTrue
             $r.LegacyProvider | Should -BeFalse
             [BitConverter]::ToUInt32([BitConverter]::GetBytes([int]$a['msPKI-Private-Key-Flag']), 0) | Should -Be ([uint32]0x06060000)
+        }
+
+        It 'Convert-ToLatestCompatibility: a schema-3 source with a KSP provider list keeps CNG semantics (no 0x100); its own legacy bit is preserved either way' {
+            # A v3 template legitimately lists KSPs in pKIDefaultCSPs ("1,Microsoft Software Key
+            # Storage Provider"). A populated list is NOT evidence of a CSP template - only schema-2
+            # (2003) sources are CSP-only. The source's own CT_FLAG_USE_LEGACY_PROVIDER bit decides.
+            $ksp = @{ 'msPKI-Template-Schema-Version' = [int]3; 'msPKI-Private-Key-Flag' = [int]0
+                      'pKIDefaultCSPs' = @('1,Microsoft Software Key Storage Provider') }
+            $r = Convert-ToLatestCompatibility -Attributes $ksp
+            $r.LegacyProvider | Should -BeFalse -Because 'setting 0x100 would switch the v4 copy to legacy CryptoAPI key handling'
+            [BitConverter]::ToUInt32([BitConverter]::GetBytes([int]$ksp['msPKI-Private-Key-Flag']), 0) | Should -Be ([uint32]0x06060000)
+            $v3csp = @{ 'msPKI-Template-Schema-Version' = [int]3; 'msPKI-Private-Key-Flag' = [int]0x100
+                        'pKIDefaultCSPs' = @('1,Microsoft RSA SChannel Cryptographic Provider') }
+            $r = Convert-ToLatestCompatibility -Attributes $v3csp
+            $r.LegacyProvider | Should -BeTrue -Because 'the source itself carries the legacy-provider bit'
+            [BitConverter]::ToUInt32([BitConverter]::GetBytes([int]$v3csp['msPKI-Private-Key-Flag']), 0) | Should -Be ([uint32]0x06060100)
         }
 
         It 'Convert-ToLatestCompatibility: REPLACES an existing compatibility level, never OR-accumulates the version nibbles' {
@@ -471,6 +531,21 @@ Describe 'Sync-ADCSTemplate' {
             $r1 = script:Invoke-LabCreate -SyncParams @{ Mode = 'Import'; Path = $script:ExportFile; Server = $AronsServer; NewTemplateName = $cn1; NewDisplayName = $cn1; OidHandling = 'GenerateRandom'; AclBase = 'Standard' }
             $t1 = script:Get-ADObjectRetry -AdParams $script:AP -Identity $r1.DN -Properties nTSecurityDescriptor
             $t1.nTSecurityDescriptor.AreAccessRulesProtected | Should -BeTrue
+            # The Standard set is the WHOLE DACL: exactly these six principals with exactly these
+            # rights, nothing inherited, nothing from the schema default, no extra bit anywhere (a
+            # stray Everyone:FullControl, or WriteProperty added to Authenticated Users, would pass
+            # a test that only looks for the expected entries).
+            $domSid  = (Get-ADDomain @script:AP).DomainSID.Value
+            $rootSid = (Get-ADDomain @script:AP -Identity (Get-ADForest @script:AP).RootDomain).DomainSID.Value
+            $rules1  = @($t1.nTSecurityDescriptor.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
+            script:Assert-ExactDacl -Rules $rules1 -Expected @(
+                @{ Sid = 'S-1-5-11';        Right = 'read' }
+                @{ Sid = "$rootSid-498";    Right = 'enroll' }, @{ Sid = "$rootSid-498"; Right = 'autoenroll' }
+                @{ Sid = "$domSid-512";     Right = 'read' },   @{ Sid = "$domSid-512";  Right = 'write' }, @{ Sid = "$domSid-512"; Right = 'enroll' }
+                @{ Sid = "$domSid-516";     Right = 'enroll' }, @{ Sid = "$domSid-516";  Right = 'autoenroll' }
+                @{ Sid = "$rootSid-519";    Right = 'read' },   @{ Sid = "$rootSid-519"; Right = 'write' }, @{ Sid = "$rootSid-519"; Right = 'enroll' }
+                @{ Sid = 'S-1-5-9';         Right = 'enroll' }, @{ Sid = 'S-1-5-9';      Right = 'autoenroll' }
+            )
 
             $cn2 = script:New-LabName
             $r2 = script:Invoke-LabCreate -SyncParams @{ Mode = 'Import'; Path = $script:ExportFile; Server = $AronsServer; NewTemplateName = $cn2; NewDisplayName = $cn2; OidHandling = 'GenerateRandom'; SkipAcl = $true }
@@ -483,10 +558,14 @@ Describe 'Sync-ADCSTemplate' {
             $r = script:Invoke-LabCreate -SyncParams @{ Mode = 'Import'; Path = $script:ExportFile; Server = $AronsServer; NewTemplateName = $cn; NewDisplayName = $cn; OidHandling = 'GenerateRandom'; AclBase = 'PrincipalsOnly'; EnrollPrincipals = @{ 'AuthenticatedUsers' = 'Read'; 'DomainControllers' = 'Enroll', 'Autoenroll' } }
             $t = script:Get-ADObjectRetry -AdParams $script:AP -Identity $r.DN -Properties nTSecurityDescriptor
             $rules = @($t.nTSecurityDescriptor.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
-            ($rules | Where-Object { $_.IdentityReference.Value -eq 'S-1-5-11' }) | Should -Not -BeNullOrEmpty
-            $enrollGuid = [Guid]'0e10c968-78fb-11d2-90d4-00c04f79dc55'
             $dcSid = (Get-ADDomain @script:AP).DomainSID.Value + '-516'
-            ($rules | Where-Object { $_.IdentityReference.Value -eq $dcSid -and $_.ObjectType -eq $enrollGuid }) | Should -Not -BeNullOrEmpty
+            # "exactly the requested grants": Authenticated Users read, Domain Controllers enroll +
+            # autoenroll - three ACEs, no other principal, no other bit, nothing inherited, no deny
+            $t.nTSecurityDescriptor.AreAccessRulesProtected | Should -BeTrue
+            script:Assert-ExactDacl -Rules $rules -Expected @(
+                @{ Sid = 'S-1-5-11'; Right = 'read' }
+                @{ Sid = $dcSid;     Right = 'enroll' }, @{ Sid = $dcSid; Right = 'autoenroll' }
+            )
         }
 
         It 'Import refuses a duplicate cn and a duplicate OID' {

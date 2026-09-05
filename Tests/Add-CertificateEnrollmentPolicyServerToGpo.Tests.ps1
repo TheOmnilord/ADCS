@@ -67,7 +67,7 @@ Describe 'Add-CertificateEnrollmentPolicyServerToGpo' {
         # (The script has mandatory params and '#Requires -Modules GroupPolicy', so it cannot be
         # dot-sourced wholesale; extracting the function bodies runs them with no side effects.)
         $ast = [System.Management.Automation.Language.Parser]::ParseFile($script:Gpo, [ref]$null, [ref]$null)
-        foreach ($name in 'Read-PolRecords', 'Get-PolEffectiveValues', 'Get-PolEntries', 'Get-PolValue', 'Test-EntryRecordsPresent') {
+        foreach ($name in 'Read-PolRecords', 'Get-PolEffectiveValues', 'Get-PolEntries', 'Get-PolValue', 'Test-EntryRecordsPresent', 'Test-PolEntryUsable') {
             $def = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name }, $false)
             if ($def) { . ([scriptblock]::Create($def[0].Extent.Text)) }
         }
@@ -118,6 +118,53 @@ Describe 'Add-CertificateEnrollmentPolicyServerToGpo' {
             $url.Data | Should -BeExactly 'https://pki.example.net/ejbca/msae/CEPService?alias'
             $flags = $recs | Where-Object { $_.Key -eq $script:entryKey -and $_.ValueName -eq 'Flags' }
             [uint32]$flags.Data | Should -Be 0x14
+        }
+
+        It 'Read-PolRecords decodes a **-instruction''s data as a string whatever its type field says (a REG_BINARY **DeleteKeys still deletes)' {
+            $p = Join-Path $TestDrive 'deletekeys-binary.pol'
+            $pol = [System.Collections.Generic.List[byte]]::new()
+            $pol.AddRange([System.IO.File]::ReadAllBytes($script:PolPath))
+            # the same UTF-16 key list, but typed 3 (REG_BINARY) instead of 1 (REG_SZ)
+            $pol.AddRange((New-PolRecord -Key '' -Value '**DeleteKeys' -Type 3 -Data (New-Sz $script:entryKey)))
+            [System.IO.File]::WriteAllBytes($p, $pol.ToArray())
+            $recs = @(Read-PolRecords -Path $p)
+            ($recs | Where-Object { $_.ValueName -eq '**DeleteKeys' }).Data | Should -Be $script:entryKey
+            (Get-PolValue $recs $script:entryKey 'URL') | Should -BeNullOrEmpty -Because 'clients delete the key regardless of the type field; a $null-decoded instruction would leave the entry looking present'
+            @(Get-PolEntries $recs).Count | Should -Be 0
+        }
+
+        It 'Read-PolRecords keeps the declared type of a **soft.<name> record (it writes a value; a DWORD Cost stays a number)' {
+            $p = Join-Path $TestDrive 'soft-dword.pol'
+            $pol = [System.Collections.Generic.List[byte]]::new()
+            $pol.AddRange([System.IO.File]::ReadAllBytes($script:PolPath))
+            $pol.AddRange((New-PolRecord -Key $script:entryKey -Value '**soft.Cost' -Type 4 -Data (New-Dword 5)))
+            [System.IO.File]::WriteAllBytes($p, $pol.ToArray())
+            $recs = @(Read-PolRecords -Path $p)
+            [uint32](Get-PolValue $recs $script:entryKey 'Cost') | Should -Be 5 -Because 'string-decoding a DWORD 5 would yield the control character U+0005'
+        }
+
+        It 'Test-PolEntryUsable requires the operational values, not just URL + PolicyID (an interrupted write leaves only those two)' {
+            $url = 'https://pki.example.net/ejbca/msae/CEPService?alias'
+            $full = @{ URL = $url; PolicyID = '241064013'; FriendlyName = 'Example'; Flags = [uint32]0x14; AuthFlags = [uint32]2; Cost = [uint32]0x7FFFFFFD }
+            Test-PolEntryUsable $full $url '241064013' | Should -BeTrue
+            Test-PolEntryUsable @{ URL = $url; PolicyID = '241064013' } $url '241064013' | Should -BeFalse -Because 'URL and PolicyID are written first; a run interrupted after them leaves a row no client can use'
+            foreach ($missing in 'FriendlyName', 'Flags', 'AuthFlags', 'Cost') {
+                $h = $full.Clone(); $h.Remove($missing)
+                Test-PolEntryUsable $h $url '241064013' | Should -BeFalse -Because "$missing is required"
+            }
+            $wrongType = $full.Clone(); $wrongType['AuthFlags'] = 'Kerberos'
+            Test-PolEntryUsable $wrongType $url '241064013' | Should -BeFalse
+            # a REG_SZ that merely spells a number is still the wrong registry type
+            $numericString = $full.Clone(); $numericString['Flags'] = '20'; $numericString['Cost'] = '5'
+            Test-PolEntryUsable $numericString $url '241064013' | Should -BeFalse -Because 'clients need a DWORD, not a string that looks like one'
+            # a REG_QWORD (Int64 as GPMC returns it) is not a DWORD either
+            $qword = $full.Clone(); $qword['AuthFlags'] = [long]2
+            Test-PolEntryUsable $qword $url '241064013' | Should -BeFalse -Because 'a QWORD AuthFlags is the wrong registry type'
+            # Get-GPRegistryValue returns a high-bit DWORD as a signed Int32: Cost 0xFFFFFFFF reads as -1
+            $signed = $full.Clone(); $signed['Cost'] = [int]-1
+            Test-PolEntryUsable $signed $url '241064013' | Should -BeTrue -Because 'a live read of Cost 0xFFFFFFFF is -1 and must still count as the DWORD it is'
+            Test-PolEntryUsable $full $url '999' | Should -BeFalse
+            Test-PolEntryUsable $null $url '241064013' | Should -BeFalse
         }
 
         It 'Read-PolRecords returns no records for a missing file' {

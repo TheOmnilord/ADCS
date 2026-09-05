@@ -1,11 +1,12 @@
 <#PSScriptInfo
-.VERSION 1.0.1
+.VERSION 1.0.2
 .GUID 61adf5d1-6eb5-4f41-8670-e9da72134570
 .AUTHOR Sveinung Svea
 .PROJECTURI https://github.com/TheOmnilord/ADCS
 .LICENSEURI https://github.com/TheOmnilord/ADCS/blob/main/LICENSE
 .TAGS ADCS PKI CertificateServices
 .RELEASENOTES
+1.0.2 - A pre-existing AD-policy row or CEP entry counts as complete only with URL, PolicyID, FriendlyName and DWORD Flags/AuthFlags/Cost present (URL + PolicyID alone is what an interrupted write leaves), for the prerequisite, the (Default) marker and -ReplaceExisting alike
 1.0.1 - For the GP locations the domain objectGUID for the AD Enrollment Policy row is resolved BEFORE the CEP entry is written; on a domain-joined machine a lookup failure now aborts the run with nothing written (previously the entry was written first and the failure became a warning, leaving a GP configuration that removes the AD enrollment policy); on a workgroup machine the row is still skipped with a warning
 1.0.0 - Initial release
 #>
@@ -380,10 +381,26 @@ if ($isGP -and -not $SkipADPolicy) {
 # "Already present" means a COMPLETE, correct row: URL 'LDAP:' AND this domain's PolicyID - not
 # merely the key (Write-CepEntry creates the key before its values, so an interrupted earlier run
 # can leave an empty one that would not restore the AD enrollment policy).
+function Test-RegEntryUsable {
+    # A policy-server row a client can USE (the GPO script's Test-PolEntryUsable, against a live
+    # key): URL and PolicyID as expected, FriendlyName present, and Flags / AuthFlags / Cost present
+    # as DWORDs. Write-CepEntry writes the strings first, so an interrupted run leaves URL +
+    # PolicyID and nothing else - not a row that may satisfy the AD-row prerequisite or the gate
+    # that lets the (Default) marker be set and -ReplaceExisting delete the working siblings.
+    param($Key, [string]$ExpectUrl, [string]$ExpectPolicyId)
+    if (-not $Key) { return $false }
+    if ("$($Key.GetValue('URL'))" -ne $ExpectUrl -or "$($Key.GetValue('PolicyID'))" -ne $ExpectPolicyId) { return $false }
+    $names = @($Key.GetValueNames())
+    if ($names -notcontains 'FriendlyName') { return $false }
+    foreach ($n in 'Flags', 'AuthFlags', 'Cost') {
+        if ($names -notcontains $n) { return $false }
+        if ($Key.GetValueKind($n) -ne [Microsoft.Win32.RegistryValueKind]::DWord) { return $false }
+    }
+    return $true
+}
 $adRowPresent = $false
 if ($isGP -and $adPid -and (Test-Path -LiteralPath "$hive\$AD_KEY")) {
-    $adKey = Get-Item -LiteralPath "$hive\$AD_KEY"
-    $adRowPresent = ("$($adKey.GetValue('URL'))" -eq 'LDAP:') -and ("$($adKey.GetValue('PolicyID'))" -eq "$adPid")
+    $adRowPresent = Test-RegEntryUsable -Key (Get-Item -LiteralPath "$hive\$AD_KEY") -ExpectUrl 'LDAP:' -ExpectPolicyId "$adPid"
 }
 if ($isGP) {
     if ($SkipADPolicy) { $adRow = 'skipped (-SkipADPolicy)' }
@@ -456,8 +473,7 @@ if ($PSCmdlet.ShouldProcess($target, $action)) {
 # client can use). Re-evaluated from the live registry right before the sibling cleanup.
 function Test-EntryComplete {
     if (-not (Test-Path -LiteralPath $target)) { return $false }
-    $k = Get-Item -LiteralPath $target
-    ("$($k.GetValue('URL'))" -eq $Url) -and ("$($k.GetValue('PolicyID'))" -eq "$PolicyId")
+    Test-RegEntryUsable -Key (Get-Item -LiteralPath $target) -ExpectUrl $Url -ExpectPolicyId "$PolicyId"
 }
 $entryExists = $entryApplied -or $WhatIfPreference -or (Test-EntryComplete)
 

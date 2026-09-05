@@ -70,7 +70,7 @@ Describe 'Submit-CertificateRequests' {
         foreach ($name in 'Resolve-FullPath', 'Resolve-TrackingFilePath', 'Assert-SafeNativeArgument', 'Assert-CertificateOutputPath', 'Assert-ProtectedDirectoryChain', 'Move-StaleCertificateAside', 'Remove-AsideIfIdentical', 'Move-RetrievedCertificate', 'New-TempCertificatePath',
                           'Get-TrustedPrincipalSet', 'ConvertTo-PrincipalLabel', 'Get-UntrustedGrant', 'Get-UntrustedOwner',
                           'Write-BatchLog', 'Get-RequestIdFromOutput', 'Get-DispositionFromOutput',
-                          'Get-FriendlyErrorHint', 'Import-TrackingData', 'Export-TrackingData', 'Remove-RspFile') {
+                          'Get-FriendlyErrorHint', 'Import-TrackingData', 'Export-TrackingData', 'Remove-RspFile', 'Resolve-CertificateOutputNames') {
             $def = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name }, $false)
             if ($def) { . ([scriptblock]::Create($def[0].Extent.Text)) }
         }
@@ -202,6 +202,76 @@ Describe 'Submit-CertificateRequests' {
             { Assert-SafeNativeArgument -Name T -Value 'x" -foo "y' } | Should -Throw -ExpectedMessage '*double quotes*'
             { Assert-SafeNativeArgument -Name T -Value "a`tb" }      | Should -Throw -ExpectedMessage '*control characters*'
             { Assert-SafeNativeArgument -Name T -Value '' }          | Should -Not -Throw
+        }
+
+        It 'Import-TrackingData reads a tracking file whose name carries wildcard characters literally' {
+            $p = Join-Path $TestDrive 'tracking[1].csv'
+            [pscustomobject]@{ RequestFile = 'C:\r\a.req'; RequestID = '7'; SubmitTime = ''; Status = 'Pending'; OutputCertFile = 'C:\r\a.cer'; LastCheckTime = ''; ErrorMessage = '' } |
+                Export-Csv -LiteralPath $p -NoTypeInformation -Encoding utf8
+            $rows = @(Import-TrackingData -Path $p)
+            $rows.Count | Should -Be 1 -Because "a wildcard-aware Test-Path looks for 'tracking1.csv', reports the file absent and returns an empty history - every request would be resubmitted"
+            $rows[0].RequestID | Should -Be '7'
+        }
+
+        It 'a row from an older tracking file (no CAConfig property) is readable under strict mode' {
+            Set-StrictMode -Version Latest
+            $row = [pscustomobject]@{ RequestFile = 'C:\r\a.req'; RequestID = '7'; Status = 'Pending'; OutputCertFile = 'C:\r\a.cer' }
+            { if ($row.PSObject.Properties['CAConfig']) { "$($row.CAConfig)" } else { '' } } | Should -Not -Throw
+            { "$($row.CAConfig)" } | Should -Throw -Because 'this is what the Retrieve loop must NOT do on legacy rows'
+        }
+
+        It 'Export-TrackingData writes the CAConfig column even when the first row comes from an older file without it, and keeps extra columns' {
+            $p = Join-Path $TestDrive 'mixed.csv'
+            $old = [pscustomobject]@{ RequestFile = 'C:\r\old.req'; RequestID = '1'; SubmitTime = ''; Status = 'Issued'; OutputCertFile = 'C:\r\old.cer'; LastCheckTime = ''; ErrorMessage = ''; Note = 'kept' }
+            $new = [pscustomobject]@{ RequestFile = 'C:\r\new.req'; RequestID = '2'; SubmitTime = ''; Status = 'Pending'; OutputCertFile = 'C:\r\new.cer'; LastCheckTime = ''; ErrorMessage = ''; CAConfig = 'ca1\CA' }
+            $script:SuppressLogFile = $true
+            try { Export-TrackingData -Data @($old, $new) -Path $p 3>$null } finally { $script:SuppressLogFile = $false }
+            $rows = @(Import-Csv -LiteralPath $p)
+            ($rows | Where-Object RequestID -eq '2').CAConfig | Should -Be 'ca1\CA' -Because 'Export-Csv takes its columns from the FIRST object; an older first row would otherwise drop the CA binding of every newer row'
+            ($rows | Where-Object RequestID -eq '1').Note | Should -Be 'kept'
+        }
+
+        It 'Write-BatchLog folds CR/LF and control characters so a tracking field cannot forge extra log lines' {
+            $log = Join-Path $TestDrive 'forge.log'
+            $saved = $script:LogFile; $script:LogFile = $log; $script:SuppressLogFile = $false
+            try { Write-BatchLog ("row for 'x.req'`r`n[2026-01-01 00:00:00] [Info] forged line" + [char]27 + "[0m") 6>$null }
+            finally { $script:LogFile = $saved }
+            $lines = @(Get-Content -LiteralPath $log)
+            $lines.Count | Should -Be 1 -Because 'one message must always be exactly one log record'
+            $lines[0] | Should -Match 'forged line'
+            $lines[0].Contains([string][char]27) | Should -BeFalse -Because 'control characters are replaced, not passed through to the log'
+            ($lines[0].Contains("`r") -or $lines[0].Contains("`n")) | Should -BeFalse
+        }
+
+        It 'Resolve-CertificateOutputNames gives every request a unique .cer name, within the batch and against other files'' recorded destinations' {
+            # prod.req + prod.csr share the base name -> full names; prod.req.txt has the BASE name
+            # 'prod.req', exactly what prod.req falls back to - the old rule mapped both to prod.req.cer
+            $names = Resolve-CertificateOutputNames -RequestPaths 'C:\in\prod.req', 'C:\in\prod.csr', 'C:\in\prod.req.txt' -ExistingRows @()
+            $names['C:\in\prod.req']     | Should -Be 'prod.req.cer'
+            $names['C:\in\prod.csr']     | Should -Be 'prod.csr.cer'
+            $names['C:\in\prod.req.txt'] | Should -Be 'prod.req.txt.cer'
+            @($names.Values | ForEach-Object { $_.ToLowerInvariant() } | Sort-Object -Unique).Count | Should -Be 3
+            # a plain file keeps the short name
+            (Resolve-CertificateOutputNames -RequestPaths 'C:\in\web01.req' -ExistingRows @())['C:\in\web01.req'] | Should -Be 'web01.cer'
+            # a base name already recorded for a DIFFERENT request file (an earlier run's web01.csr -> web01.cer) is not reused
+            $rows = @([pscustomobject]@{ RequestFile = 'C:\in\web01.csr'; OutputCertFile = 'C:\out\web01.cer' })
+            (Resolve-CertificateOutputNames -RequestPaths 'C:\in\web01.req' -ExistingRows $rows)['C:\in\web01.req'] | Should -Be 'web01.req.cer'
+            # ...while the same file's own row does not block it (a -Force resubmit)
+            $own = @([pscustomobject]@{ RequestFile = 'C:\in\web01.req'; OutputCertFile = 'C:\out\web01.cer' })
+            (Resolve-CertificateOutputNames -RequestPaths 'C:\in\web01.req' -ExistingRows $own)['C:\in\web01.req'] | Should -Be 'web01.cer'
+            # a name that an OLDER run recorded for TWO other files (the pre-1.0.4 collision) blocks
+            # both of them, not just the first one listed
+            $twoOwners = @([pscustomobject]@{ RequestFile = 'C:\in\prod.req'; OutputCertFile = 'C:\out\prod.req.cer' },
+                           [pscustomobject]@{ RequestFile = 'C:\in\prod.req.txt'; OutputCertFile = 'C:\out\prod.req.cer' })
+            # prod.req + prod.csr collide on prod.cer, so prod.req must fall back to prod.req.cer - which
+            # prod.req.txt's row still points at. No safe name exists: the batch is refused, not guessed.
+            { Resolve-CertificateOutputNames -RequestPaths 'C:\in\prod.req', 'C:\in\prod.csr' -ExistingRows $twoOwners } |
+                Should -Throw -ExpectedMessage '*already records for*prod.req.txt*'
+            # alone (no prod.csr in the batch) prod.req keeps its natural prod.cer, which nobody recorded
+            (Resolve-CertificateOutputNames -RequestPaths 'C:\in\prod.req' -ExistingRows $twoOwners)['C:\in\prod.req'] | Should -Be 'prod.cer'
+            # an unresolvable clash aborts before anything is submitted
+            $clash = @([pscustomobject]@{ RequestFile = 'C:\in\other.csr'; OutputCertFile = 'C:\out\web01.req.cer' })
+            { Resolve-CertificateOutputNames -RequestPaths 'C:\in\web01.req', 'C:\in\web01.csr' -ExistingRows $clash } | Should -Throw -ExpectedMessage '*never share a destination*'
         }
 
         It 'Assert-CertificateOutputPath confines a tracking-row path to a rooted .cer beneath an allowed root' {
@@ -741,7 +811,13 @@ RequestType = PKCS10
                 $call = @{ CAConfig = $script:Ca; TrackingFile = $script:Tracking; OutputFolder = $script:CertDir; Confirm = $false
                            TrustedOutputPrincipal = $script:EnvTrusted }   # this machine's TEMP-chain grants (see the outer BeforeAll)
                 foreach ($k in $Params.Keys) { $call[$k] = $Params[$k] }   # a test may override a default (e.g. OutputFolder)
-                $out = & $script:Submit @call *>&1 | Out-String -Width 400
+                # A run with failed/attention rows ends with a terminating error (non-zero exit for
+                # automation). Collect the streamed output first, then the error, so the tests can
+                # still judge both the rows and what was logged.
+                $lines = [System.Collections.Generic.List[string]]::new()
+                try { & $script:Submit @call *>&1 | ForEach-Object { $lines.Add("$_") } }
+                catch { $lines.Add("TERMINATING: $($_.Exception.Message)") }
+                $out = $lines -join "`n"
                 $rows = if (Test-Path $script:Tracking) { @(Import-Csv $script:Tracking) } else { @() }
                 foreach ($r in $rows) {
                     if ($r.RequestID -match '^\d+$' -and [int]$r.RequestID -notin $script:CaRequestIds) {

@@ -1,11 +1,12 @@
 <#PSScriptInfo
-.VERSION 1.0.1
+.VERSION 1.0.2
 .GUID 689db74d-e668-410a-9a62-0b208179a369
 .AUTHOR Sveinung Svea
 .PROJECTURI https://github.com/TheOmnilord/ADCS
 .LICENSEURI https://github.com/TheOmnilord/ADCS/blob/main/LICENSE
 .TAGS ADCS PKI CertificateServices
 .RELEASENOTES
+1.0.2 - A user@domain principal in -EnrollPrincipals resolves ONLY as a UPN, and a different object carrying that string as its sAMAccountName is refused (sAMAccountName may contain '@', so a planted account could previously capture a grant meant for the UPN); -UpgradeCompatibility sets CT_FLAG_USE_LEGACY_PROVIDER only for a schema-2 source with a provider list and preserves a schema-3 source's own bit (a v3 KSP template was switched to legacy provider handling); -Mode Validate fails with a terminating error when the throwaway template cannot be read back after creation (previously a warning and exit 0 with nothing validated)
 1.0.1 - The template create is now -ErrorAction Stop with a returned-object check (a non-terminating New-ADObject failure previously printed a green "Created template" line with an empty DN, orphaned the companion OID object and exited 0); after the create the OID is re-queried and, if another template claimed it concurrently, the new template is rolled back and the run fails
 1.0.0 - Initial release
 #>
@@ -428,8 +429,10 @@ function Convert-ToLatestCompatibility {
     # Encoding (verified against real MMC-made v4 templates and a live-DC round-trip):
     #   msPKI-Template-Schema-Version -> 4
     #   msPKI-Private-Key-Flag        |= 0x06060000 (CA=Server2016 nibble | recipient=Win10/2016 nibble),
-    #                                    plus 0x100 (CT_FLAG_USE_LEGACY_PROVIDER) for CSP-based
-    #                                    templates only - NOT CNG/KSP templates (no pKIDefaultCSPs)
+    #                                    plus 0x100 (CT_FLAG_USE_LEGACY_PROVIDER) for a schema-2
+    #                                    source with a provider list (v2 knows only CryptoAPI CSPs);
+    #                                    a schema-3 source keeps its own 0x100 bit as-is (its list
+    #                                    may legitimately name KSPs)
     #   flags                          IS_DEFAULT (0x10000) -> IS_MODIFIED (0x20000)
     #   msPKI-Template-Minor-Revision  += 1
     param([Parameter(Mandatory)][hashtable]$Attributes)
@@ -447,7 +450,14 @@ function Convert-ToLatestCompatibility {
     $pkf = ($pkf -band 0xF0F0FFFF) -bor 0x06060000
     # @($null).Count is 1, so test the value explicitly - do NOT rely on the count alone.
     $isCsp = $Attributes.ContainsKey('pKIDefaultCSPs') -and $null -ne $Attributes['pKIDefaultCSPs'] -and @($Attributes['pKIDefaultCSPs']).Count -gt 0
-    if ($isCsp) { $pkf = $pkf -bor 0x100 }
+    # CT_FLAG_USE_LEGACY_PROVIDER is derived from the SOURCE's own semantics, never from the mere
+    # presence of a provider list: a schema-2 (Server 2003) template can only name CryptoAPI CSPs,
+    # so a populated list there means legacy; a schema-3 template's list may name KSPs ("Microsoft
+    # Software Key Storage Provider") and its own 0x100 bit already says which - that bit survived
+    # the mask above and is left exactly as the source had it. Setting 0x100 on a KSP template
+    # would switch the v4 copy to legacy (CryptoAPI) key handling.
+    if ($ver -eq 2 -and $isCsp) { $pkf = $pkf -bor 0x100 }
+    $legacy = [bool]($pkf -band 0x100)
 
     $flags = if ($Attributes.ContainsKey('flags')) { [BitConverter]::ToUInt32([BitConverter]::GetBytes([int]$Attributes['flags']), 0) } else { [uint32]0 }
     $flags = ($flags -band (-bnot 0x10000)) -bor 0x20000
@@ -458,7 +468,7 @@ function Convert-ToLatestCompatibility {
     if ($Attributes.ContainsKey('msPKI-Template-Minor-Revision')) {
         $Attributes['msPKI-Template-Minor-Revision'] = [System.Int32]([int]$Attributes['msPKI-Template-Minor-Revision'] + 1)
     }
-    return [pscustomobject]@{ Upgraded = $true; FromVersion = $ver; PrivateKeyFlag = ('0x{0:X8}' -f $pkf); LegacyProvider = $isCsp }
+    return [pscustomobject]@{ Upgraded = $true; FromVersion = $ver; PrivateKeyFlag = ('0x{0:X8}' -f $pkf); LegacyProvider = $legacy }
 }
 
 function Get-RandomHex {
@@ -1238,12 +1248,29 @@ function Resolve-PrincipalSid {
     # never goes into a filter). -ErrorAction Stop: a failed search must fail the run, not silently
     # degrade into a token/not-found path that could resolve a different SID.
     $escName = ConvertTo-LdapFilterValue $name
-    $obj = @(Get-ADObject @ADParams -LDAPFilter "(sAMAccountName=$escName)" -Properties objectSid -ErrorAction Stop |
-            Where-Object { $_.objectSid })
-
-    if (-not $obj.Count -and $id -match '@') {
+    if ($id -notmatch '\\' -and $id -match '@') {
+        # ANY unprefixed value containing '@' is a UPN and is resolved ONLY as one (a stricter shape
+        # test would route an odd-but-real UPN such as 'ann lee@x.test' back to the sAMAccountName
+        # lookup, and with it around the shadow check). sAMAccountName may legally contain '@',
+        # so an attacker with account-creation rights could plant a principal whose sAMAccountName
+        # equals the victim's UPN; consulting sAMAccountName first (as before) would have handed
+        # that principal the grant. The UPN lookup is the authority, and a sAMAccountName match for
+        # the same string that is a DIFFERENT object is refused rather than guessed.
         $escUpn = ConvertTo-LdapFilterValue $id
         $obj = @(Get-ADObject @ADParams -LDAPFilter "(userPrincipalName=$escUpn)" -Properties objectSid -ErrorAction Stop |
+                Where-Object { $_.objectSid })
+        $shadow = @(Get-ADObject @ADParams -LDAPFilter "(sAMAccountName=$escName)" -Properties objectSid -ErrorAction Stop |
+                Where-Object { $_.objectSid })
+        if ($shadow.Count) {
+            $upnSids = @($obj | ForEach-Object { ([System.Security.Principal.SecurityIdentifier]$_.objectSid).Value })
+            $other = @($shadow | Where-Object { ([System.Security.Principal.SecurityIdentifier]$_.objectSid).Value -notin $upnSids })
+            if ($other.Count) {
+                throw "Principal '$Identity' is a UPN, but a different directory object carries it as its sAMAccountName ($(@($other | ForEach-Object { $_.DistinguishedName }) -join '; ')) - a planted or colliding account. Use the intended principal's SID (S-1-5-...) instead."
+            }
+        }
+    }
+    else {
+        $obj = @(Get-ADObject @ADParams -LDAPFilter "(sAMAccountName=$escName)" -Properties objectSid -ErrorAction Stop |
                 Where-Object { $_.objectSid })
     }
     if ($obj.Count -gt 1) {
@@ -1548,8 +1575,10 @@ function Invoke-OneRoundTrip {
 
     $created = Get-ADObjectIfPresent -Identity $CreatedDN.Value -ADParams $ADParams -Properties *
     if (-not $created) {
-        Write-Warning "$PipelineName throwaway template could not be read back after creation (replication lag on a domain-name -Server?); nothing to compare."
-        return $null
+        # A throw, not a warning + $null: $null means "declined at the prompt" to the caller, which
+        # then returns normally - and a deployment gate on the exit code would accept a copy that
+        # was never validated. The throwaway object (if it exists) is removed by the caller's finally.
+        throw "$PipelineName throwaway template '$($CreatedDN.Value)' was created but could not be read back (replication lag on a domain-name -Server? pass a single DC). Validation did NOT run."
     }
 
     Show-RoundTripDiff -Label "$PipelineName comparison: '$SourceName' -> '$Cn'" -Source $Source -Target $created
