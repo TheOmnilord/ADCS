@@ -1,11 +1,12 @@
 <#PSScriptInfo
-.VERSION 1.0.4
+.VERSION 1.0.5
 .GUID 6f98f16e-0c56-4a72-ba31-443938175c06
 .AUTHOR Sveinung Svea
 .PROJECTURI https://github.com/TheOmnilord/ADCS
 .LICENSEURI https://github.com/TheOmnilord/ADCS/blob/main/LICENSE
 .TAGS ADCS PKI CertificateServices
 .RELEASENOTES
+1.0.5 - Help text only: the notes document the CAConfig column and the CA check on Retrieve, up-front unique certificate names, the Unknown-without-RequestID rule and the non-zero exit on failed or attention-needing rows; no code change
 1.0.4 - Certificate file names are allocated up front and must be unique within the batch and against the destinations already recorded for other request files (prod.req / prod.csr / prod.req.txt no longer map two requests onto one .cer); the tracking file is read with -LiteralPath (a name with [ ] was reported absent and its whole history resubmitted); a nonexistent or non-folder -InputPath is a terminating error instead of an empty batch; every row records the CA it was submitted to (CAConfig) and -Mode Retrieve refuses rows submitted to a different CA; a submission certreq reports as successful but whose reply yields neither a RequestID nor a certificate is recorded as Unknown and never resubmitted automatically; a run with failed or attention-needing rows ends with a terminating error (non-zero exit); log messages fold CR/LF and control characters so a tracking field cannot forge log lines; Export-Csv column loss with mixed old/new rows prevented
 1.0.3 - The delivery folder is also judged on what its ACL hands to the FILES created inside it: an inheritable "files" entry (inherit-only or not) granting an untrusted principal write, append, delete, write-attributes or re-permission rights is refused (a warning under -AllowUnprotectedOutputFolder; -TrustedOutputPrincipal applies), because certreq's staging file and the delivered certificate inherit it while the folder-swap checks rightly ignore inherit-only entries - previously such a user could alter the certificate's bytes before or after delivery with every folder check passing. CREATOR OWNER / OWNER RIGHTS placeholders resolve to the running account and are trusted; CREATOR GROUP is not
 1.0.2 - A retrieval that reports Issued without producing the .cer file is recorded as Error (retried next Retrieve) instead of a final Issued; certreq exit code + .cer presence now decide Issued independently of certreq's (localized) wording; certificates are written to a private staging file inside the destination folder and delivered with a no-overwrite rename (an existing file is moved aside as <name>.superseded-<stamp>.cer, never deleted); every folder from the destination to the volume root is checked for reparse points and untrusted owners/writers before delivery (new -AllowUnprotectedOutputFolder and -TrustedOutputPrincipal); a tracking row's OutputCertFile must resolve beneath the tracking folder or -OutputFolder; an issued certificate that cannot be delivered gets the new Undelivered status (never resubmitted); values that reach the certreq command line are validated; concurrent runs on one tracking file are refused (exclusive <TrackingFile>.lock) and the tracking file is replaced via a unique temp file; cmdlets inside an approved action no longer raise their own -Confirm prompts
@@ -120,9 +121,24 @@
       delivered (locked destination, denied rename), the row is recorded as Status 'Undelivered'
       with its RequestID kept and the certificate left in its staging file beside the destination (path in ErrorMessage): it counts
       as submitted on later runs (never resubmitted automatically) and -Mode Retrieve re-fetches
-      it; an Undelivered row with no RequestID is reported for manual reconciliation. Values that
-      reach the certreq command line (-CAConfig, -CertificateTemplate, RequestID, paths) must not
-      contain double quotes or control characters.
+      it; an Undelivered row with no RequestID is reported for manual reconciliation. A submission
+      certreq reports as SUCCESSFUL but whose reply yields neither a RequestID nor a certificate
+      (localized output) is recorded as 'Unknown' and counts as submitted the same way: never
+      resubmitted automatically (a later Submit asks, or needs -Force) and listed by Retrieve for
+      reconciliation. Values that reach the certreq command line (-CAConfig, -CertificateTemplate,
+      RequestID, paths) must not contain double quotes or control characters.
+    - Every row records the CA it was submitted to (CAConfig column). -Mode Retrieve refuses rows
+      submitted to a different CA - RequestIDs are per CA, so another CA's request with the same
+      number is an unrelated certificate - and stamps rows from older tracking files (no CAConfig)
+      with the run's -CAConfig. Certificate file names are allocated before anything is submitted
+      and must be unique within the batch and against the destinations already recorded for other
+      request files (prod.req, prod.csr and prod.req.txt never share a .cer); an unresolvable
+      clash aborts the run before any submission.
+    - A run in which any request failed or needs attention (Error, Denied, Undelivered, Unknown,
+      or a Retrieve row skipped as invalid) ends with a terminating error after the summary and
+      the final checkpoint, so automation gating on the exit code does not treat a partial batch
+      as success; Pending is not a failure. A nonexistent or non-folder -InputPath is an error
+      too (an existing empty folder is an empty batch).
     - Output folders must not be swappable by untrusted users: every folder from the destination up
       to the volume/share root is checked, and the script REFUSES to deliver when any of them is a
       reparse point (junction/symlink/mount point), is owned by an untrusted principal, can be

@@ -1,11 +1,12 @@
 <#PSScriptInfo
-.VERSION 1.0.2
+.VERSION 1.0.3
 .GUID 61adf5d1-6eb5-4f41-8670-e9da72134570
 .AUTHOR Sveinung Svea
 .PROJECTURI https://github.com/TheOmnilord/ADCS
 .LICENSEURI https://github.com/TheOmnilord/ADCS/blob/main/LICENSE
 .TAGS ADCS PKI CertificateServices
 .RELEASENOTES
+1.0.3 - Help text only: -ReplaceExisting documents the complete-row requirement; no code change
 1.0.2 - A pre-existing AD-policy row or CEP entry counts as complete only with URL, PolicyID, FriendlyName and DWORD Flags/AuthFlags/Cost present (URL + PolicyID alone is what an interrupted write leaves), for the prerequisite, the (Default) marker and -ReplaceExisting alike
 1.0.1 - For the GP locations the domain objectGUID for the AD Enrollment Policy row is resolved BEFORE the CEP entry is written; on a domain-joined machine a lookup failure now aborts the run with nothing written (previously the entry was written first and the failure became a warning, leaving a GP configuration that removes the AD enrollment policy); on a workgroup machine the row is still skipped with a warning
 1.0.0 - Initial release
@@ -121,7 +122,11 @@
     Remove sibling entries that share this PolicyID but have a different URL (typically stale
     entries from an earlier run with a typo'd or superseded URL). The AD policy row is never
     treated as a removable sibling. Without this switch the script only warns - multiple URLs
-    per PolicyID is also the legitimate redundant-endpoint pattern.
+    per PolicyID is also the legitimate redundant-endpoint pattern. The cleanup (like the
+    (Default) marker and the AD-row prerequisite) acts only when the entry that replaces the
+    siblings is COMPLETE at that moment - written and verified by this run, or already present
+    with URL and PolicyID as requested AND FriendlyName plus DWORD-typed Flags, AuthFlags and
+    Cost; URL + PolicyID alone (what an interrupted write leaves) does not count.
 
 .PARAMETER DisableUserConfigured
     GP locations only: set root Flags bit 0x4 so clients ignore user-configured policy

@@ -8,6 +8,23 @@ Each script also carries its own version in the `PSScriptInfo` header at the top
 Test-ScriptFileInfo .\Submit-CertificateRequests.ps1 | Select-Object Name, Version
 ```
 
+## [1.0.5] — 2026-09-06
+
+Help text only — no code changes. Each script's comment-based help now describes the behaviour its 1.0.2–1.0.4 fixes introduced, matching the README:
+
+- **Submit-CertificateRequests.ps1 → 1.0.5** — the notes cover the `CAConfig` column and the CA check on Retrieve, up-front unique certificate names, the `Unknown`-without-RequestID rule, and the non-zero exit on failed or attention-needing rows.
+- **Sync-ADCSTemplate.ps1 → 1.0.3** — `-EnrollPrincipals` documents the UPN-only resolution of `user@domain` keys, `-UpgradeCompatibility` the legacy-provider rule, `-Mode Validate` the read-back failure.
+- **Set-ADCSTemplateValidity.ps1 → 1.0.3** — `-OverlapPeriod` documents the retained-overlap refusal.
+- **Add-CertificateEnrollmentPolicyServerToGpo.ps1 → 1.0.3** and **…Offline.ps1 → 1.0.3** — `-ReplaceExisting` documents the complete-row requirement.
+
+| Script | Version |
+|---|---|
+| Set-ADCSTemplateValidity.ps1 | **1.0.3** |
+| Submit-CertificateRequests.ps1 | **1.0.5** |
+| Sync-ADCSTemplate.ps1 | **1.0.3** |
+| Add-CertificateEnrollmentPolicyServerOffline.ps1 | **1.0.3** |
+| Add-CertificateEnrollmentPolicyServerToGpo.ps1 | **1.0.3** |
+
 ## [1.0.4] — 2026-09-06
 
 Findings of a full-repository adversarial review (Codex, gpt-6-astra, high effort) after v1.0.3, each verified against the code before fixing.
@@ -129,6 +146,7 @@ Initial release.
 | Add-CertificateEnrollmentPolicyServerOffline.ps1 | 1.0.0 |
 | Add-CertificateEnrollmentPolicyServerToGpo.ps1 | 1.0.0 |
 
+[1.0.5]: https://github.com/TheOmnilord/ADCS/compare/v1.0.4...v1.0.5
 [1.0.4]: https://github.com/TheOmnilord/ADCS/compare/v1.0.3...v1.0.4
 [1.0.3]: https://github.com/TheOmnilord/ADCS/compare/v1.0.2...v1.0.3
 [1.0.2]: https://github.com/TheOmnilord/ADCS/compare/v1.0.1...v1.0.2

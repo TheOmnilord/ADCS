@@ -1,11 +1,12 @@
 <#PSScriptInfo
-.VERSION 1.0.2
+.VERSION 1.0.3
 .GUID 54763db6-2359-401f-8960-ef0de5911aaf
 .AUTHOR Sveinung Svea
 .PROJECTURI https://github.com/TheOmnilord/ADCS
 .LICENSEURI https://github.com/TheOmnilord/ADCS/blob/main/LICENSE
 .TAGS ADCS PKI CertificateServices
 .RELEASENOTES
+1.0.3 - Help text only: -ReplaceExisting documents the complete-row requirement; no code change
 1.0.2 - A **-prefixed registry.pol instruction (**DeleteKeys, **DeleteValues, **del., **delvals.) decodes its data as a string whatever its type field says (**soft.<name> keeps its declared type, since it writes a value), as the Group Policy engine does (a **DeleteKeys typed REG_BINARY previously decoded to no data and deleted nothing in the model, so a deleted entry could be reported as present); a pre-existing AD-policy row or CEP entry counts as complete only with URL, PolicyID, FriendlyName and numeric Flags/AuthFlags/Cost present (URL + PolicyID alone is what an interrupted write leaves), for the prerequisite, the (Default) marker and -ReplaceExisting alike
 1.0.1 - The domain objectGUID for the AD Enrollment Policy row is resolved BEFORE any GPO write and a lookup failure now aborts the run (previously the CEP entry was written first and the failure became a warning, leaving a GPO that removes the AD enrollment policy from every client in scope); a GUID-shaped -GpoName falls back to the GPO ID only after an independent listing proves no GPO carries that display name (any other name-lookup failure is rethrown); registry.pol reads validate the PReg header, refuse oversized files and trailing junk, and return the EFFECTIVE value (records replayed in file order: last write wins, **del./**delvals./**DeleteValues honoured) instead of the first matching record; the deletion-order damage check is judged per value, so a deletion between an obsolete record and its replacement no longer raises a false DAMAGED warning
 1.0.0 - Initial release
@@ -116,7 +117,11 @@
 .PARAMETER ReplaceExisting
     Remove sibling entries sharing this PolicyID under a different URL (stale/typo entries).
     The AD policy row is never removed by this. Without the switch the script only warns,
-    since multiple URLs per PolicyID is also the legitimate redundant-endpoint pattern.
+    since multiple URLs per PolicyID is also the legitimate redundant-endpoint pattern. The
+    cleanup (like the (Default) marker and the AD-row prerequisite) acts only when the entry
+    that replaces the siblings is COMPLETE at that moment - written and verified by this run, or
+    already present with URL and PolicyID as requested AND FriendlyName plus DWORD Flags,
+    AuthFlags and Cost; URL + PolicyID alone (what an interrupted write leaves) does not count.
 
 .PARAMETER DisableUserConfigured
     Set root Flags bit 0x4 (clients ignore user-configured policy servers). Preserved on

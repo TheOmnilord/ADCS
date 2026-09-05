@@ -1,11 +1,12 @@
 ﻿<#PSScriptInfo
-.VERSION 1.0.2
+.VERSION 1.0.3
 .GUID 48b937ae-18bd-4710-9de9-5ae76f7c9a72
 .AUTHOR Sveinung Svea
 .PROJECTURI https://github.com/TheOmnilord/ADCS
 .LICENSEURI https://github.com/TheOmnilord/ADCS/blob/main/LICENSE
 .TAGS ADCS PKI CertificateServices
 .RELEASENOTES
+1.0.3 - Help text only: -OverlapPeriod documents the retained-overlap refusal; no code change
 1.0.2 - When the overlap is not being set, a template whose EXISTING renewal overlap is not shorter than the new validity is reported as an error and left unchanged (previously the validity was shortened beneath the retained overlap, an invalid pair; the begin-block check only covered an explicitly supplied overlap)
 1.0.1 - A run in which any search or template update failed now ends with a terminating error (non-zero exit) after the summary, instead of exit 0 with errors only in the console; help no longer advertises ? as a wildcard (LDAP substring filters only know *, so ? always matched literally - documentation corrected)
 1.0.0 - Initial release
@@ -38,6 +39,9 @@
 .PARAMETER OverlapPeriod
     Optional. The numeric value for the renewal overlap period (1–9999).
     Must be specified together with OverlapPeriodUnit, and must be shorter than the validity period.
+    When omitted, each template keeps its existing overlap - and a template whose existing overlap
+    is not shorter than the new validity (a 30-day validity over a stock 6-week overlap) is reported
+    as an error and left unchanged; pass a shorter overlap to change both together.
 
 .PARAMETER OverlapPeriodUnit
     Optional. The unit for OverlapPeriod: Years, Months, Weeks, Days, or Hours.

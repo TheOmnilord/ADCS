@@ -1,11 +1,12 @@
 <#PSScriptInfo
-.VERSION 1.0.2
+.VERSION 1.0.3
 .GUID 689db74d-e668-410a-9a62-0b208179a369
 .AUTHOR Sveinung Svea
 .PROJECTURI https://github.com/TheOmnilord/ADCS
 .LICENSEURI https://github.com/TheOmnilord/ADCS/blob/main/LICENSE
 .TAGS ADCS PKI CertificateServices
 .RELEASENOTES
+1.0.3 - Help text only: -EnrollPrincipals documents the UPN-only resolution of user@domain keys, -UpgradeCompatibility the legacy-provider rule, -Mode Validate the read-back failure; no code change
 1.0.2 - A user@domain principal in -EnrollPrincipals resolves ONLY as a UPN, and a different object carrying that string as its sAMAccountName is refused (sAMAccountName may contain '@', so a planted account could previously capture a grant meant for the UPN); -UpgradeCompatibility sets CT_FLAG_USE_LEGACY_PROVIDER only for a schema-2 source with a provider list and preserves a schema-3 source's own bit (a v3 KSP template was switched to legacy provider handling); -Mode Validate fails with a terminating error when the throwaway template cannot be read back after creation (previously a warning and exit 0 with nothing validated)
 1.0.1 - The template create is now -ErrorAction Stop with a returned-object check (a non-terminating New-ADObject failure previously printed a green "Created template" line with an empty DN, orphaned the companion OID object and exited 0); after the create the OID is re-queried and, if another template claimed it concurrently, the new template is rolled back and the run fails
 1.0.0 - Initial release
@@ -80,7 +81,9 @@
           untouched by JSON, so the file check cannot stand in for it). Each throwaway gets a
           unique OID that needs no OID root; every copied attribute of each copy is diffed -
           byte[] attributes included. Any mismatch makes the run FAIL with a terminating error
-          (non-zero exit code), so Validate can gate automation; cleanup still runs first. By
+          (non-zero exit code), so Validate can gate automation; cleanup still runs first. A
+          throwaway that cannot be read back after its confirmed creation fails the run the same
+          way (nothing was validated), never as a warning with exit 0. By
           default the throwaway templates and the temp file are removed afterwards (keep them for
           inspection with -KeepArtifacts). Requires the same write access as Import.
 
@@ -215,7 +218,9 @@
     cannot hijack a token, and a token cannot shadow a distinct real group - disambiguate with a
     SID or a DOMAIN\ prefix); the built-in groups' own names (e.g. 'Domain Admins') resolve
     normally, since both readings yield the same SID. A name matching more than one object
-    (duplicate UPNs) is refused rather than guessed. Values: one
+    (duplicate UPNs) is refused rather than guessed. A key containing '@' (user@domain) resolves
+    ONLY as a UPN: sAMAccountName may legally contain '@', so a different object carrying that
+    string as its sAMAccountName is refused as a planted or colliding account. Values: one
     or more of Read, Write, Enroll, Autoenroll, FullControl. Named principals are looked up in the
     target (-Server) domain; use a SID for a principal in another domain. Validated up front, before
     anything is created. Example:
@@ -232,7 +237,9 @@
     the matching private-key-flag bits). Only schema v2/v3 templates can be upgraded in place; a
     schema v1 template is imported unchanged with a warning (v1 built-ins are read-only in the MMC),
     and a template already at v4 is left as-is. The source template/export is not modified; only the
-    copy written to the target is upgraded.
+    copy written to the target is upgraded. The legacy-provider bit (CT_FLAG_USE_LEGACY_PROVIDER,
+    0x100) is set only for a schema-2 source with a provider list (v2 knows only CryptoAPI CSPs); a
+    schema-3 source keeps its own bit, so a v3 template that lists a KSP stays CNG.
 
 .PARAMETER KeepArtifacts
     Validate only. Leaves the throwaway templates and the export file in place after the diff
