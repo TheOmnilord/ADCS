@@ -8,6 +8,16 @@ Each script also carries its own version in the `PSScriptInfo` header at the top
 Test-ScriptFileInfo .\Submit-CertificateRequests.ps1 | Select-Object Name, Version
 ```
 
+## [1.0.3] — 2026-09-05
+
+### Fixed
+- **Submit-CertificateRequests.ps1 → 1.0.3** — the delivery folder is now also judged on what its ACL hands to the *files* created inside it. The 1.0.2 checks judged each folder on the rights it grants on the folder itself and, correctly for folder-swap purposes, ignored inherit-only entries — but an inheritable "files only" entry granting an untrusted principal write, append, delete or re-permission rights is exactly what certreq's staging file and the delivered certificate inherit, so such a user could have altered the certificate's bytes after certreq closed the file, before or after delivery, with every folder check passing (and the post-delivery ACL reset, which re-enables inheritance from the folder, would have kept the grant). Every entry that propagates to files (ObjectInherit, inherit-only or not) is now checked against the file write-class on the delivery folder — write-data, append-data, delete, change permissions, take ownership, and write-attributes (enough on its own to set a reparse point on a file) — and a grant to an untrusted principal is refused — a warning under `-AllowUnprotectedOutputFolder`; `-TrustedOutputPrincipal` applies. The inheritance placeholders are resolved as the file system resolves them: CREATOR OWNER and OWNER RIGHTS become the creating (running, trusted) account, so the inherit-only CREATOR OWNER entry that the `C:\` root propagates to every unprotected folder does not cause a refusal; CREATOR GROUP becomes the running account's primary group and stays untrusted unless `S-1-3-1` is named in `-TrustedOutputPrincipal`. Found by adversarial review after v1.0.2.
+- Tests: file-inheritance regression cases for the delivery folder — an inherit-only *files* Modify entry, an object-inheritable append-data entry (tolerated as create-subfolder on the folder, but append on a file), a files-only write-attributes entry, a folders-only entry that files do not inherit, and the `C:\`-style inherit-only CREATOR OWNER Full Control entry that must *not* be refused (with the file it produces proving it resolves to the running account) — with a real file created inside proving what is inherited.
+
+| Script | Version |
+|---|---|
+| Submit-CertificateRequests.ps1 | **1.0.3** |
+
 ## [1.0.2] — 2026-09-05
 
 ### Fixed
@@ -87,6 +97,7 @@ Initial release.
 | Add-CertificateEnrollmentPolicyServerOffline.ps1 | 1.0.0 |
 | Add-CertificateEnrollmentPolicyServerToGpo.ps1 | 1.0.0 |
 
+[1.0.3]: https://github.com/TheOmnilord/ADCS/compare/v1.0.2...v1.0.3
 [1.0.2]: https://github.com/TheOmnilord/ADCS/compare/v1.0.1...v1.0.2
 [1.0.1]: https://github.com/TheOmnilord/ADCS/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/TheOmnilord/ADCS/releases/tag/v1.0.0

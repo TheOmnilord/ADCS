@@ -405,6 +405,92 @@ Describe 'Submit-CertificateRequests' {
             # ...but a child created beneath it inherits the effective Modify and IS swappable
             $child = Join-Path $d 'child'; New-Item -ItemType Directory -Force $child | Out-Null
             @(Get-UntrustedGrant -Path $child -Kind Swap) -join ' ' | Should -Match 'Authenticated Users'
+            # ...and a FILE created in the folder inherits it too - which is what the File kind and
+            # the delivery-folder check exist for: the folder passes every swap check, yet the
+            # staging file and the delivered certificate would be writable by Authenticated Users
+            @(Get-UntrustedGrant -Path $d -Kind File) -join ' ' | Should -Match 'Authenticated Users'
+            { Assert-ProtectedDirectoryChain -Name T -Directory $d -Path (Join-Path $d 'x.cer') } | Should -Throw -ExpectedMessage '*FILES created inside it*'
+            $script:AllowUnprotectedOutput = $true
+            try { { Assert-ProtectedDirectoryChain -Name T -Directory $d -Path (Join-Path $d 'x.cer') 3>$null } | Should -Not -Throw }
+            finally { $script:AllowUnprotectedOutput = $false }
+        }
+
+        It 'Get-UntrustedGrant -Kind File judges what the delivery folder hands to FILES: files-only Modify and inheritable append-data are refused, a folders-only entry is not' {
+            $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+            $authUsers = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-11')
+            $mk = {
+                param($name, $rights, $inherit, $prop)
+                $d = Join-Path $TestDrive "acl-file-$name"; New-Item -ItemType Directory -Force $d | Out-Null
+                $acl = Get-Acl -LiteralPath $d
+                $acl.SetAccessRuleProtection($true, $false); foreach ($r in @($acl.Access)) { [void]$acl.RemoveAccessRule($r) }
+                $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($me, 'FullControl', 'ContainerInherit, ObjectInherit', 'None', 'Allow')))
+                $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($authUsers, $rights, $inherit, $prop, 'Allow')))
+                Set-Acl -LiteralPath $d -AclObject $acl
+                $d
+            }
+            # 1. "Modify - files only" (ObjectInherit + InheritOnly): nothing on the folder, Modify on every file in it
+            $filesOnly = & $mk 'filesonly' 'Modify' 'ObjectInherit' 'InheritOnly'
+            @(Get-UntrustedGrant -Path $filesOnly -Kind Swap).Count   | Should -Be 0 -Because 'the folder itself grants nothing'
+            @(Get-UntrustedGrant -Path $filesOnly -Kind Create).Count | Should -Be 0
+            @(Get-UntrustedGrant -Path $filesOnly -Kind File) -join ' ' | Should -Match 'Authenticated Users'
+            $f = Join-Path $filesOnly 'proof.staging.cer'; Set-Content -LiteralPath $f -Value 'x'
+            $inherited = @((Get-Acl -LiteralPath $f).GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]) |
+                Where-Object { $_.IdentityReference.Value -eq 'S-1-5-11' -and $_.IsInherited })
+            $inherited.Count | Should -BeGreaterThan 0 -Because 'a file created in the folder inherits the files-only entry'
+            ([int]$inherited[0].FileSystemRights -band [int][System.Security.AccessControl.FileSystemRights]::WriteData) | Should -Not -Be 0
+            { Assert-ProtectedDirectoryChain -Name T -Directory $filesOnly -Path (Join-Path $filesOnly 'x.cer') } | Should -Throw -ExpectedMessage '*FILES created inside it*'
+            # 2. create-subfolder (FILE_APPEND_DATA) with ObjectInherit: tolerated on the folder (Create only) but APPEND on a file
+            $append = & $mk 'append' 'CreateDirectories' 'ContainerInherit, ObjectInherit' 'None'
+            @(Get-UntrustedGrant -Path $append -Kind Swap).Count | Should -Be 0
+            @(Get-UntrustedGrant -Path $append -Kind Create) -join ' ' | Should -Match 'Authenticated Users'
+            @(Get-UntrustedGrant -Path $append -Kind File) -join ' ' | Should -Match 'Authenticated Users' -Because 'FILE_APPEND_DATA on a file lets the holder append to the certificate'
+            # 3. Modify for SUBFOLDERS only (ContainerInherit + InheritOnly): files never inherit it - not a file-tamper grant
+            $foldersOnly = & $mk 'foldersonly' 'Modify' 'ContainerInherit' 'InheritOnly'
+            @(Get-UntrustedGrant -Path $foldersOnly -Kind File).Count | Should -Be 0 -Because 'a ContainerInherit-only entry does not propagate to files'
+            $f2 = Join-Path $foldersOnly 'proof.cer'; Set-Content -LiteralPath $f2 -Value 'x'
+            @((Get-Acl -LiteralPath $f2).GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]) | Where-Object { $_.IdentityReference.Value -eq 'S-1-5-11' }).Count | Should -Be 0
+            { Assert-ProtectedDirectoryChain -Name T -Directory $foldersOnly -Path (Join-Path $foldersOnly 'x.cer') } | Should -Not -Throw
+            # 4. read-only for Everyone on files is not a write-class grant
+            $ro = & $mk 'readonly' 'ReadAndExecute' 'ContainerInherit, ObjectInherit' 'None'
+            @(Get-UntrustedGrant -Path $ro -Kind File).Count | Should -Be 0
+            # 4b. write-ATTRIBUTES on files only: not content, but FSCTL_SET_REPARSE_POINT accepts a
+            #     file handle opened with FILE_WRITE_ATTRIBUTES alone, so the delivered certificate
+            #     could be turned into a reparse point after the plain-file post-condition
+            $wa = & $mk 'writeattr' 'WriteAttributes' 'ObjectInherit' 'InheritOnly'
+            @(Get-UntrustedGrant -Path $wa -Kind Swap).Count | Should -Be 0
+            @(Get-UntrustedGrant -Path $wa -Kind File) -join ' ' | Should -Match 'Authenticated Users'
+            # 4c. the C:\ default "CREATOR OWNER: Full Control, subfolders and files only" - a
+            #     placeholder the file system replaces with the CREATING account, i.e. the running
+            #     account certreq runs as. Every unprotected folder under C:\ carries it; it must NOT
+            #     be refused, or no real output folder would pass.
+            $co = Join-Path $TestDrive 'acl-file-creatorowner'; New-Item -ItemType Directory -Force $co | Out-Null
+            $acl = Get-Acl -LiteralPath $co
+            $acl.SetAccessRuleProtection($true, $false); foreach ($r in @($acl.Access)) { [void]$acl.RemoveAccessRule($r) }
+            $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($me, 'FullControl', 'ContainerInherit, ObjectInherit', 'None', 'Allow')))
+            $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+                (New-Object System.Security.Principal.SecurityIdentifier('S-1-3-0')), 'FullControl', 'ContainerInherit, ObjectInherit', 'InheritOnly', 'Allow')))
+            Set-Acl -LiteralPath $co -AclObject $acl
+            @(Get-UntrustedGrant -Path $co -Kind File).Count | Should -Be 0 -Because 'CREATOR OWNER resolves to the creating (running, trusted) account'
+            { Assert-ProtectedDirectoryChain -Name T -Directory $co -Path (Join-Path $co 'x.cer') } | Should -Not -Throw
+            $f3 = Join-Path $co 'proof.cer'; Set-Content -LiteralPath $f3 -Value 'x'
+            $onFile = @((Get-Acl -LiteralPath $f3).GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]) | ForEach-Object { $_.IdentityReference.Value })
+            $onFile | Should -Not -Contain 'S-1-3-0' -Because 'the placeholder never survives onto the file'
+            $onFile | Should -Contain $me.Value -Because 'it resolves to the account that created the file'
+            # ...whereas CREATOR GROUP resolves to the running account's PRIMARY GROUP (possibly Domain Users) and stays untrusted
+            $cg = Join-Path $TestDrive 'acl-file-creatorgroup'; New-Item -ItemType Directory -Force $cg | Out-Null
+            $acl = Get-Acl -LiteralPath $cg
+            $acl.SetAccessRuleProtection($true, $false); foreach ($r in @($acl.Access)) { [void]$acl.RemoveAccessRule($r) }
+            $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($me, 'FullControl', 'ContainerInherit, ObjectInherit', 'None', 'Allow')))
+            $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+                (New-Object System.Security.Principal.SecurityIdentifier('S-1-3-1')), 'Modify', 'ObjectInherit', 'InheritOnly', 'Allow')))
+            Set-Acl -LiteralPath $cg -AclObject $acl
+            @(Get-UntrustedGrant -Path $cg -Kind File) -join ' ' | Should -Match 'CREATOR GROUP'
+            # 5. ...and the trusted set applies to the File kind as well
+            $saved = $script:TrustedSids
+            try {
+                $script:TrustedSids = Get-TrustedPrincipalSet -Extra 'S-1-5-11'
+                @(Get-UntrustedGrant -Path $filesOnly -Kind File).Count | Should -Be 0
+            } finally { $script:TrustedSids = $saved }
         }
 
         It 'Assert-CertificateOutputPath picks the DEEPEST matching root and refuses a root that is a junction' {

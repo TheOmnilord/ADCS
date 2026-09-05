@@ -1,11 +1,12 @@
 <#PSScriptInfo
-.VERSION 1.0.2
+.VERSION 1.0.3
 .GUID 6f98f16e-0c56-4a72-ba31-443938175c06
 .AUTHOR Sveinung Svea
 .PROJECTURI https://github.com/TheOmnilord/ADCS
 .LICENSEURI https://github.com/TheOmnilord/ADCS/blob/main/LICENSE
 .TAGS ADCS PKI CertificateServices
 .RELEASENOTES
+1.0.3 - The delivery folder is also judged on what its ACL hands to the FILES created inside it: an inheritable "files" entry (inherit-only or not) granting an untrusted principal write, append, delete, write-attributes or re-permission rights is refused (a warning under -AllowUnprotectedOutputFolder; -TrustedOutputPrincipal applies), because certreq's staging file and the delivered certificate inherit it while the folder-swap checks rightly ignore inherit-only entries - previously such a user could alter the certificate's bytes before or after delivery with every folder check passing. CREATOR OWNER / OWNER RIGHTS placeholders resolve to the running account and are trusted; CREATOR GROUP is not
 1.0.2 - A retrieval that reports Issued without producing the .cer file is recorded as Error (retried next Retrieve) instead of a final Issued; certreq exit code + .cer presence now decide Issued independently of certreq's (localized) wording; certificates are written to a private staging file inside the destination folder and delivered with a no-overwrite rename (an existing file is moved aside as <name>.superseded-<stamp>.cer, never deleted); every folder from the destination to the volume root is checked for reparse points and untrusted owners/writers before delivery (new -AllowUnprotectedOutputFolder and -TrustedOutputPrincipal); a tracking row's OutputCertFile must resolve beneath the tracking folder or -OutputFolder; an issued certificate that cannot be delivered gets the new Undelivered status (never resubmitted); values that reach the certreq command line are validated; concurrent runs on one tracking file are refused (exclusive <TrackingFile>.lock) and the tracking file is replaced via a unique temp file; cmdlets inside an approved action no longer raise their own -Confirm prompts
 1.0.1 - Retrieve mode honours an explicit -OutputFolder (previously the path recorded at submit time was always used)
 1.0.0 - Initial release
@@ -61,13 +62,20 @@
     Administrators, TrustedInstaller, the running account, its Domain/Enterprise Admins and
     -TrustedOutputPrincipal - because such a user could swap the folder for a junction (or, with
     mere write-data / write-attributes rights, turn an empty folder into one in place) while a
-    certificate is being delivered and redirect the privileged write. Pass this switch to accept
-    that risk (e.g. a shared drop folder whose ACL cannot be tightened); the conditions are then
-    only warned about.
+    certificate is being delivered and redirect the privileged write. The delivery folder is also
+    refused when its ACL would hand an untrusted principal write, append, delete, write-attributes
+    or re-permission rights on the FILES created inside it (an inheritable "files" entry,
+    inherit-only or not): the staging file certreq writes and the delivered certificate inherit
+    such a grant. CREATOR OWNER entries resolve to the running account and are trusted; a CREATOR
+    GROUP entry resolves to its primary group and is not (name S-1-3-1 in -TrustedOutputPrincipal
+    to accept it). Pass this
+    switch to accept those risks (e.g. a shared drop folder whose ACL cannot be tightened); the
+    conditions are then only warned about.
 
 .PARAMETER TrustedOutputPrincipal
     Additional principals (SIDs or account names, e.g. 'CONTOSO\PKI-Operators') that may own, or
-    hold delete/rename/write rights on, the folders certificates are delivered through, on top of
+    hold delete/rename/write rights on, the folders certificates are delivered through (including
+    file-inheritable write rights in the delivery folder itself), on top of
     the built-in trusted set (see -AllowUnprotectedOutputFolder). Use it when the output folders
     are managed by a dedicated operator group rather than by Administrators.
 
@@ -273,7 +281,10 @@ function Assert-CertificateOutputPath {
     # established then - unless -AllowUnprotectedOutputFolder was passed, which turns these
     # refusals into warnings. Only the create-SUBFOLDER right (FILE_APPEND_DATA, what the C:\ root
     # grants Users on itself) is tolerated: it cannot set a reparse point; what it could pre-plant
-    # is caught by the owner, reparse-point and destination-shape checks.
+    # is caught by the owner, reparse-point and destination-shape checks. The delivery folder is
+    # additionally judged on what its ACL hands to the FILES created inside it (inheritable
+    # entries, inherit-only or not): certreq's staging file and the delivered certificate inherit
+    # them, so an untrusted write/append/delete grant there is refused as well.
     Assert-ProtectedDirectoryChain -Name $Name -Directory $dir -Path $Path
 }
 
@@ -294,10 +305,14 @@ function Assert-ProtectedDirectoryChain {
             if ($script:AllowUnprotectedOutput) { Write-BatchLog "$msg (-AllowUnprotectedOutputFolder: proceeding anyway)" -Level Warning }
             else { throw "$msg Use a real folder, or pass -AllowUnprotectedOutputFolder to accept the risk." }
         }
-        $swappers = $null; $badOwner = $null
+        $swappers = $null; $badOwner = $null; $fileWriters = @()
         try {
             $swappers = @(Get-UntrustedGrant -Path $probe -Kind Swap)
             $badOwner = Get-UntrustedOwner -Path $probe
+            # The delivery folder itself is also judged on what its ACL hands to the FILES created
+            # inside it: the staging file and the delivered certificate inherit those entries
+            # (inherit-only or not), which the folder-swap check above rightly ignores.
+            if ($probe -eq $Directory) { $fileWriters = @(Get-UntrustedGrant -Path $probe -Kind File) }
         }
         catch {
             $msg = "$Name lies under '$probe', whose security descriptor could not be read ($($_.Exception.Message)), so it cannot be established that untrusted users are unable to swap it during a delivery."
@@ -313,6 +328,11 @@ function Assert-ProtectedDirectoryChain {
             $msg = "$Name lies under '$probe', which untrusted principal(s) $($swappers -join ', ') can delete, rename or write to (write-data/write-attributes rights are enough to turn an empty folder into a junction in place) - such a user could redirect it while a certificate is being delivered."
             if ($script:AllowUnprotectedOutput) { Write-BatchLog "$msg (-AllowUnprotectedOutputFolder: proceeding anyway)" -Level Warning }
             else { throw "$msg Restrict that folder's ACL to trusted principals (name additional ones with -TrustedOutputPrincipal), or pass -AllowUnprotectedOutputFolder to accept the risk." }
+        }
+        if ($fileWriters -and $fileWriters.Count) {
+            $msg = "$Name would be written in '$probe', whose ACL grants untrusted principal(s) $($fileWriters -join ', ') write, append, delete, write-attributes or re-permission rights on the FILES created inside it (an inheritable 'files' entry) - the staging file certreq writes and the delivered certificate inherit that grant, so such a user could alter the certificate's bytes, or turn the delivered file into a reparse point, before or after delivery."
+            if ($script:AllowUnprotectedOutput) { Write-BatchLog "$msg (-AllowUnprotectedOutputFolder: proceeding anyway)" -Level Warning }
+            else { throw "$msg Remove that entry from the folder's ACL (or name the principal with -TrustedOutputPrincipal), or pass -AllowUnprotectedOutputFolder to accept the risk." }
         }
         $probe = [System.IO.Path]::GetDirectoryName($probe)   # $null at the volume root (C:\) or the share root (\\server\share)
     }
@@ -386,16 +406,38 @@ function Get-UntrustedGrant {
     #           on itself. It cannot set a reparse point or remove anything; what it can plant
     #           (a new subfolder) is caught by the owner and reparse-point checks and by the
     #           no-overwrite delivery rename, so it is only reported.
-    # Generic access bits are included because generic ACEs carry them. Inherit-only ACEs (the
-    # "subfolders and files only" entries the C:\ root carries) do not apply to the folder itself
-    # and are skipped - the folders they propagate to are judged on their own ACLs. An ACL that
-    # cannot be read is a terminating error: the caller must treat "unknown" as unprotected.
+    #   File    what the folder's ACL hands to the FILES created inside it - judged on the DELIVERY
+    #           folder only. Every ACE carrying ObjectInherit is considered, inherit-only or not
+    #           (an inherit-only "files only" entry is exactly what the Swap check must ignore),
+    #           against the file write-class: write-data, append-data, delete, change permissions,
+    #           take ownership, write-attributes, GENERIC_WRITE/ALL. certreq's staging file and the
+    #           delivered certificate inherit such an entry, so an untrusted principal holding one
+    #           could alter or replace the certificate's bytes once certreq has closed the file -
+    #           before delivery or after it - with every folder on the chain fully protected.
+    #           Write-attributes is included because FSCTL_SET_REPARSE_POINT accepts a FILE handle
+    #           opened with FILE_WRITE_ATTRIBUTES alone, which would let such a user turn the
+    #           delivered certificate into a reparse point after the plain-file post-condition.
+    #           The inheritance placeholders are resolved the way the file system resolves them:
+    #           CREATOR OWNER (S-1-3-0) and OWNER RIGHTS (S-1-3-4) become the creating account -
+    #           the trusted running account, since certreq creates the file - so they are skipped
+    #           (the C:\ root hands every unprotected folder an inherit-only CREATOR OWNER Full
+    #           Control entry); CREATOR GROUP (S-1-3-1) becomes the running account's primary
+    #           group, which can be as broad as Domain Users, so it stays untrusted unless named
+    #           in -TrustedOutputPrincipal.
+    # Generic access bits are included because generic ACEs carry them. For Swap and Create,
+    # inherit-only ACEs (the "subfolders and files only" entries the C:\ root carries) do not apply
+    # to the folder itself and are skipped - the folders they propagate to are judged on their own
+    # ACLs; File looks at precisely those entries. An ACL that cannot be read is a terminating
+    # error: the caller must treat "unknown" as unprotected.
     param(
         [Parameter(Mandatory)][string]$Path,
-        [Parameter(Mandatory)][ValidateSet('Swap', 'Create')][string]$Kind
+        [Parameter(Mandatory)][ValidateSet('Swap', 'Create', 'File')][string]$Kind
     )
     $mask = if ($Kind -eq 'Swap') {
         ([int64][System.Security.AccessControl.FileSystemRights]'Delete, DeleteSubdirectoriesAndFiles, ChangePermissions, TakeOwnership, CreateFiles, WriteAttributes') -bor 0x10000000 -bor 0x40000000   # + GENERIC_ALL, GENERIC_WRITE
+    } elseif ($Kind -eq 'File') {
+        # CreateFiles = FILE_WRITE_DATA and CreateDirectories = FILE_APPEND_DATA on a file
+        ([int64][System.Security.AccessControl.FileSystemRights]'CreateFiles, CreateDirectories, Delete, ChangePermissions, TakeOwnership, WriteAttributes') -bor 0x10000000 -bor 0x40000000   # + GENERIC_ALL, GENERIC_WRITE
     } else {
         [int64][System.Security.AccessControl.FileSystemRights]'CreateDirectories'
     }
@@ -407,11 +449,23 @@ function Get-UntrustedGrant {
     if (-not $acl) { throw "Get-Acl returned no security descriptor for '$Path'." }
     foreach ($rule in $acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])) {
         if ($rule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow) { continue }
-        if ($rule.PropagationFlags -band [System.Security.AccessControl.PropagationFlags]::InheritOnly) { continue }
+        if ($Kind -eq 'File') {
+            # Only entries that propagate to files matter; a folders-only (ContainerInherit) entry
+            # is never inherited by the staging file or the delivered certificate.
+            if (-not ($rule.InheritanceFlags -band [System.Security.AccessControl.InheritanceFlags]::ObjectInherit)) { continue }
+        }
+        elseif ($rule.PropagationFlags -band [System.Security.AccessControl.PropagationFlags]::InheritOnly) { continue }
         $sid = $rule.IdentityReference.Value
         if ($script:TrustedSids.ContainsKey($sid)) { continue }
+        # Inheritance placeholders (only meaningful in inheritable entries): CREATOR OWNER and
+        # OWNER RIGHTS resolve to the account that creates the file - the running account, which
+        # is trusted by construction. CREATOR GROUP resolves to that account's primary group and
+        # is deliberately left untrusted (fail closed); its label says what it becomes.
+        if ($sid -eq 'S-1-3-0' -or $sid -eq 'S-1-3-4') { continue }
         $rights = ([int64][int]$rule.FileSystemRights) -band 0xFFFFFFFF
-        if ($rights -band $mask) { $found += ConvertTo-PrincipalLabel -Sid $sid }
+        if ($rights -band $mask) {
+            $found += if ($sid -eq 'S-1-3-1') { "CREATOR GROUP ($sid, resolves to the running account's primary group)" } else { ConvertTo-PrincipalLabel -Sid $sid }
+        }
     }
     @($found | Sort-Object -Unique)
 }
