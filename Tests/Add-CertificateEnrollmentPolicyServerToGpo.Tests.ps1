@@ -148,6 +148,21 @@ Describe 'Add-CertificateEnrollmentPolicyServerToGpo' {
             $full = @{ URL = $url; PolicyID = '241064013'; FriendlyName = 'Example'; Flags = [uint32]0x14; AuthFlags = [uint32]2; Cost = [uint32]0x7FFFFFFD }
             Test-PolEntryUsable $full $url '241064013' | Should -BeTrue
             Test-PolEntryUsable @{ URL = $url; PolicyID = '241064013' } $url '241064013' | Should -BeFalse -Because 'URL and PolicyID are written first; a run interrupted after them leaves a row no client can use'
+            # An EMPTY URL or PolicyID must be rejected even when the caller passes that same empty
+            # value as the expected one (the root-Flags gate does exactly this for arbitrary siblings):
+            # an otherwise-complete row with no PolicyID is not a usable server.
+            $noPid = $full.Clone(); $noPid['PolicyID'] = ''
+            Test-PolEntryUsable $noPid $url '' | Should -BeFalse -Because 'empty PolicyID must not pass the empty-equals-empty comparison'
+            $noUrl = $full.Clone(); $noUrl['URL'] = ''
+            Test-PolEntryUsable $noUrl '' '241064013' | Should -BeFalse -Because 'empty URL must not pass'
+            # URL/PolicyID/FriendlyName must be REG_SZ: a PolicyID decoded as a DWORD (uint32) stringifies
+            # to a matching value but is not the string a client reads, so it is not a usable server.
+            $dwordPid = $full.Clone(); $dwordPid['PolicyID'] = [uint32]241064013
+            Test-PolEntryUsable $dwordPid '241064013' '241064013' | Should -BeFalse -Because 'a REG_DWORD PolicyID is not the REG_SZ a client reads'
+            $dwordFn = $full.Clone(); $dwordFn['FriendlyName'] = [uint32]1
+            Test-PolEntryUsable $dwordFn $url '241064013' | Should -BeFalse
+            $dwordUrl = $full.Clone(); $dwordUrl['URL'] = [uint32]1
+            Test-PolEntryUsable $dwordUrl 1 '241064013' | Should -BeFalse
             foreach ($missing in 'FriendlyName', 'Flags', 'AuthFlags', 'Cost') {
                 $h = $full.Clone(); $h.Remove($missing)
                 Test-PolEntryUsable $h $url '241064013' | Should -BeFalse -Because "$missing is required"

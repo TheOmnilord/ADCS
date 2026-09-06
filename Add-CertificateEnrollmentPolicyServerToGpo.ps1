@@ -1,11 +1,13 @@
 <#PSScriptInfo
-.VERSION 1.0.5
+.VERSION 1.0.6
 .GUID 54763db6-2359-401f-8960-ef0de5911aaf
 .AUTHOR Sveinung Svea
 .PROJECTURI https://github.com/TheOmnilord/ADCS
 .LICENSEURI https://github.com/TheOmnilord/ADCS/blob/main/LICENSE
 .TAGS ADCS PKI CertificateServices
 .RELEASENOTES
+1.0.6 - The root-Flags gate recognises any pre-existing USABLE policy-server entry (a complete row - URL, PolicyID, FriendlyName and numeric Flags/AuthFlags/Cost - not an incomplete fragment) in the scope, not only the requested CEP entry and the AD row: a declined requested entry no longer wrongly blocks a legitimate root-Flags change when another working server exists, while an incomplete fragment cannot make clearing 0x2 activate a zero-server list
+1.0.5 - Root Flags are no longer written when no usable policy-server entry exists in scope (the CEP entry declined AND no AD Enrollment Policy row): writing PolicyServers root values there activated GP CEP configuration with zero servers, so clients lost the AD enrollment policy fleet-wide; the Auto-Enrollment write is now verified (Test-GpoEntry) and its key is included in the deletion-order damage scan (a **delvals. ordered after the AE values previously defeated autoenrollment silently while the run reported applied=True)
 1.0.4 - The gates that let the (Default) marker be set and -ReplaceExisting delete siblings now require the replacing entry to be complete in BOTH the live GPMC view and the EFFECTIVE registry.pol replay (a row whose authored values a later deletion record wipes was accepted from the GPMC view alone); a freshly written AD row or CEP entry must also show in the replay, else the run fails; the GPO mutation cmdlets pass -Confirm:$false inside approved actions and a removal or marker clear is verified from registry.pol before it is reported (a declined nested prompt reported a removal that never happened)
 1.0.3 - Help text only: -ReplaceExisting documents the complete-row requirement; no code change
 1.0.2 - A **-prefixed registry.pol instruction (**DeleteKeys, **DeleteValues, **del., **delvals.) decodes its data as a string whatever its type field says (**soft.<name> keeps its declared type, since it writes a value), as the Group Policy engine does (a **DeleteKeys typed REG_BINARY previously decoded to no data and deleted nothing in the model, so a deleted entry could be reported as present); a pre-existing AD-policy row or CEP entry counts as complete only with URL, PolicyID, FriendlyName and numeric Flags/AuthFlags/Cost present (URL + PolicyID alone is what an interrupted write leaves), for the prerequisite, the (Default) marker and -ReplaceExisting alike
@@ -466,8 +468,18 @@ function Test-PolEntryUsable([hashtable]$Values, [string]$ExpectUrl, [string]$Ex
     # AD-row prerequisite nor the "an entry for this URL exists" gate that lets the (Default)
     # marker be set and -ReplaceExisting delete the working siblings.
     if (-not $Values) { return $false }
+    # A usable row must actually HAVE a URL and PolicyID: an empty one is not a server a client can
+    # reach. Checked independently of the expected values, because a caller that passes the row's own
+    # (empty) URL/PolicyID as the expected would otherwise pass the empty-equals-empty comparison.
+    if (-not "$($Values['URL'])" -or -not "$($Values['PolicyID'])") { return $false }
     if ("$($Values['URL'])" -ne $ExpectUrl -or "$($Values['PolicyID'])" -ne "$ExpectPolicyId") { return $false }
-    if (-not $Values.ContainsKey('FriendlyName') -or $null -eq $Values['FriendlyName']) { return $false }
+    # URL, PolicyID and FriendlyName must be REG_SZ. Get-PolEffectiveValues decodes a REG_DWORD to a
+    # number, so a PolicyID stored as a DWORD stringifies to a matching value but is NOT the REG_SZ a
+    # client reads - it is not a usable server row. (This also covers a missing FriendlyName: $null is
+    # not a string.)
+    foreach ($s in 'URL', 'PolicyID', 'FriendlyName') {
+        if (-not ($Values[$s] -is [string])) { return $false }
+    }
     foreach ($n in 'Flags', 'AuthFlags', 'Cost') {
         # registry.pol yields UInt32; Get-GPRegistryValue yields a signed Int32 (Cost 0xFFFFFFFF
         # reads as -1). Both are the DWORD the client needs; a REG_SZ - even one that spells a
@@ -773,10 +785,21 @@ $entryExists = $entryApplied -or $WhatIfPreference -or (Test-EntryComplete $preR
 # AND there is no AD Enrollment Policy row) publishes "PolicyServers configured, zero servers",
 # which by this script's own client model makes clients treat GP CEP as present and stop falling
 # back to the built-in AD enrollment policy - the fleet-wide outage the AD-row ordering exists to
-# prevent. So the root Flags write is gated on a real entry being present (the CEP entry just
-# written or already complete, or the AD row written/already present). -SkipADPolicy alone does
-# NOT satisfy this: it means the AD row was deliberately omitted, not that a server exists.
-$policyServerPresent = $entryExists -or $adRowPresent -or ($adRow -eq 'applied')
+# prevent. So the root Flags write is gated on a real entry being present: the requested CEP entry
+# (just written or already complete), the AD row (written or already present), OR any OTHER
+# pre-existing USABLE policy-server entry in this scope - so a declined requested entry does not
+# wrongly block a root-Flags change (e.g. -EnableUserConfigured) when another working server exists,
+# while an incomplete fragment (a subkey with only, say, FriendlyName) does NOT count, so clearing
+# 0x2 cannot activate a list of zero usable servers. Usable = a complete row (URL, PolicyID,
+# FriendlyName and numeric Flags/AuthFlags/Cost), the same bar Test-PolEntryUsable enforces.
+# -SkipADPolicy alone does NOT satisfy this: it means the AD row was deliberately omitted.
+$anyUsableServer = $false
+foreach ($e in @(Get-PolEntries $preRecs)) {
+    if (-not "$($e.URL)") { continue }
+    $vals = (Get-PolEffectiveValues $preRecs "$relBase\$($e.Key)").Values
+    if (Test-PolEntryUsable $vals "$($e.URL)" "$($e.PolicyID)") { $anyUsableServer = $true; break }
+}
+$policyServerPresent = $entryExists -or ($adRow -eq 'applied') -or $anyUsableServer
 
 # ---- 3. root Flags (DISABLE bits; existing bits preserved; bit-safe for high-bit values) ---
 $existingRoot = Get-PolValue $preRecs $relBase 'Flags'

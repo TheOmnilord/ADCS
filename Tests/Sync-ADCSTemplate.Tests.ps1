@@ -68,7 +68,7 @@ Describe 'Sync-ADCSTemplate' {
         # (The script has a mandatory -Mode and runs main logic on load, so it cannot be dot-sourced
         # wholesale; extracting the function definitions gives their real bodies with no side effects.)
         $ast = [System.Management.Automation.Language.Parser]::ParseFile($script:Sync, [ref]$null, [ref]$null)
-        foreach ($name in 'Get-RandomHex', 'ConvertTo-LdapFilterValue', 'New-SyntheticOidBase', 'Get-AttrCanonical', 'Compare-TemplateAttributes', 'Convert-ToLatestCompatibility', 'ConvertTo-ImportAttributeValue') {
+        foreach ($name in 'Get-RandomHex', 'ConvertTo-LdapFilterValue', 'New-SyntheticOidBase', 'Get-AttrCanonical', 'Compare-TemplateAttributes', 'Convert-ToLatestCompatibility', 'ConvertTo-ImportAttributeValue', 'Get-LinkedIssuancePolicy') {
             $def = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name }, $false)
             if ($def) { . ([scriptblock]::Create($def[0].Extent.Text)) }
         }
@@ -209,9 +209,11 @@ Describe 'Sync-ADCSTemplate' {
             # A giant or non-finite JSON number overflows the [decimal] cast; it must still be
             # refused with the ATTRIBUTE-NAMED message (a bare cast threw a raw ".NET cannot convert"
             # error that did not name the attribute), on both 5.1 and 7.
-            foreach ($bad in @(0.4, '5', 'abc', $true, @(1, 2), 4294967296, 1e40, ([double]::PositiveInfinity), ([double]::NaN))) {
+            # 1e-30 is the DECIMAL-UNDERFLOW case: [decimal]1e-30 is 0, so a post-cast integer check
+            # would silently coerce this malformed value to 0. It must be refused, not coerced.
+            foreach ($bad in @(0.4, '5', 'abc', $true, @(1, 2), 4294967296, 1e40, 1e-30, 5e-28, ([double]::PositiveInfinity), ([double]::NaN))) {
                 { ConvertTo-ImportAttributeValue -Name 'msPKI-RA-Signature' -Value $bad } |
-                    Should -Throw -ExpectedMessage '*Import refused*msPKI-RA-Signature*' -Because "'$bad' must be refused with the attribute named (a bare cast dropped, coerced, or threw an un-attributed error)"
+                    Should -Throw -ExpectedMessage '*Import refused*msPKI-RA-Signature*' -Because "'$bad' must be refused with the attribute named (a bare cast dropped, coerced, underflowed, or threw an un-attributed error)"
             }
             { ConvertTo-ImportAttributeValue -Name 'msPKI-RA-Signature' -Value @() }   | Should -Throw -ExpectedMessage '*Import refused*'
             { ConvertTo-ImportAttributeValue -Name 'msPKI-RA-Signature' -Value $null } | Should -Throw -ExpectedMessage '*Import refused*'
@@ -228,6 +230,8 @@ Describe 'Sync-ADCSTemplate' {
             { ConvertTo-ImportAttributeValue -Name 'pKIKeyUsage' -Value @(1, 2, 3) }     | Should -Throw -ExpectedMessage '*Import refused*'
             { ConvertTo-ImportAttributeValue -Name 'pKIExpirationPeriod' -Value @(0, 64, 57, 135, 46, 225, 254, 256) }  | Should -Throw -ExpectedMessage '*not a byte*'
             { ConvertTo-ImportAttributeValue -Name 'pKIExpirationPeriod' -Value @(0, 64, 57, 135, 46, 225, 254, 'ff') } | Should -Throw -ExpectedMessage '*not a byte*'
+            # decimal-underflow element: [decimal]1e-30 is 0, so this must be refused, not coerced to a 0 byte
+            { ConvertTo-ImportAttributeValue -Name 'pKIExpirationPeriod' -Value @(0, 64, 57, 135, 46, 225, 254, 1e-30) } | Should -Throw -ExpectedMessage '*not a byte*'
             { ConvertTo-ImportAttributeValue -Name 'pKIExpirationPeriod' -Value 'AEA5hy7h/v8=' } | Should -Throw -ExpectedMessage '*got a string*'
         }
 
@@ -336,6 +340,30 @@ Describe 'Sync-ADCSTemplate' {
             $r = Convert-ToLatestCompatibility -Attributes $a
             $r.Upgraded | Should -BeFalse
             $a['msPKI-Private-Key-Flag'] | Should -Be 0x06060100
+        }
+
+        It 'Get-LinkedIssuancePolicy scans only msPKI-Certificate-Policy (issued-cert policy), not msPKI-RA-Policies (signing-cert requirement)' {
+            # An OID only in msPKI-RA-Policies yields NO AMA candidates, so the function returns before
+            # touching AD (the empty-OID early return) - a stub -ADParams is never dereferenced. This
+            # proves msPKI-RA-Policies is excluded: those policies constrain the enrollment-agent
+            # signing certificate, they are not stamped into the issued cert, so an AMA link on one
+            # grants the enrollee nothing and must not refuse the import.
+            Get-LinkedIssuancePolicy -Attributes @{ 'msPKI-RA-Policies' = @('1.3.6.1.4.1.311.10.3.10') } -ConfigNC 'DC=x' -ADParams @{} | Should -BeNullOrEmpty
+            Get-LinkedIssuancePolicy -Attributes @{} -ConfigNC 'DC=x' -ADParams @{} | Should -BeNullOrEmpty
+            Get-LinkedIssuancePolicy -Attributes @{ 'msPKI-Certificate-Policy' = $null } -ConfigNC 'DC=x' -ADParams @{} | Should -BeNullOrEmpty
+        }
+
+        It 'Convert-ToLatestCompatibility: a minor revision at Int32.MaxValue is refused ATOMICALLY (no half-upgrade)' {
+            # Incrementing Int32.MaxValue overflowed the [Int32] cast; the old order set schema/flags
+            # first, so the template was left half-upgraded (v4 schema, un-bumped revision) and still
+            # reported Upgraded. Now the overflow throws before ANY attribute is mutated.
+            $a = @{ 'msPKI-Template-Schema-Version' = [int]2; 'msPKI-Private-Key-Flag' = [int]0
+                    'flags' = [BitConverter]::ToInt32([BitConverter]::GetBytes([uint32]0x10000), 0)
+                    'msPKI-Template-Minor-Revision' = [int]::MaxValue }
+            { Convert-ToLatestCompatibility -Attributes $a } | Should -Throw -ExpectedMessage '*Int32.MaxValue*'
+            $a['msPKI-Template-Schema-Version']   | Should -Be 2      -Because 'nothing may be mutated when the revision cannot be incremented'
+            $a['msPKI-Private-Key-Flag']          | Should -Be 0
+            $a['msPKI-Template-Minor-Revision']   | Should -Be ([int]::MaxValue)
         }
     }
 

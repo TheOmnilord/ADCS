@@ -8,6 +8,35 @@ Each script also carries its own version in the `PSScriptInfo` header at the top
 Test-ScriptFileInfo .\Submit-CertificateRequests.ps1 | Select-Object Name, Version
 ```
 
+## [1.0.7] — 2026-09-06
+
+An iterative Codex/Astra (gpt-6-astra, high effort) adversarial review of the v1.0.6 fixes — capped at seven rounds and run until a round confirmed convergence (an explicit *approve* with no remaining reachable defect). Each round re-scanned the whole working-tree diff; every finding was verified against the code, and reproduced on both PowerShell 5.1 and 7 where applicable, before fixing.
+
+### Fixed
+- **Add-CertificateEnrollmentPolicyServerOffline.ps1 → 1.0.6**
+  - **(P1)** `Write-CepEntry` now validates the specific key it writes (`Assert-ProtectedRegistryPath`). The up-front preflight only checked the HTTP CEP entry's path; the AD Enrollment Policy row is a *sibling* leaf, so a delegated or symlinked AD-row key took the privileged write unchecked.
+  - The root-Flags gate recognises any pre-existing USABLE policy-server entry (a complete row, not an incomplete fragment) in the location, not only the requested entry and the AD row, so a declined requested entry no longer blocks a legitimate change when another working server exists while a fragment cannot make clearing `0x2` activate a zero-server list.
+  - The `-ReplaceExisting` sibling cleanup validates each sibling's registry path (`Assert-ProtectedRegistryPath`) before reading or removing it, so a sibling that is a registry symbolic link cannot make the recursive delete destroy a key in another location.
+  - `-Remove` and `-ReplaceExisting` refuse to recursively delete a CEP entry that has subkeys (an entry is a leaf by design): on 5.1 .NET opens descendants without `REG_OPTION_OPEN_LINK`, so a recursive delete could otherwise follow a registry symbolic link planted beneath a delegated descendant into another location.
+  - **(P1)** `Assert-ProtectedRegistryPath` decides each component's existence with a native `REG_OPTION_OPEN_LINK` probe instead of `Test-Path`. The provider follows a symbolic link to its target, so a *dangling* link (target absent) read as not-found and let the walk `break` before the link/owner/ACL checks — after which the link could be retargeted at a protected key and take the run's privileged write. The native probe sees the link object itself, so the link falls through to the check that rejects it; the probe fails closed on any error other than a genuine `ERROR_FILE_NOT_FOUND`.
+- **Submit-CertificateRequests.ps1 → 1.0.8**
+  - **(P1)** `Get-DestinationOwnerConflict` skips only the *same row* (reference identity), not every row sharing the RequestID number. RequestIDs are per CA, so a different CA's request with the same number is a different request that can share the destination and must still be considered.
+  - SubmitTime is compared as `DateTimeOffset` (instants), not local `DateTime`: across the DST fall-back hour a local comparison reversed the order (an earlier wall-clock time with the summer offset is a later instant than a later wall-clock time with the winter offset), which could let an older request overwrite a newer certificate.
+- **Sync-ADCSTemplate.ps1 → 1.0.6**
+  - `ConvertTo-ImportAttributeValue` checks integrality and range in the value's own numeric type *before* any `[decimal]` cast: a tiny double (`1e-30`) cast to decimal underflows to `0` and was silently coerced to `0` (integer and byte-element branches) — the coercion this validation exists to prevent.
+  - `Convert-ToLatestCompatibility` computes and validates every replacement value — including the minor-revision increment, which now throws on `Int32.MaxValue` overflow — *before* mutating `$Attributes`, so a failure no longer leaves a template half-upgraded (v4 schema/flags with an un-bumped revision) while still reporting `Upgraded`.
+  - The Authentication Mechanism Assurance import guard (`Get-LinkedIssuancePolicy`) scans **only** `msPKI-Certificate-Policy` — the issuance policies stamped into the *issued* certificate, which is what AMA maps to a group at logon — no longer `msPKI-RA-Policies`, which constrains the enrollment-agent *signing* certificate and is never stamped into the issued cert. The over-broad scan falsely refused a template that merely requires a signing-cert application policy. Help and README updated to match.
+- **Add-CertificateEnrollmentPolicyServerToGpo.ps1 → 1.0.6** — the root-Flags gate recognises any pre-existing USABLE policy-server entry (a complete row, not a fragment) in the GPO scope (`Get-PolEntries` + `Test-PolEntryUsable`), not only the requested entry and the AD row (as for the Offline script).
+- Tests: decimal-underflow cases for the integer and byte converter branches; the atomic revision-overflow refusal; cross-CA same-RequestID and DST-instant cases for the destination-owner check; and a Lab test that a *dangling* registry symbolic link — which `Test-Path` reports as absent — is now caught by `Assert-ProtectedRegistryPath`.
+
+| Script | Version |
+|---|---|
+| Set-ADCSTemplateValidity.ps1 | **1.0.4** |
+| Submit-CertificateRequests.ps1 | **1.0.8** |
+| Sync-ADCSTemplate.ps1 | **1.0.6** |
+| Add-CertificateEnrollmentPolicyServerOffline.ps1 | **1.0.6** |
+| Add-CertificateEnrollmentPolicyServerToGpo.ps1 | **1.0.6** |
+
 ## [1.0.6] — 2026-09-06
 
 Two adversarial review rounds after v1.0.5 — a Codex/gpt-6-astra full-repository review, then a thorough Claude review (13 finders with 3-refuter verification). Every finding was verified against the code before fixing.
@@ -190,6 +219,7 @@ Initial release.
 | Add-CertificateEnrollmentPolicyServerOffline.ps1 | 1.0.0 |
 | Add-CertificateEnrollmentPolicyServerToGpo.ps1 | 1.0.0 |
 
+[1.0.7]: https://github.com/TheOmnilord/ADCS/compare/v1.0.6...v1.0.7
 [1.0.6]: https://github.com/TheOmnilord/ADCS/compare/v1.0.5...v1.0.6
 [1.0.5]: https://github.com/TheOmnilord/ADCS/compare/v1.0.4...v1.0.5
 [1.0.4]: https://github.com/TheOmnilord/ADCS/compare/v1.0.3...v1.0.4

@@ -1,11 +1,13 @@
 <#PSScriptInfo
-.VERSION 1.0.5
+.VERSION 1.0.6
 .GUID 61adf5d1-6eb5-4f41-8670-e9da72134570
 .AUTHOR Sveinung Svea
 .PROJECTURI https://github.com/TheOmnilord/ADCS
 .LICENSEURI https://github.com/TheOmnilord/ADCS/blob/main/LICENSE
 .TAGS ADCS PKI CertificateServices
 .RELEASENOTES
+1.0.6 - Write-CepEntry validates the specific key it writes (Assert-ProtectedRegistryPath), so the AD Enrollment Policy row - a sibling leaf of the CEP entry - is no longer written to a delegated or symlinked key that escaped the up-front preflight of the CEP entry alone; the root-Flags gate recognises any pre-existing USABLE policy-server entry (a complete row, not an incomplete fragment) in the location, not only the requested entry and the AD row; the -ReplaceExisting sibling cleanup validates each sibling's registry path before reading or removing it, so a sibling that is a symbolic link cannot make the recursive delete destroy a key in another location; -Remove and -ReplaceExisting refuse to recursively delete a CEP entry that has subkeys (a CEP entry is a leaf by design), closing a path where a recursive delete could follow a registry symbolic link planted beneath a delegated descendant; Assert-ProtectedRegistryPath decides each component's existence with a native REG_OPTION_OPEN_LINK probe instead of Test-Path, so a DANGLING symbolic link (target absent, which Test-Path reports as not-found) can no longer let the walk break before the link check and leave the link to be retargeted at a protected key before the write
+1.0.5 - Root Flags are no longer written when no usable policy-server entry exists in a GP location (the CEP entry declined AND no AD Enrollment Policy row): writing PolicyServers root values there activated GP CEP configuration with no server, so clients lost the AD enrollment policy
 1.0.4 - Every existing key on the target path is checked before any write: a registry symbolic link, an untrusted owner or write-class rights for an untrusted principal refuse the run (a link planted where PolicyServers did not exist yet would have carried an elevated first-time write to whatever key it pointed at); string values and the (Default) marker are written as REG_SZ explicitly and every value's KIND is verified (Set-ItemProperty kept an existing wrong kind and the string compare accepted it; a REG_SZ root Flags with the right number is now repaired to a DWORD); the cmdlets inside an approved action pass -Confirm:$false and a removal is verified before it is reported (a declined nested Remove-Item prompt reported a removal that never happened and could clear the marker of an entry that still existed)
 1.0.3 - Help text only: -ReplaceExisting documents the complete-row requirement; no code change
 1.0.2 - A pre-existing AD-policy row or CEP entry counts as complete only with URL, PolicyID, FriendlyName and DWORD Flags/AuthFlags/Cost present (URL + PolicyID alone is what an interrupted write leaves), for the prerequisite, the (Default) marker and -ReplaceExisting alike
@@ -293,6 +295,19 @@ function Test-RegistryKeyIsLink {
     }
     finally { [void][CepRegNative]::RegCloseKey($h) }
 }
+function Test-RegistryComponentExists {
+    # $true when a key OR a symbolic link exists at hive-relative $SubKey. Opened with
+    # REG_OPTION_OPEN_LINK (0x8) the call targets the component ITSELF, so a link is seen as present
+    # regardless of whether its target exists - unlike Test-Path, which follows the link and reports a
+    # DANGLING link (target absent) as 'not found'. Fails closed on any error other than a genuine
+    # ERROR_FILE_NOT_FOUND so an unreadable component is never mistaken for an absent one.
+    param([IntPtr]$HiveHandle, [string]$SubKey)
+    $h = [IntPtr]::Zero
+    $rc = [CepRegNative]::RegOpenKeyExW($HiveHandle, $SubKey, 0x8, 0x1, [ref]$h)   # REG_OPTION_OPEN_LINK | KEY_QUERY_VALUE
+    if ($rc -eq 0) { [void][CepRegNative]::RegCloseKey($h); return $true }
+    if ($rc -eq 2) { return $false }   # ERROR_FILE_NOT_FOUND: truly absent
+    throw "Registry key '$SubKey' could not be probed for existence (Win32 error $rc)."
+}
 function Assert-ProtectedRegistryPath {
     param([string]$Path)   # HKLM:\... or HKCU:\...; every EXISTING component is checked, root first
     $isCU = $Path -like 'HKCU:*'
@@ -312,7 +327,12 @@ function Assert-ProtectedRegistryPath {
     foreach ($p in @(($Path -replace '^HK(CU|LM):\\?', '') -split '\\' | Where-Object { $_ })) {
         $sub = if ($sub) { "$sub\$p" } else { $p }
         $full = "$hivePrefix\$sub"
-        if (-not (Test-Path -LiteralPath $full)) { break }   # the rest does not exist yet: this run creates it under the parent just checked
+        # Decide existence with the native link-aware open, NOT Test-Path: the provider follows a
+        # symbolic link to its target, so a DANGLING link (target absent) reads as 'not found' and would
+        # let the loop break before the link/owner/ACL checks below - after which the link could be
+        # retargeted at a protected key and take this run's privileged write. The native probe opens the
+        # component itself, so a link is seen as present and falls through to the link check that rejects it.
+        if (-not (Test-RegistryComponentExists -HiveHandle $hiveHandle -SubKey $sub)) { break }   # the rest does not exist yet: this run creates it under the parent just checked
         if (Test-RegistryKeyIsLink -HiveHandle $hiveHandle -SubKey $sub) {
             throw "Refusing to write: registry key '$full' is a SYMBOLIC LINK. A link on the path would carry this run's privileged writes to whatever key it points at. Remove the link (and find out who planted it) before rerunning."
         }
@@ -364,6 +384,12 @@ function Get-RootFlagsDisplay {
 }
 function Write-CepEntry {
     param([string]$EntryPath, [hashtable]$Strings, [hashtable]$Dwords)
+    # Validate the specific key being written here, not just the shared ancestor chain checked once
+    # up front for the HTTP CEP entry. The AD Enrollment Policy row is a SIBLING leaf ($hive\<AD_KEY>)
+    # of that entry, so a delegated or symlinked AD_KEY key would otherwise take this privileged write
+    # unchecked. Assert-ProtectedRegistryPath walks from the hive root to the deepest existing
+    # component of $EntryPath, so it covers both the entry and the AD row.
+    Assert-ProtectedRegistryPath -Path $EntryPath
     if (-not (Test-Path -LiteralPath $EntryPath)) {
         $parent = Split-Path -Path $EntryPath -Parent
         if (-not (Test-Path -LiteralPath $parent)) { New-Item -Path $parent -Force -Confirm:$false | Out-Null }  # -Force only creates missing parents here (guarded)
@@ -405,6 +431,13 @@ if ($PSCmdlet.ParameterSetName -eq 'Remove') {
             # -Confirm:$false: the script's own prompt above IS the approval. A nested Remove-Item
             # prompt that the operator declined returned normally, and this run then reported a
             # removal that never happened - and cleared the marker of an entry that still existed.
+            # A CEP entry is a LEAF (only values). Refuse a recursive delete of one that has subkeys:
+            # Assert-ProtectedRegistryPath validated the entry and its ancestors, but a recursive
+            # Remove-Item descends into subkeys too, and on 5.1 .NET opens descendants WITHOUT
+            # REG_OPTION_OPEN_LINK - so a registry link planted beneath a delegated descendant would be
+            # followed and the link target's subkeys deleted. An entry with subkeys is anomalous.
+            $tk = Get-Item -LiteralPath $target -ErrorAction SilentlyContinue
+            if ($tk -and $tk.SubKeyCount -gt 0) { throw "Refusing to remove ${target}: a CEP entry is a leaf key, but this one has $($tk.SubKeyCount) subkey(s) - a recursive delete could follow a registry symbolic link planted beneath a delegated descendant. Investigate and remove it manually." }
             try { Remove-Item -LiteralPath $target -Recurse -Force -Confirm:$false } catch { throw "Failed to remove ${target}: $_" }
             if (Test-Path -LiteralPath $target) { throw "Removal of $target did not take effect (the key still exists)." }
             $removedEntry = $true
@@ -492,9 +525,18 @@ function Test-RegEntryUsable {
     # that lets the (Default) marker be set and -ReplaceExisting delete the working siblings.
     param($Key, [string]$ExpectUrl, [string]$ExpectPolicyId)
     if (-not $Key) { return $false }
+    # A usable row must actually HAVE a URL and PolicyID: an empty one is not a server a client can
+    # reach. Checked independently of the expected values (a caller passing the row's own empty
+    # URL/PolicyID as expected would otherwise pass the empty-equals-empty comparison).
+    if (-not "$($Key.GetValue('URL'))" -or -not "$($Key.GetValue('PolicyID'))") { return $false }
     if ("$($Key.GetValue('URL'))" -ne $ExpectUrl -or "$($Key.GetValue('PolicyID'))" -ne $ExpectPolicyId) { return $false }
     $names = @($Key.GetValueNames())
-    if ($names -notcontains 'FriendlyName') { return $false }
+    # URL, PolicyID and FriendlyName must be REG_SZ (a PolicyID stored as REG_DWORD stringifies to a
+    # matching value but is not the string a client reads); Flags/AuthFlags/Cost must be REG_DWORD.
+    foreach ($s in 'URL', 'PolicyID', 'FriendlyName') {
+        if ($names -notcontains $s) { return $false }
+        if ($Key.GetValueKind($s) -ne [Microsoft.Win32.RegistryValueKind]::String) { return $false }
+    }
     foreach ($n in 'Flags', 'AuthFlags', 'Cost') {
         if ($names -notcontains $n) { return $false }
         if ($Key.GetValueKind($n) -ne [Microsoft.Win32.RegistryValueKind]::DWord) { return $false }
@@ -580,11 +622,20 @@ function Test-EntryComplete {
 }
 $entryExists = $entryApplied -or $WhatIfPreference -or (Test-EntryComplete)
 # Root Flags live under the PolicyServers key ITSELF; writing them with no usable policy-server
-# entry in this location (the CEP entry declined AND no AD Enrollment Policy row) activates GP CEP
-# configuration with no server, so clients lose the AD enrollment policy. Gate on a real entry.
-# (-SkipADPolicy alone does not count: it means the AD row was deliberately omitted, not that a
-# server exists.)
-$policyServerPresent = $entryExists -or $adRowPresent -or ($adRow -eq 'applied')
+# entry in this location (the CEP entry declined AND no AD row) activates GP CEP configuration with
+# no server, so clients lose the AD enrollment policy. Gate on a real entry: the requested CEP entry,
+# the AD row, OR any OTHER pre-existing USABLE entry in this location - so a declined requested entry
+# does not wrongly block a root-Flags change when another working server exists (that would over-
+# restrict), while an incomplete fragment (e.g. a subkey carrying only FriendlyName) does NOT count,
+# so clearing 0x2 cannot activate a list of zero usable servers. Usable = a complete row (URL,
+# PolicyID, FriendlyName and DWORD Flags/AuthFlags/Cost), the same bar Test-RegEntryUsable enforces.
+$anyUsableServer = $false
+foreach ($e in @(Get-CepEntries)) {
+    if (-not "$($e.URL)") { continue }
+    $k = Get-Item -LiteralPath "$hive\$($e.Key)" -ErrorAction SilentlyContinue
+    if ($k -and (Test-RegEntryUsable -Key $k -ExpectUrl "$($e.URL)" -ExpectPolicyId "$($e.PolicyID)")) { $anyUsableServer = $true; break }
+}
+$policyServerPresent = $entryExists -or ($adRow -eq 'applied') -or $anyUsableServer
 
 # ---- 3. root Flags (GP locations; DISABLE bits, preserved across runs) ---------------------
 if ($isGP) {
@@ -648,9 +699,26 @@ foreach ($d in $dups) {
                 $notes.Add("Superseded entry '$($d.URL)' (key $($d.Key)) NOT removed: the replacing CEP entry is no longer complete (changed or removed while the prompt was open).")
                 continue
             }
+            # Validate the sibling's registry path BEFORE reading or removing it: a sibling that is a
+            # registry SYMBOLIC LINK to a key in another location would otherwise be read through the
+            # link and then removed by Remove-Item -Recurse, which on PowerShell 7 opens the link
+            # target and deletes THROUGH it - destroying an unrelated key. Assert-ProtectedRegistryPath
+            # refuses a link (and an untrusted owner/writer); a refusal skips this sibling with a note
+            # rather than failing the whole run.
+            try { Assert-ProtectedRegistryPath -Path "$hive\$($d.Key)" }
+            catch {
+                $notes.Add("Superseded entry '$($d.URL)' (key $($d.Key)) NOT removed: its registry path failed the protection check ($($_.Exception.Message)) - it may be a symbolic link or a delegated key. Investigate and remove it manually.")
+                continue
+            }
             $sib = Get-Item -LiteralPath "$hive\$($d.Key)" -ErrorAction SilentlyContinue
             if (-not $sib -or "$($sib.GetValue('PolicyID'))" -ne "$PolicyId" -or "$($sib.GetValue('URL'))" -eq $Url) {
                 $notes.Add("Entry at key $($d.Key) NOT removed: it no longer serves PolicyID $PolicyId under a different URL (changed or removed while the prompt was open).")
+                continue
+            }
+            # As in -Remove: a CEP entry is a leaf. Refuse a recursive delete of a sibling with subkeys
+            # (a recursive Remove-Item can follow a registry link beneath a delegated descendant).
+            if ($sib.SubKeyCount -gt 0) {
+                $notes.Add("Superseded entry '$($d.URL)' (key $($d.Key)) NOT removed: it has $($sib.SubKeyCount) subkey(s) - a CEP entry is a leaf, and a recursive delete could follow a symbolic link planted beneath a delegated descendant. Investigate and remove it manually.")
                 continue
             }
             Remove-Item -LiteralPath "$hive\$($d.Key)" -Recurse -Force -Confirm:$false

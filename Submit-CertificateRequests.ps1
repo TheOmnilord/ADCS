@@ -1,11 +1,13 @@
 <#PSScriptInfo
-.VERSION 1.0.7
+.VERSION 1.0.8
 .GUID 6f98f16e-0c56-4a72-ba31-443938175c06
 .AUTHOR Sveinung Svea
 .PROJECTURI https://github.com/TheOmnilord/ADCS
 .LICENSEURI https://github.com/TheOmnilord/ADCS/blob/main/LICENSE
 .TAGS ADCS PKI CertificateServices
 .RELEASENOTES
+1.0.8 - Get-DestinationOwnerConflict skips only the SAME row by reference identity, not every row sharing the RequestID number (RequestIDs are per CA, so a different CA's request with the same number is a different request that can share the destination and must still be considered); SubmitTime is parsed and compared as DateTimeOffset (instants) instead of local DateTime, which reversed ordering across the DST fall-back hour
+1.0.7 - Get-RequestFiles reads the drop folder with -LiteralPath and an EXACT-extension filter (a folder named e.g. CSR[prod] was globbed as a character class and matched nothing, exiting 0 with work undone; -Filter '*.req' also matched longer extensions like .reqbak/.request, submitting stray backups); Export-TrackingData writes the checkpoint and Remove-RspFile removes the .rsp with -LiteralPath (a tracking path or request name with [ ] lost the RequestID or left the .rsp behind); certreq stdout/stderr are read with -Encoding Oem (default was ANSI on 5.1 but UTF-8 on 7, so the persisted ErrorMessage differed and was lossy on 7); Get-DestinationOwnerConflict is directional on SubmitTime (a -Force renewal that goes Pending can be retrieved) and guards its System.IO.Path calls (an invalid path char threw on 5.1 and aborted the batch); -Mode Retrieve computes the redirected destination and stamps a legacy row's CAConfig only inside the approved ShouldProcess branch, so a declined row stays byte-identical
 1.0.6 - -Mode Retrieve refuses to deliver a request whose destination already holds the certificate of a DIFFERENT request (Issued/Undelivered) for the same request file - the older of two requests for one CSR (a -Force resubmission after a pending first request) previously replaced the newer, already delivered certificate while that row kept saying Issued; the row is skipped, counted as needing attention and reported; -Force resubmission of an unresolved request warns about it
 1.0.5 - Help text only: the notes document the CAConfig column and the CA check on Retrieve, up-front unique certificate names, the Unknown-without-RequestID rule and the non-zero exit on failed or attention-needing rows; no code change
 1.0.4 - Certificate file names are allocated up front and must be unique within the batch and against the destinations already recorded for other request files (prod.req / prod.csr / prod.req.txt no longer map two requests onto one .cer); the tracking file is read with -LiteralPath (a name with [ ] was reported absent and its whole history resubmitted); a nonexistent or non-folder -InputPath is a terminating error instead of an empty batch; every row records the CA it was submitted to (CAConfig) and -Mode Retrieve refuses rows submitted to a different CA; a submission certreq reports as successful but whose reply yields neither a RequestID nor a certificate is recorded as Unknown and never resubmitted automatically; a run with failed or attention-needing rows ends with a terminating error (non-zero exit); log messages fold CR/LF and control characters so a tracking field cannot forge log lines; Export-Csv column loss with mixed old/new rows prevented
@@ -846,14 +848,20 @@ function Get-DestinationOwnerConflict {
     if (-not $dest) { return $null }
     $destFull = try { [System.IO.Path]::GetFullPath($dest) } catch { $dest }
     foreach ($row in @($Tracking | Where-Object { $_ })) {
-        if ("$($row.RequestID)" -eq "$($Record.RequestID)") { continue }
+        # Skip only THIS SAME row (reference identity), not every row sharing the RequestID number:
+        # RequestIDs are per CA, so a DIFFERENT CA's request with the same number is a different
+        # request that can legitimately share this destination, and it must still be considered.
+        if ([object]::ReferenceEquals($row, $Record)) { continue }
         if ($row.Status -notin 'Issued', 'Undelivered') { continue }
-        # Owner only when the other row's SubmitTime is strictly greater (newer). When both parse and
-        # the other is not strictly newer, it is not an owner - skip it. Missing/unparseable falls
-        # through to the path check and refuses (fail closed).
-        $tThis = [datetime]::MinValue; $tOther = [datetime]::MinValue
-        $okThis  = [datetime]::TryParse("$($Record.SubmitTime)", [ref]$tThis)
-        $okOther = [datetime]::TryParse("$($row.SubmitTime)", [ref]$tOther)
+        # Owner only when the other row's SubmitTime is strictly greater (newer). Parsed as
+        # DateTimeOffset and compared as INSTANTS: a local DateTime comparison reverses order across
+        # the DST fall-back hour (an earlier wall-clock time with the summer offset is a later
+        # instant than a later wall-clock time with the winter offset). When both parse and the other
+        # is not strictly newer, it is not an owner - skip it. Missing/unparseable falls through to
+        # the path check and refuses (fail closed).
+        $tThis = [datetimeoffset]::MinValue; $tOther = [datetimeoffset]::MinValue
+        $okThis  = [datetimeoffset]::TryParse("$($Record.SubmitTime)", [ref]$tThis)
+        $okOther = [datetimeoffset]::TryParse("$($row.SubmitTime)", [ref]$tOther)
         if ($okThis -and $okOther -and $tOther -le $tThis) { continue }
         $other = "$($row.OutputCertFile)"
         if (-not $other) { continue }

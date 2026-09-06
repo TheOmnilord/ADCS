@@ -1,11 +1,13 @@
 <#PSScriptInfo
-.VERSION 1.0.5
+.VERSION 1.0.6
 .GUID 689db74d-e668-410a-9a62-0b208179a369
 .AUTHOR Sveinung Svea
 .PROJECTURI https://github.com/TheOmnilord/ADCS
 .LICENSEURI https://github.com/TheOmnilord/ADCS/blob/main/LICENSE
 .TAGS ADCS PKI CertificateServices
 .RELEASENOTES
+1.0.6 - ConvertTo-ImportAttributeValue checks integrality and range in the value's OWN numeric type before any [decimal] cast: a tiny double (1e-30) cast to decimal underflowed to 0 and was silently coerced to 0 (integer and byte-element branches both); Convert-ToLatestCompatibility computes and validates every replacement value - including the minor-revision increment, which now throws on Int32.MaxValue overflow - BEFORE mutating $Attributes, so a failure no longer leaves a template half-upgraded (v4 schema/flags with an un-bumped revision) while still reporting Upgraded; the Authentication Mechanism Assurance import guard scans only msPKI-Certificate-Policy (the issuance policies stamped into the ISSUED certificate), no longer msPKI-RA-Policies (which constrains the enrollment-agent SIGNING certificate and is not stamped into the issued cert, so an AMA link on it never grants the enrollee) - it was falsely refusing templates that merely require a signing-cert application policy
+1.0.5 - The DOMAIN\user@domain principal form now takes the UPN-only resolution and sAMAccountName shadow check (matching on the raw key let a prefixed key skip to the sAMAccountName lookup, so a planted sAMAccountName could still capture the grant); the dotted-OID validation regexes are anchored with \z instead of $ (a trailing newline in a tampered msPKI-Cert-Template-OID passed validation and bypassed the template-OID uniqueness search); -UpgradeCompatibility refuses a schema-2 source carrying msPKI-RA-Application-Policies (its encoding differs at v3/v4, so upgrading in place would silently drop the RA-signature application-policy requirement)
 1.0.4 - Every known attribute of an import is validated for type, shape and range and the import is refused when one is malformed (a failed cast previously dropped the attribute - msPKI-RA-Signature included - and the template was created without it; 0.4 was coerced to 0, a three-element period array passed as a period); an issuance policy OID that the TARGET forest links to a group via Authentication Mechanism Assurance refuses the import unless -AllowLinkedIssuancePolicy is given (new switch)
 1.0.3 - Help text only: -EnrollPrincipals documents the UPN-only resolution of user@domain keys, -UpgradeCompatibility the legacy-provider rule, -Mode Validate the read-back failure; no code change
 1.0.2 - A user@domain principal in -EnrollPrincipals resolves ONLY as a UPN, and a different object carrying that string as its sAMAccountName is refused (sAMAccountName may contain '@', so a planted account could previously capture a grant meant for the UPN); -UpgradeCompatibility sets CT_FLAG_USE_LEGACY_PROVIDER only for a schema-2 source with a provider list and preserves a schema-3 source's own bit (a v3 KSP template was switched to legacy provider handling); -Mode Validate fails with a terminating error when the throwaway template cannot be read back after creation (previously a warning and exit 0 with nothing validated)
@@ -244,7 +246,7 @@
 
 .PARAMETER AllowLinkedIssuancePolicy
     Import/Sync. By default the import is REFUSED when the template carries an issuance policy OID
-    (msPKI-Certificate-Policy / msPKI-RA-Policies) that the TARGET forest already links to a group
+    (in msPKI-Certificate-Policy - the issuance policies stamped into the ISSUED certificate) that the TARGET forest already links to a group
     through Authentication Mechanism Assurance (msDS-OIDToGroupLink): certificates issued from the
     copy would grant that group's membership at logon to every principal the copy's enrollment ACL
     admits, with no link ever being copied. Pass this switch to accept such a mapping deliberately
@@ -504,12 +506,26 @@ function Convert-ToLatestCompatibility {
     $flags = if ($Attributes.ContainsKey('flags')) { [BitConverter]::ToUInt32([BitConverter]::GetBytes([int]$Attributes['flags']), 0) } else { [uint32]0 }
     $flags = ($flags -band (-bnot 0x10000)) -bor 0x20000
 
-    $Attributes['msPKI-Template-Schema-Version'] = [System.Int32]4
-    $Attributes['msPKI-Private-Key-Flag']        = [BitConverter]::ToInt32([BitConverter]::GetBytes([uint32]$pkf), 0)
-    $Attributes['flags']                         = [BitConverter]::ToInt32([BitConverter]::GetBytes([uint32]$flags), 0)
+    # Compute EVERY replacement value (including the minor-revision increment) and validate it
+    # BEFORE mutating $Attributes, so a failure leaves the hashtable untouched. The old order set
+    # schema/flags first and incremented the revision last: a source revision of Int32.MaxValue
+    # overflowed the `[System.Int32](... + 1)` cast, which under the default error preference left
+    # the template half-upgraded (v4 schema/flags, un-bumped revision) and still returned Upgraded.
+    $newSchema = [System.Int32]4
+    $newPkf    = [BitConverter]::ToInt32([BitConverter]::GetBytes([uint32]$pkf), 0)
+    $newFlags  = [BitConverter]::ToInt32([BitConverter]::GetBytes([uint32]$flags), 0)
+    $newRev    = $null
     if ($Attributes.ContainsKey('msPKI-Template-Minor-Revision')) {
-        $Attributes['msPKI-Template-Minor-Revision'] = [System.Int32]([int]$Attributes['msPKI-Template-Minor-Revision'] + 1)
+        $curRev = [int]$Attributes['msPKI-Template-Minor-Revision']
+        if ($curRev -eq [int]::MaxValue) {
+            throw "Import refused: msPKI-Template-Minor-Revision is already Int32.MaxValue ($curRev) and cannot be incremented for the compatibility upgrade - the source object or export is corrupt or tampered with."
+        }
+        $newRev = [System.Int32]($curRev + 1)
     }
+    $Attributes['msPKI-Template-Schema-Version'] = $newSchema
+    $Attributes['msPKI-Private-Key-Flag']        = $newPkf
+    $Attributes['flags']                         = $newFlags
+    if ($null -ne $newRev) { $Attributes['msPKI-Template-Minor-Revision'] = $newRev }
     return [pscustomobject]@{ Upgraded = $true; FromVersion = $ver; PrivateKeyFlag = ('0x{0:X8}' -f $pkf); LegacyProvider = $legacy }
 }
 
@@ -930,20 +946,29 @@ function ConvertTo-ImportAttributeValue {
         if ($null -eq $v)   { & $fail 'no value' }
         if ($v -is [string]) { & $fail 'expected an integer, got a string' }
         if ($v -is [bool])   { & $fail 'expected an integer, got a boolean' }
-        if ($v -is [double] -or $v -is [single] -or $v -is [decimal]) {
-            # Guarded like the byte branch below: a giant or non-finite JSON number (1e40, Infinity,
-            # NaN) overflows the [decimal] cast. Unguarded it throws a raw ".NET cannot convert"
-            # error BEFORE $fail runs - the import is still refused (fail closed), but the message
-            # would not name the attribute, contrary to this function's contract.
-            $dv = try { [decimal]$v } catch { $null }
-            if ($null -eq $dv) { & $fail "value $v is outside the Int32 range" }
-            if ([math]::Truncate($dv) -ne $dv) { & $fail "expected an integer, got $v" }
-            $v = $dv
+        if ($v -is [double] -or $v -is [single]) {
+            # Finiteness, integrality AND range are checked in DOUBLE space BEFORE any [decimal] cast:
+            # a tiny double (1e-30) cast to decimal UNDERFLOWS to 0, which would pass a post-cast
+            # integer check and SILENTLY COERCE the malformed value to 0 - exactly the coercion this
+            # validation exists to prevent. A giant/non-finite double (1e40, Infinity, NaN) is refused
+            # here too (it is not integral or is out of Int32 range), with the attribute named.
+            $dbl = [double]$v
+            if ([double]::IsNaN($dbl) -or [double]::IsInfinity($dbl)) { & $fail "expected an integer, got $v" }
+            if ([math]::Truncate($dbl) -ne $dbl) { & $fail "expected an integer, got $v" }
+            if ($dbl -lt [int]::MinValue -or $dbl -gt [int]::MaxValue) { & $fail "value $v is outside the Int32 range" }
+            return [System.Int32]$dbl
         }
-        elseif ($v -isnot [byte] -and $v -isnot [sbyte] -and $v -isnot [int16] -and $v -isnot [uint16] -and
+        if ($v -is [decimal]) {
+            # decimal is exact within its range, so no underflow: check integrality and range directly.
+            if ([math]::Truncate($v) -ne $v) { & $fail "expected an integer, got $v" }
+            if ($v -lt [int]::MinValue -or $v -gt [int]::MaxValue) { & $fail "value $v is outside the Int32 range" }
+            return [System.Int32]$v
+        }
+        if ($v -isnot [byte] -and $v -isnot [sbyte] -and $v -isnot [int16] -and $v -isnot [uint16] -and
                 $v -isnot [int] -and $v -isnot [uint32] -and $v -isnot [long] -and $v -isnot [uint64]) {
             & $fail "expected an integer, got $($v.GetType().Name)"
         }
+        # An integer type: [decimal] is exact (no underflow); only the Int32 range remains to check.
         $d = [decimal]$v
         if ($d -lt [int]::MinValue -or $d -gt [int]::MaxValue) { & $fail "value $v is outside the Int32 range" }
         return [System.Int32]$d
@@ -957,9 +982,18 @@ function ConvertTo-ImportAttributeValue {
         for ($i = 0; $i -lt $arr.Count; $i++) {
             $b = $arr[$i]
             if ($null -eq $b -or $b -is [string] -or $b -is [bool]) { & $fail "element $i is not a byte" }
-            $d = try { [decimal]$b } catch { $null }
-            if ($null -eq $d -or [math]::Truncate($d) -ne $d -or $d -lt 0 -or $d -gt 255) { & $fail "element $i ($b) is not a byte (0-255)" }
-            $bytes[$i] = [byte]$d
+            if ($b -is [double] -or $b -is [single]) {
+                # As in the integer branch: check integrality in DOUBLE space, since [decimal]1e-30
+                # underflows to 0 and would silently coerce a malformed element to a valid byte.
+                $db = [double]$b
+                if ([double]::IsNaN($db) -or [double]::IsInfinity($db) -or [math]::Truncate($db) -ne $db -or $db -lt 0 -or $db -gt 255) { & $fail "element $i ($b) is not a byte (0-255)" }
+                $bytes[$i] = [byte]$db
+            }
+            else {
+                $d = try { [decimal]$b } catch { $null }
+                if ($null -eq $d -or [math]::Truncate($d) -ne $d -or $d -lt 0 -or $d -gt 255) { & $fail "element $i ($b) is not a byte (0-255)" }
+                $bytes[$i] = [byte]$d
+            }
         }
         return , $bytes
     }
@@ -981,16 +1015,21 @@ function ConvertTo-ImportAttributeValue {
 }
 
 function Get-LinkedIssuancePolicy {
-    # Issuance-policy OIDs the import carries (msPKI-Certificate-Policy, msPKI-RA-Policies) that the
+    # ISSUANCE-policy OIDs stamped into the issued certificate (msPKI-Certificate-Policy) that the
     # TARGET forest already binds to a group through Authentication Mechanism Assurance
     # (msDS-OIDToGroupLink on the OID object). A copy carrying such an OID issues certificates that
     # grant that group's membership at logon - to everyone its enrollment ACL admits - with no link
     # ever being copied: the link already exists here. An export the operator did not author, or
     # one an attacker edited, can carry exactly such an OID. Returns one record per linked OID:
     # @{ Oid; OidObjectDN; GroupDN }.
+    # ONLY msPKI-Certificate-Policy is scanned: those OIDs go into the Certificate Policies extension
+    # of the ISSUED certificate, which is what AMA maps to a group at logon. msPKI-RA-Policies is
+    # deliberately EXCLUDED - it constrains the enrollment-agent SIGNING certificate (the co-signer
+    # must hold those application policies), it is not stamped into the issued certificate, so an AMA
+    # link on such an OID does not grant the enrollee anything.
     param([hashtable]$Attributes, [string]$ConfigNC, [hashtable]$ADParams)
     $oids = @()
-    foreach ($a in 'msPKI-Certificate-Policy', 'msPKI-RA-Policies') {
+    foreach ($a in 'msPKI-Certificate-Policy') {
         if ($Attributes.ContainsKey($a) -and $null -ne $Attributes[$a]) { $oids += @($Attributes[$a] | ForEach-Object { "$_" }) }
     }
     $oids = @($oids | Where-Object { $_ } | Sort-Object -Unique)
@@ -1152,7 +1191,7 @@ function Import-Template {
                 Write-Warning "The template carries issuance policy OID(s) that THIS forest links to a group via Authentication Mechanism Assurance ($list). Certificates issued from the copy will grant that group's membership at logon to every principal its enrollment ACL admits (-AllowLinkedIssuancePolicy given; proceeding)."
             }
             else {
-                throw "Import refused: the template carries issuance policy OID(s) that THIS forest already links to a group via Authentication Mechanism Assurance: $list. Certificates issued from the copy would grant that group's membership at logon to every principal its enrollment ACL admits - a security decision, not a copy detail. Strip the OID from the source's msPKI-Certificate-Policy / msPKI-RA-Policies, or rerun with -AllowLinkedIssuancePolicy to accept the mapping deliberately."
+                throw "Import refused: the template carries issuance policy OID(s) that THIS forest already links to a group via Authentication Mechanism Assurance: $list. Certificates issued from the copy would grant that group's membership at logon to every principal its enrollment ACL admits - a security decision, not a copy detail. Strip the OID from the source's msPKI-Certificate-Policy, or rerun with -AllowLinkedIssuancePolicy to accept the mapping deliberately."
             }
         }
     }

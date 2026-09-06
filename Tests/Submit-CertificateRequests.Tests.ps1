@@ -333,6 +333,27 @@ Describe 'Submit-CertificateRequests' {
                 [pscustomobject]@{ RequestFile = 'C:\in\x.req'; RequestID = '51'; Status = 'Pending'; OutputCertFile = 'C:\out\x.cer'; SubmitTime = 'not-a-date' }
             )
             (Get-DestinationOwnerConflict -Record $noTime[1] -Tracking $noTime).RequestID | Should -Be '50' -Because 'when the order cannot be established, the conflict is refused (fail closed)'
+
+            # CROSS-CA: RequestIDs are per CA, so two DIFFERENT requests can share the number. CA-A/41
+            # (older, Pending) and CA-B/41 (newer, Issued) share a destination; retrieving CA-A/41 must
+            # see CA-B/41 as the owner (they are NOT the same request despite the same ID).
+            $crossCa = @(
+                [pscustomobject]@{ RequestFile = 'C:\in\srv.req'; RequestID = '41'; CAConfig = 'CA-A\Issuing'; Status = 'Pending'; OutputCertFile = 'C:\out\srv.cer'; SubmitTime = '2026-09-01T10:00:00' }
+                [pscustomobject]@{ RequestFile = 'C:\in\srv.req'; RequestID = '41'; CAConfig = 'CA-B\Issuing'; Status = 'Issued';  OutputCertFile = 'C:\out\srv.cer'; SubmitTime = '2026-09-02T10:00:00' }
+            )
+            (Get-DestinationOwnerConflict -Record $crossCa[0] -Tracking $crossCa).CAConfig | Should -Be 'CA-B\Issuing' -Because 'a different CA''s request with the same number is a different request and still owns the shared destination'
+            # a row still does not conflict with ITSELF (reference identity, not RequestID equality)
+            Get-DestinationOwnerConflict -Record $crossCa[1] -Tracking @($crossCa[1]) | Should -BeNullOrEmpty
+
+            # DST: instants must be compared, not local wall-clock. On the Oslo fall-back night an
+            # older submission with the summer offset is an EARLIER instant than a later one with the
+            # winter offset; a [datetime] comparison reverses them. The older must not own the dest.
+            $dst = @(
+                [pscustomobject]@{ RequestFile = 'C:\in\d.req'; RequestID = '60'; Status = 'Issued'; OutputCertFile = 'C:\out\d.cer'; SubmitTime = '2026-10-25T02:45:00.0000000+02:00' }  # 00:45 UTC (older instant)
+                [pscustomobject]@{ RequestFile = 'C:\in\d.req'; RequestID = '61'; Status = 'Issued'; OutputCertFile = 'C:\out\d.cer'; SubmitTime = '2026-10-25T02:15:00.0000000+01:00' }  # 01:15 UTC (newer instant)
+            )
+            Get-DestinationOwnerConflict -Record $dst[1] -Tracking $dst | Should -BeNullOrEmpty -Because 'row 61 is the later INSTANT (01:15 UTC) despite the earlier wall-clock; the older 60 must not own the destination'
+            (Get-DestinationOwnerConflict -Record $dst[0] -Tracking $dst).RequestID | Should -Be '61' -Because 'retrieving the older 60 over the newer 61 is refused (instants compared, not local wall-clock)'
         }
 
         It 'Assert-CertificateOutputPath confines a tracking-row path to a rooted .cer beneath an allowed root' {

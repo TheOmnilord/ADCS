@@ -361,7 +361,7 @@ Describe 'Add-CertificateEnrollmentPolicyServerOffline' {
             $shim = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.IfStatementAst] -and $n.Extent.Text -match 'CepRegNative' }, $true)
             $shim | Should -Not -BeNullOrEmpty
             . ([scriptblock]::Create($shim[0].Extent.Text))
-            foreach ($name in 'Test-RegistryKeyIsLink', 'Assert-ProtectedRegistryPath') {
+            foreach ($name in 'Test-RegistryKeyIsLink', 'Test-RegistryComponentExists', 'Assert-ProtectedRegistryPath') {
                 $def = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name }, $false)
                 $def | Should -Not -BeNullOrEmpty
                 . ([scriptblock]::Create($def[0].Extent.Text))
@@ -407,6 +407,59 @@ public static class PesterRegLink {
                 # target through the link (Remove-Item would follow it).
                 $lh = [IntPtr]::Zero
                 if ([PesterRegLink]::RegOpenKeyExW($hkcu, $linkRel, 0x8, 0x10000, [ref]$lh) -eq 0) {   # DELETE
+                    try { [void][PesterRegLink]::NtDeleteKey($lh) } finally { [void][PesterRegLink]::RegCloseKey($lh) }
+                }
+            }
+        }
+
+        It 'the path check catches a DANGLING symbolic link that Test-Path reports as absent (extracted checker, throwaway HKCU keys)' {
+            # Regression for the round-6 finding: Assert-ProtectedRegistryPath must decide each component's
+            # existence with the native REG_OPTION_OPEN_LINK probe, not Test-Path. The provider follows a
+            # link to its target, so a link whose target does NOT exist reads as absent to Test-Path - which
+            # would let the walk break BEFORE the link check and leave the link to be retargeted at a
+            # protected key before the write. The native probe sees the link object itself.
+            $ast  = [System.Management.Automation.Language.Parser]::ParseFile($script:Cep, [ref]$null, [ref]$null)
+            $shim = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.IfStatementAst] -and $n.Extent.Text -match 'CepRegNative' }, $true)
+            . ([scriptblock]::Create($shim[0].Extent.Text))
+            foreach ($name in 'Test-RegistryKeyIsLink', 'Test-RegistryComponentExists', 'Assert-ProtectedRegistryPath') {
+                $def = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name }, $false)
+                $def | Should -Not -BeNullOrEmpty
+                . ([scriptblock]::Create($def[0].Extent.Text))
+            }
+            if (-not ('PesterRegLink' -as [type])) {
+                Add-Type -TypeDefinition @"
+using System; using System.Runtime.InteropServices;
+public static class PesterRegLink {
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern int RegCreateKeyExW(IntPtr hKey, string lpSubKey, int Reserved, string lpClass, uint dwOptions, uint samDesired, IntPtr lpSecurityAttributes, out IntPtr phkResult, out uint lpdwDisposition);
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern int RegSetValueExW(IntPtr hKey, string lpValueName, int Reserved, uint dwType, byte[] lpData, uint cbData);
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern int RegOpenKeyExW(IntPtr hKey, string lpSubKey, uint ulOptions, uint samDesired, out IntPtr phkResult);
+    [DllImport("ntdll.dll")] public static extern int NtDeleteKey(IntPtr KeyHandle);
+    [DllImport("advapi32.dll")] public static extern int RegCloseKey(IntPtr hKey);
+}
+"@
+            }
+            $hkcu = [IntPtr]::new(-2147483647)   # HKEY_CURRENT_USER
+            $sid  = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+            # A link whose SymbolicLinkValue names a target key that is never created: the link DANGLES.
+            $danglingRel = "Software\$script:Prefix-dangling"; $absentRel = "Software\$script:Prefix-absent-target"
+            $h = [IntPtr]::Zero; $disp = [uint32]0
+            [PesterRegLink]::RegCreateKeyExW($hkcu, $danglingRel, 0, $null, 0x3, 0xF003F, [IntPtr]::Zero, [ref]$h, [ref]$disp) | Should -Be 0   # VOLATILE | CREATE_LINK
+            try {
+                $linkTarget = [System.Text.Encoding]::Unicode.GetBytes("\Registry\User\$sid\$absentRel")
+                [PesterRegLink]::RegSetValueExW($h, 'SymbolicLinkValue', 0, 6, $linkTarget, [uint32]$linkTarget.Length) | Should -Be 0
+            } finally { [void][PesterRegLink]::RegCloseKey($h) }
+            try {
+                Test-Path -LiteralPath "HKCU:\$danglingRel" | Should -BeFalse -Because 'the provider follows the link to its ABSENT target - exactly the bypass the native probe closes'
+                Test-RegistryComponentExists -HiveHandle $hkcu -SubKey $danglingRel | Should -BeTrue -Because 'the link OBJECT exists even though its target does not'
+                Test-RegistryComponentExists -HiveHandle $hkcu -SubKey $absentRel   | Should -BeFalse -Because 'a genuinely absent key returns ERROR_FILE_NOT_FOUND'
+                { Assert-ProtectedRegistryPath -Path "HKCU:\$danglingRel\PolicyServers" } | Should -Throw -ExpectedMessage '*SYMBOLIC LINK*'
+            }
+            finally {
+                $lh = [IntPtr]::Zero
+                if ([PesterRegLink]::RegOpenKeyExW($hkcu, $danglingRel, 0x8, 0x10000, [ref]$lh) -eq 0) {   # OPEN_LINK | DELETE
                     try { [void][PesterRegLink]::NtDeleteKey($lh) } finally { [void][PesterRegLink]::RegCloseKey($lh) }
                 }
             }
