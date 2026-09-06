@@ -1,11 +1,12 @@
 <#PSScriptInfo
-.VERSION 1.0.5
+.VERSION 1.0.7
 .GUID 6f98f16e-0c56-4a72-ba31-443938175c06
 .AUTHOR Sveinung Svea
 .PROJECTURI https://github.com/TheOmnilord/ADCS
 .LICENSEURI https://github.com/TheOmnilord/ADCS/blob/main/LICENSE
 .TAGS ADCS PKI CertificateServices
 .RELEASENOTES
+1.0.6 - -Mode Retrieve refuses to deliver a request whose destination already holds the certificate of a DIFFERENT request (Issued/Undelivered) for the same request file - the older of two requests for one CSR (a -Force resubmission after a pending first request) previously replaced the newer, already delivered certificate while that row kept saying Issued; the row is skipped, counted as needing attention and reported; -Force resubmission of an unresolved request warns about it
 1.0.5 - Help text only: the notes document the CAConfig column and the CA check on Retrieve, up-front unique certificate names, the Unknown-without-RequestID rule and the non-zero exit on failed or attention-needing rows; no code change
 1.0.4 - Certificate file names are allocated up front and must be unique within the batch and against the destinations already recorded for other request files (prod.req / prod.csr / prod.req.txt no longer map two requests onto one .cer); the tracking file is read with -LiteralPath (a name with [ ] was reported absent and its whole history resubmitted); a nonexistent or non-folder -InputPath is a terminating error instead of an empty batch; every row records the CA it was submitted to (CAConfig) and -Mode Retrieve refuses rows submitted to a different CA; a submission certreq reports as successful but whose reply yields neither a RequestID nor a certificate is recorded as Unknown and never resubmitted automatically; a run with failed or attention-needing rows ends with a terminating error (non-zero exit); log messages fold CR/LF and control characters so a tracking field cannot forge log lines; Export-Csv column loss with mixed old/new rows prevented
 1.0.3 - The delivery folder is also judged on what its ACL hands to the FILES created inside it: an inheritable "files" entry (inherit-only or not) granting an untrusted principal write, append, delete, write-attributes or re-permission rights is refused (a warning under -AllowUnprotectedOutputFolder; -TrustedOutputPrincipal applies), because certreq's staging file and the delivered certificate inherit it while the folder-swap checks rightly ignore inherit-only entries - previously such a user could alter the certificate's bytes before or after delivery with every folder check passing. CREATOR OWNER / OWNER RIGHTS placeholders resolve to the running account and are trusted; CREATOR GROUP is not
@@ -674,15 +675,18 @@ function Get-RequestFiles {
         throw "InputPath must be a folder, not a file: $Path"
     }
 
-    $files = @(
-        Get-ChildItem -Path $Path -Filter '*.req' -File
-        Get-ChildItem -Path $Path -Filter '*.csr' -File
-        Get-ChildItem -Path $Path -Filter '*.txt' -File
-    )
+    # -LiteralPath, not -Path: an input folder whose name contains a wildcard metacharacter (e.g.
+    # 'CSR[prod]') would otherwise be globbed as a character class, match nothing, and let a
+    # scheduled run exit 0 with the CA reachable and no work done - the exact failure the
+    # -LiteralPath existence guard above was added to stop. And an EXACT-extension filter on
+    # $_.Extension, not -Filter '*.req': Win32 wildcard matching treats '*.req' as any extension
+    # BEGINNING with 'req', so a leftover backup (prod.reqbak, prod.request) would be submitted to
+    # the CA as if it were a request. $_.Extension is the true extension; -in is case-insensitive.
+    $files = @(Get-ChildItem -LiteralPath $Path -File | Where-Object { $_.Extension -in '.req', '.csr', '.txt' })
 
     if ($files.Count -eq 0) {
         Write-BatchLog "No .req/.csr/.txt files found in: $Path" -Level Warning
-        $other = @(Get-ChildItem -Path $Path -File -ErrorAction SilentlyContinue)
+        $other = @(Get-ChildItem -LiteralPath $Path -File -ErrorAction SilentlyContinue)
         if ($other.Count -gt 0) {
             $sample = ($other | Select-Object -First 5 -ExpandProperty Name) -join ', '
             $suffix = if ($other.Count -gt 5) { ", ..." } else { '' }
@@ -766,7 +770,12 @@ function Resolve-CertificateOutputNames {
     # record one name for two files; a candidate is refused when ANY recorded owner is another file.
     $taken = @{}
     foreach ($row in @($ExistingRows | Where-Object { $_ -and "$($_.OutputCertFile)" })) {
-        $leaf = [System.IO.Path]::GetFileName("$($row.OutputCertFile)").ToLowerInvariant()
+        # try/catch: on Windows PowerShell 5.1 [System.IO.Path]::GetFileName throws on a Win32-invalid
+        # path character (| < >) that a hand-edited/imported CSV row may carry - unguarded it would
+        # abort the whole batch before a single CSR is submitted (PS7 returns a value and proceeds).
+        # A row whose recorded destination is not even a valid path cannot be a real occupant, so it
+        # is simply not registered as taken.
+        $leaf = try { [System.IO.Path]::GetFileName("$($row.OutputCertFile)").ToLowerInvariant() } catch { $null }
         if (-not $leaf) { continue }
         if (-not $taken.ContainsKey($leaf)) { $taken[$leaf] = @() }
         if ("$($row.RequestFile)" -notin $taken[$leaf]) { $taken[$leaf] += "$($row.RequestFile)" }
@@ -818,6 +827,42 @@ function Resolve-CertificateOutputNames {
     $names
 }
 
+function Get-DestinationOwnerConflict {
+    # The OTHER tracking row - a different RequestID - whose certificate already occupies (Issued)
+    # or is staged for (Undelivered) the destination a retrieval is about to deliver to, AND which is
+    # strictly NEWER than $Record; $null when there is none. Destinations are per request FILE, so
+    # two requests for one CSR - a -Force resubmission after a first request stayed pending - share a
+    # name. The refusal is DIRECTIONAL: only a newer request owns the destination. Retrieving the
+    # OLDER request once a newer one has delivered there would replace the newer certificate with the
+    # older one's (a different key, if the CSR was regenerated) while the newer row still says Issued
+    # - so that is refused and reported. Retrieving the NEWER request delivers normally, and
+    # Move-StaleCertificateAside preserves the older certificate, exactly as the Submit path does for
+    # a -Force resubmit. Fail closed (keep refusing) when either SubmitTime is missing or unparseable.
+    # -Destination overrides the row's stored path so the caller can check the EFFECTIVE destination
+    # (after -OutputFolder redirection) without first mutating $record - a declined row must stay
+    # byte-identical in the tracking file.
+    param([Parameter(Mandatory)]$Record, [object[]]$Tracking, [string]$Destination)
+    $dest = if ($PSBoundParameters.ContainsKey('Destination')) { $Destination } else { "$($Record.OutputCertFile)" }
+    if (-not $dest) { return $null }
+    $destFull = try { [System.IO.Path]::GetFullPath($dest) } catch { $dest }
+    foreach ($row in @($Tracking | Where-Object { $_ })) {
+        if ("$($row.RequestID)" -eq "$($Record.RequestID)") { continue }
+        if ($row.Status -notin 'Issued', 'Undelivered') { continue }
+        # Owner only when the other row's SubmitTime is strictly greater (newer). When both parse and
+        # the other is not strictly newer, it is not an owner - skip it. Missing/unparseable falls
+        # through to the path check and refuses (fail closed).
+        $tThis = [datetime]::MinValue; $tOther = [datetime]::MinValue
+        $okThis  = [datetime]::TryParse("$($Record.SubmitTime)", [ref]$tThis)
+        $okOther = [datetime]::TryParse("$($row.SubmitTime)", [ref]$tOther)
+        if ($okThis -and $okOther -and $tOther -le $tThis) { continue }
+        $other = "$($row.OutputCertFile)"
+        if (-not $other) { continue }
+        $otherFull = try { [System.IO.Path]::GetFullPath($other) } catch { $other }
+        if ($otherFull.Equals($destFull, [System.StringComparison]::OrdinalIgnoreCase)) { return $row }
+    }
+    $null
+}
+
 function Import-TrackingData {
     param([string]$Path)
 
@@ -854,7 +899,10 @@ function Export-TrackingData {
         # (plus any extra column an operator added), so the file always carries every field.
         $columns = [System.Collections.Generic.List[string]]@('RequestFile', 'RequestID', 'SubmitTime', 'Status', 'OutputCertFile', 'LastCheckTime', 'ErrorMessage', 'CAConfig')
         foreach ($r in $filtered) { foreach ($pn in $r.PSObject.Properties.Name) { if ($pn -notin $columns) { $columns.Add($pn) } } }
-        $filtered | Select-Object -Property $columns | Export-Csv -Path $tempFile -NoTypeInformation -Encoding utf8 -Confirm:$false
+        # -LiteralPath: the temp name inherits $Path, so a tracking path containing [ or ] would be
+        # globbed by -Path and the checkpoint would silently fail to write - losing the RequestID of
+        # a request the CA already has, which the next run resubmits as a duplicate.
+        $filtered | Select-Object -Property $columns | Export-Csv -LiteralPath $tempFile -NoTypeInformation -Encoding utf8 -Confirm:$false
         # File.Replace / File.Move rather than Move-Item -Force: both fail if the tracking-file
         # name is occupied by a folder or a link (Move-Item would move the CSV INTO a folder).
         if (Test-Path -LiteralPath $Path -PathType Leaf) { [System.IO.File]::Replace($tempFile, $Path, $null) }
@@ -869,8 +917,10 @@ function Remove-RspFile {
     param([string]$CerPath)
 
     $rspPath = [System.IO.Path]::ChangeExtension($CerPath, '.rsp')
-    if (Test-Path $rspPath) {
-        Remove-Item -Path $rspPath -Force -Confirm:$false -ErrorAction SilentlyContinue
+    # -LiteralPath: a request file the requester named 'web[1].req' produces a 'web[1]....rsp'
+    # staging path; -Path would glob the brackets and leave the .rsp in the delivery folder.
+    if (Test-Path -LiteralPath $rspPath) {
+        Remove-Item -LiteralPath $rspPath -Force -Confirm:$false -ErrorAction SilentlyContinue
         Write-BatchLog "  Deleted .rsp file: $rspPath"
     }
 }
@@ -906,8 +956,13 @@ function Submit-SingleRequest {
             "`"$tmpCer`""
         ) -NoNewWindow -Wait -PassThru -RedirectStandardOutput $stdoutFile -RedirectStandardError $stderrFile
 
-        $stdout = @(Get-Content -Path $stdoutFile -ErrorAction SilentlyContinue)
-        $stderr = @(Get-Content -Path $stderrFile -ErrorAction SilentlyContinue)
+        # -Encoding Oem + -LiteralPath: certreq writes its redirected output in the console OEM
+        # code page. Get-Content with no -Encoding decodes it as ANSI on 5.1 but UTF-8 on 7 - the
+        # same bytes become different (and, on 7, lossy U+FFFD) characters, which are then persisted
+        # into the tracking row's ErrorMessage and the log. Oem resolves identically on both engines.
+        # (The RequestId regex and the 0x8009 hint patterns are ASCII and were unaffected either way.)
+        $stdout = @(Get-Content -LiteralPath $stdoutFile -Encoding Oem -ErrorAction SilentlyContinue)
+        $stderr = @(Get-Content -LiteralPath $stderrFile -Encoding Oem -ErrorAction SilentlyContinue)
 
         $requestId = Get-RequestIdFromOutput $stdout
         $disposition = Get-DispositionFromOutput $stdout
@@ -1040,8 +1095,13 @@ function Get-IssuedCertificate {
             "`"$tmpCer`""
         ) -NoNewWindow -Wait -PassThru -RedirectStandardOutput $stdoutFile -RedirectStandardError $stderrFile
 
-        $stdout = @(Get-Content -Path $stdoutFile -ErrorAction SilentlyContinue)
-        $stderr = @(Get-Content -Path $stderrFile -ErrorAction SilentlyContinue)
+        # -Encoding Oem + -LiteralPath: certreq writes its redirected output in the console OEM
+        # code page. Get-Content with no -Encoding decodes it as ANSI on 5.1 but UTF-8 on 7 - the
+        # same bytes become different (and, on 7, lossy U+FFFD) characters, which are then persisted
+        # into the tracking row's ErrorMessage and the log. Oem resolves identically on both engines.
+        # (The RequestId regex and the 0x8009 hint patterns are ASCII and were unaffected either way.)
+        $stdout = @(Get-Content -LiteralPath $stdoutFile -Encoding Oem -ErrorAction SilentlyContinue)
+        $stderr = @(Get-Content -LiteralPath $stderrFile -Encoding Oem -ErrorAction SilentlyContinue)
 
         $disposition = Get-DispositionFromOutput $stdout
         # Issued means "certreq returned 0 AND wrote the temp file" - language-independent,
@@ -1273,6 +1333,13 @@ try {   # the lock is released in the finally at the end of the run, on every ex
 
                     if ($Force) {
                         Write-BatchLog "Resubmitting (-Force): $($file.Name) [previous RequestID: $prevId, Status: $prevStatus]" -Level Warning
+                        # Always warn: this resubmission shares its certificate destination with the
+                        # previous request for the same file. On delivery the previous certificate is
+                        # moved aside as <name>.superseded-<stamp>.cer (never deleted). If the earlier
+                        # request is still pending and the CA issues it later, -Mode Retrieve will NOT
+                        # deliver it over this newer certificate - it is refused and reported for
+                        # reconciliation (Get-DestinationOwnerConflict is directional: newer wins).
+                        Write-BatchLog "  Note: request $prevId shares this file's certificate destination. The previous certificate is preserved as <name>.superseded-<stamp>.cer, and an older still-pending request is never delivered over this newer one." -Level Warning
                     }
                     else {
                         $yes = New-Object System.Management.Automation.Host.ChoiceDescription '&Yes', 'Resubmit as a new certificate request'
@@ -1381,28 +1448,46 @@ try {   # the lock is released in the finally at the end of the run, on every ex
                     $script:FailureCount++
                     continue
                 }
-                if (-not $rowCa) {
-                    Write-BatchLog "RequestID $($record.RequestID): the row records no CA (tracking file written by an older version); assuming '$CAConfig' and recording it." -Level Warning
-                    $record | Add-Member -NotePropertyName CAConfig -NotePropertyValue $CAConfig -Force
-                }
+                # A legacy row (no CAConfig property) is stamped with this run's CA - but only once the
+                # retrieval is APPROVED (below), so a declined row is left byte-identical in the CSV.
+                $stampLegacyCa = (-not $rowCa)
 
+                # The redirected destination is computed WITHOUT mutating $record: Export-TrackingData
+                # serialises the WHOLE $tracking array, so a pre-gate mutation of this row would be
+                # persisted by a LATER approved row's checkpoint even when the operator declined THIS
+                # one. try/catch: GetFileName throws on Windows PowerShell 5.1 for a Win32-invalid path
+                # character in a hand-edited row - unguarded it would abandon every remaining row.
+                $effectiveDest = "$($record.OutputCertFile)"
                 if ($redirectOutput) {
                     $cerName = if ($record.OutputCertFile) {
-                        [System.IO.Path]::GetFileName($record.OutputCertFile)
+                        try { [System.IO.Path]::GetFileName($record.OutputCertFile) } catch { $null }
                     }
                     else {
-                        [System.IO.Path]::GetFileNameWithoutExtension($record.RequestFile) + '.cer'
+                        try { [System.IO.Path]::GetFileNameWithoutExtension($record.RequestFile) + '.cer' } catch { $null }
                     }
-                    $record.OutputCertFile = Join-Path $OutputFolder $cerName
+                    if (-not $cerName) {
+                        Write-BatchLog "Skipping RequestID $($record.RequestID): OutputCertFile/RequestFile is not a valid path (edited tracking file?)." -Level Error
+                        $script:FailureCount++
+                        continue
+                    }
+                    $effectiveDest = Join-Path $OutputFolder $cerName
                 }
 
-                if (-not $record.OutputCertFile) {
+                if (-not $effectiveDest) {
                     Write-BatchLog "Skipping RequestID $($record.RequestID): the row has no OutputCertFile (pass -OutputFolder to redirect it)." -Level Error
                     $script:FailureCount++
                     continue
                 }
+                # Another request for the same CSR may already own this destination (see
+                # Get-DestinationOwnerConflict): never deliver an older request over a newer one's cert.
+                $owner = Get-DestinationOwnerConflict -Record $record -Tracking $tracking -Destination $effectiveDest
+                if ($owner) {
+                    Write-BatchLog "Skipping RequestID $($record.RequestID): its destination '$effectiveDest' already holds the certificate of RequestID $($owner.RequestID) (Status $($owner.Status), submitted $($owner.SubmitTime)) for the same request file. Retrieving would replace that newer certificate with this older request's. Reconcile manually: move that file or edit this row's OutputCertFile, then rerun." -Level Error
+                    $script:FailureCount++
+                    continue
+                }
                 try {
-                    Assert-CertificateOutputPath -Name "OutputCertFile of RequestID $($record.RequestID)" -Path $record.OutputCertFile -AllowedRoots $retrieveRoots
+                    Assert-CertificateOutputPath -Name "OutputCertFile of RequestID $($record.RequestID)" -Path $effectiveDest -AllowedRoots $retrieveRoots
                 }
                 catch {
                     Write-BatchLog "Skipping RequestID $($record.RequestID): $_" -Level Error
@@ -1411,6 +1496,13 @@ try {   # the lock is released in the finally at the end of the run, on every ex
                 }
 
                 if ($PSCmdlet.ShouldProcess("RequestID $($record.RequestID)", "Retrieve certificate from $CAConfig")) {
+                    # Commit the per-row mutations ONLY now the action is approved (see above): a
+                    # declined row stays exactly as it was read.
+                    if ($stampLegacyCa) {
+                        Write-BatchLog "RequestID $($record.RequestID): the row records no CA (older tracking file); recording '$CAConfig'." -Level Warning
+                        $record | Add-Member -NotePropertyName CAConfig -NotePropertyValue $CAConfig -Force
+                    }
+                    $record.OutputCertFile = $effectiveDest
                     try {
                         Get-IssuedCertificate -Record $record -CAConfig $CAConfig -KeepRspFile:$KeepRspFile -AllowedRoots $retrieveRoots
                     }

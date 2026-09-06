@@ -70,7 +70,7 @@ Describe 'Submit-CertificateRequests' {
         foreach ($name in 'Resolve-FullPath', 'Resolve-TrackingFilePath', 'Assert-SafeNativeArgument', 'Assert-CertificateOutputPath', 'Assert-ProtectedDirectoryChain', 'Move-StaleCertificateAside', 'Remove-AsideIfIdentical', 'Move-RetrievedCertificate', 'New-TempCertificatePath',
                           'Get-TrustedPrincipalSet', 'ConvertTo-PrincipalLabel', 'Get-UntrustedGrant', 'Get-UntrustedOwner',
                           'Write-BatchLog', 'Get-RequestIdFromOutput', 'Get-DispositionFromOutput',
-                          'Get-FriendlyErrorHint', 'Import-TrackingData', 'Export-TrackingData', 'Remove-RspFile', 'Resolve-CertificateOutputNames') {
+                          'Get-FriendlyErrorHint', 'Import-TrackingData', 'Export-TrackingData', 'Remove-RspFile', 'Resolve-CertificateOutputNames', 'Get-DestinationOwnerConflict', 'Get-RequestFiles') {
             $def = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name }, $false)
             if ($def) { . ([scriptblock]::Create($def[0].Extent.Text)) }
         }
@@ -213,6 +213,26 @@ Describe 'Submit-CertificateRequests' {
             $rows[0].RequestID | Should -Be '7'
         }
 
+        It 'Export-TrackingData writes a tracking path containing wildcard characters literally (the checkpoint is not lost)' {
+            $p = Join-Path $TestDrive 'Cert[1]Tracking.csv'
+            $rows = @([pscustomobject]@{ RequestFile = 'C:\r\a.req'; RequestID = '9'; SubmitTime = ''; Status = 'Issued'; OutputCertFile = 'C:\r\a.cer'; LastCheckTime = ''; ErrorMessage = ''; CAConfig = 'ca\CA' })
+            $script:SuppressLogFile = $true
+            try { Export-TrackingData -Data $rows -Path $p 3>$null } finally { $script:SuppressLogFile = $false }
+            Test-Path -LiteralPath $p | Should -BeTrue -Because 'Export-Csv -Path would glob the [1] and silently fail to write the checkpoint, losing the RequestID of an already-submitted request'
+            (Import-Csv -LiteralPath $p).RequestID | Should -Be '9'
+        }
+
+        It 'Get-RequestFiles reads a bracketed drop folder literally and matches only EXACT .req/.csr/.txt extensions' {
+            $dir = Join-Path $TestDrive 'CSR[prod]'   # a real folder whose name contains a wildcard metacharacter
+            [void][System.IO.Directory]::CreateDirectory($dir)   # New-Item has no -LiteralPath; -Path would glob the brackets
+            foreach ($n in 'a.req', 'b.csr', 'note.txt', 'a.reqbak', 'c.request', 'readme.md') { Set-Content -LiteralPath (Join-Path $dir $n) -Value 'x' }
+            $script:SuppressLogFile = $true
+            try { $files = @(Get-RequestFiles -Path $dir 3>$null) } finally { $script:SuppressLogFile = $false }
+            @($files | ForEach-Object { $_.Name } | Sort-Object) | Should -Be (@('a.req', 'b.csr', 'note.txt') | Sort-Object) -Because 'the folder is read with -LiteralPath (not globbed as a character class) and only exact extensions match'
+            $files.Name | Should -Not -Contain 'a.reqbak' -Because "-Filter '*.req' would match this backup, submitting it to the CA"
+            $files.Name | Should -Not -Contain 'c.request'
+        }
+
         It 'a row from an older tracking file (no CAConfig property) is readable under strict mode' {
             Set-StrictMode -Version Latest
             $row = [pscustomobject]@{ RequestFile = 'C:\r\a.req'; RequestID = '7'; Status = 'Pending'; OutputCertFile = 'C:\r\a.cer' }
@@ -272,6 +292,47 @@ Describe 'Submit-CertificateRequests' {
             # an unresolvable clash aborts before anything is submitted
             $clash = @([pscustomobject]@{ RequestFile = 'C:\in\other.csr'; OutputCertFile = 'C:\out\web01.req.cer' })
             { Resolve-CertificateOutputNames -RequestPaths 'C:\in\web01.req', 'C:\in\web01.csr' -ExistingRows $clash } | Should -Throw -ExpectedMessage '*never share a destination*'
+            # a tracking row whose recorded destination carries a Win32-invalid path char (| < >) must
+            # NOT throw (GetFileName throws on 5.1): the row is simply not registered as taken.
+            $badRow = @([pscustomobject]@{ RequestFile = 'C:\in\other.req'; OutputCertFile = 'C:\out\a|b.cer' })
+            { Resolve-CertificateOutputNames -RequestPaths 'C:\in\web01.req' -ExistingRows $badRow } | Should -Not -Throw
+            (Resolve-CertificateOutputNames -RequestPaths 'C:\in\web01.req' -ExistingRows $badRow)['C:\in\web01.req'] | Should -Be 'web01.cer'
+        }
+
+        It 'Get-DestinationOwnerConflict finds another request (different RequestID, Issued/Undelivered) already owning the destination' {
+            $rows = @(
+                [pscustomobject]@{ RequestFile = 'C:\in\srv.req'; RequestID = '41'; Status = 'Pending'; OutputCertFile = 'C:\out\srv.cer'; SubmitTime = '2026-09-01T10:00:00' }
+                [pscustomobject]@{ RequestFile = 'C:\in\srv.req'; RequestID = '42'; Status = 'Issued';  OutputCertFile = 'C:\out\SRV.cer'; SubmitTime = '2026-09-02T10:00:00' }
+                [pscustomobject]@{ RequestFile = 'C:\in\web.req'; RequestID = '43'; Status = 'Issued';  OutputCertFile = 'C:\out\web.cer'; SubmitTime = '2026-09-02T11:00:00' }
+            )
+            (Get-DestinationOwnerConflict -Record $rows[0] -Tracking $rows).RequestID | Should -Be '42' -Because 'the newer request already delivered srv.cer (paths compare case-insensitively); retrieving 41 into it must be refused'
+            Get-DestinationOwnerConflict -Record $rows[2] -Tracking $rows | Should -BeNullOrEmpty
+            # a row never conflicts with itself, and a Pending/Error row owns nothing yet
+            Get-DestinationOwnerConflict -Record $rows[1] -Tracking $rows | Should -BeNullOrEmpty
+            $undelivered = [pscustomobject]@{ RequestFile = 'C:\in\web.req'; RequestID = '44'; Status = 'Undelivered'; OutputCertFile = 'C:\out\web.cer'; SubmitTime = '' }
+            (Get-DestinationOwnerConflict -Record $rows[2] -Tracking ($rows + $undelivered)).RequestID | Should -Be '44' -Because 'an Undelivered row has a certificate staged for that destination'
+        }
+
+        It 'Get-DestinationOwnerConflict is DIRECTIONAL: an older delivered request never blocks a newer one, and it fails closed on unparseable timestamps' {
+            # The -Force renewal case: 41 Issued (older) at srv.cer, 42 (newer) resubmitted to the
+            # SAME destination. The newer request must be deliverable; only a strictly newer row owns.
+            $renew = @(
+                [pscustomobject]@{ RequestFile = 'C:\in\srv.req'; RequestID = '41'; Status = 'Issued';  OutputCertFile = 'C:\out\srv.cer'; SubmitTime = '2026-09-01T10:00:00' }
+                [pscustomobject]@{ RequestFile = 'C:\in\srv.req'; RequestID = '42'; Status = 'Pending'; OutputCertFile = 'C:\out\srv.cer'; SubmitTime = '2026-09-02T10:00:00' }
+            )
+            Get-DestinationOwnerConflict -Record $renew[1] -Tracking $renew | Should -BeNullOrEmpty -Because 'the newer request 42 may deliver; the older Issued 41 does NOT own the destination'
+            # ...but once 42 has delivered (Issued), retrieving the OLDER still-pending... (make 41 the one retrieved)
+            $renew[1].Status = 'Issued'
+            (Get-DestinationOwnerConflict -Record $renew[0] -Tracking $renew).RequestID | Should -Be '42' -Because 'retrieving the OLDER 41 over the newer, already delivered 42 is refused'
+            # -Destination override checks the effective (redirected) path without mutating the row
+            Get-DestinationOwnerConflict -Record $renew[0] -Tracking $renew -Destination 'D:\Redirect\elsewhere.cer' |
+                Should -BeNullOrEmpty -Because 'redirected to a different physical path, there is no shared destination'
+            # unparseable/missing SubmitTime -> fail closed (refuse rather than guess the order)
+            $noTime = @(
+                [pscustomobject]@{ RequestFile = 'C:\in\x.req'; RequestID = '50'; Status = 'Issued';  OutputCertFile = 'C:\out\x.cer'; SubmitTime = '' }
+                [pscustomobject]@{ RequestFile = 'C:\in\x.req'; RequestID = '51'; Status = 'Pending'; OutputCertFile = 'C:\out\x.cer'; SubmitTime = 'not-a-date' }
+            )
+            (Get-DestinationOwnerConflict -Record $noTime[1] -Tracking $noTime).RequestID | Should -Be '50' -Because 'when the order cannot be established, the conflict is refused (fail closed)'
         }
 
         It 'Assert-CertificateOutputPath confines a tracking-row path to a rooted .cer beneath an allowed root' {

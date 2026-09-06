@@ -2,18 +2,18 @@
     "name":  "CrossCA",
     "displayName":  "Cross Certification Authority",
     "objectClass":  "pKICertificateTemplate",
-    "flags":  133136,
+    "flags":  67600,
     "revision":  105,
     "msPKI-Certificate-Name-Flag":  1,
     "msPKI-Enrollment-Flag":  8,
     "msPKI-Minimal-Key-Size":  2048,
-    "msPKI-Private-Key-Flag":  101056784,
+    "msPKI-Private-Key-Flag":  16,
     "msPKI-RA-Application-Policies":  [
                                           "1.3.6.1.4.1.311.10.3.10"
                                       ],
     "msPKI-RA-Signature":  1,
-    "msPKI-Template-Minor-Revision":  1,
-    "msPKI-Template-Schema-Version":  4,
+    "msPKI-Template-Minor-Revision":  0,
+    "msPKI-Template-Schema-Version":  2,
     "pKICriticalExtensions":  [
                                   "2.5.29.15",
                                   "2.5.29.19"

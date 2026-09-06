@@ -82,13 +82,19 @@ example — Microsoft's modern DC template, ready to import.
 same templates with compatibility moved to the newest setting — **CA: Windows Server 2016**,
 **recipient: Windows 10 / Windows Server 2016** — for the templates where that is possible.
 
-- **Only the 9 schema v2/v3 templates are upgraded** (CAExchange, CrossCA,
+- **Only the 8 schema v2/v3 templates that can be upgraded in place are** (CAExchange,
   DirectoryEmailReplication, DomainControllerAuthentication, KerberosAuthentication,
-  KeyRecoveryAgent, OCSPResponseSigning, RASAndIASServer, Workstation). The 24 **schema v1**
-  built-ins are read-only in the Certificate Templates MMC — their compatibility can't be
-  raised in place — so in `MaxCompat/` they are byte-identical to `Default/`. `MaxCompat/` is
-  therefore a complete, self-contained set: import from it and you get the newest compatibility
-  everywhere it's available.
+  KeyRecoveryAgent, OCSPResponseSigning, RASAndIASServer, Workstation). **CrossCA is deliberately
+  excluded from the upgrade**: it is schema v2 and carries `msPKI-RA-Application-Policies`, whose
+  encoding differs between v1/v2 (a bare application-policy OID list) and v3/v4 (a packed
+  `` name`type`value `` string). Raising the schema version in place without re-encoding that
+  attribute would make a v4 CA read no application-policy requirement, silently dropping the
+  RA-signature policy constraint — so the sync script now refuses that upgrade, and in `MaxCompat/`
+  CrossCA is byte-identical to `Default/` at its stock v2. The 24 **schema v1** built-ins are
+  read-only in the Certificate Templates MMC — their compatibility can't be raised in place —
+  so in `MaxCompat/` they too are byte-identical to `Default/`. `MaxCompat/` is therefore a
+  complete, self-contained set: import from it and you get the newest compatibility everywhere
+  it's available.
 - **What "latest compatibility" changes** (nothing else is touched): `msPKI-Template-Schema-Version`
   → `4`; `msPKI-Private-Key-Flag` gains `0x06060000` (CA = Server 2016, recipient = Win10/2016)
   plus `0x100` (`CT_FLAG_USE_LEGACY_PROVIDER`) for CSP-based templates — **not** for the one
@@ -156,7 +162,7 @@ legacy `DomainController` (v1) and `DomainControllerAuthentication` templates.
   from a second forest — the stock values are confirmed, not assumed.
 - **Import pre-flight:** every `Default/` and `EJBCA/` file passed `-Mode Import -WhatIf` with a
   throwaway name (zero residue).
-- **Live round-trip:** every `MaxCompat/` upgraded template (the 9 defaults + 3 EJBCA variants)
+- **Live round-trip:** every `MaxCompat/` upgraded template (the 8 defaults + 4 EJBCA variants)
   was imported for real into a live domain controller, which accepted each as a valid **v4**
   object with the intended `msPKI-Template-Schema-Version`, `msPKI-Private-Key-Flag`, and
   `msPKI-Certificate-Name-Flag`; the throwaways and their companion OID objects were then

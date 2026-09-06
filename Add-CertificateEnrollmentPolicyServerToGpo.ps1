@@ -1,11 +1,12 @@
 <#PSScriptInfo
-.VERSION 1.0.3
+.VERSION 1.0.5
 .GUID 54763db6-2359-401f-8960-ef0de5911aaf
 .AUTHOR Sveinung Svea
 .PROJECTURI https://github.com/TheOmnilord/ADCS
 .LICENSEURI https://github.com/TheOmnilord/ADCS/blob/main/LICENSE
 .TAGS ADCS PKI CertificateServices
 .RELEASENOTES
+1.0.4 - The gates that let the (Default) marker be set and -ReplaceExisting delete siblings now require the replacing entry to be complete in BOTH the live GPMC view and the EFFECTIVE registry.pol replay (a row whose authored values a later deletion record wipes was accepted from the GPMC view alone); a freshly written AD row or CEP entry must also show in the replay, else the run fails; the GPO mutation cmdlets pass -Confirm:$false inside approved actions and a removal or marker clear is verified from registry.pol before it is reported (a declined nested prompt reported a removal that never happened)
 1.0.3 - Help text only: -ReplaceExisting documents the complete-row requirement; no code change
 1.0.2 - A **-prefixed registry.pol instruction (**DeleteKeys, **DeleteValues, **del., **delvals.) decodes its data as a string whatever its type field says (**soft.<name> keeps its declared type, since it writes a value), as the Group Policy engine does (a **DeleteKeys typed REG_BINARY previously decoded to no data and deleted nothing in the model, so a deleted entry could be reported as present); a pre-existing AD-policy row or CEP entry counts as complete only with URL, PolicyID, FriendlyName and numeric Flags/AuthFlags/Cost present (URL + PolicyID alone is what an interrupted write leaves), for the prerequisite, the (Default) marker and -ReplaceExisting alike
 1.0.1 - The domain objectGUID for the AD Enrollment Policy row is resolved BEFORE any GPO write and a lookup failure now aborts the run (previously the CEP entry was written first and the failure became a warning, leaving a GPO that removes the AD enrollment policy from every client in scope); a GUID-shaped -GpoName falls back to the GPO ID only after an independent listing proves no GPO carries that display name (any other name-lookup failure is rethrown); registry.pol reads validate the PReg header, refuse oversized files and trailing junk, and return the EFFECTIVE value (records replayed in file order: last write wins, **del./**delvals./**DeleteValues honoured) instead of the first matching record; the deletion-order damage check is judged per value, so a deletion between an obsolete record and its replacement no longer raises a false DAMAGED warning
@@ -564,7 +565,13 @@ if ($PSCmdlet.ParameterSetName -eq 'Remove') {
         $markerMatches = $marker0 -and ("$marker0" -eq "$entryPid")
         $survivorServes = @($entries0 | Where-Object { $_.Key -ne $hash -and "$($_.PolicyID)" -eq "$marker0" }).Count -gt 0
         if ($PSCmdlet.ShouldProcess($gpoLabel, "Remove CEP entry $entryKey (URL=$entryUrl, PolicyID=$entryPid)")) {
-            Invoke-GPWrite -TolerateNotFound { Remove-GPRegistryValue @wr -Key $entryKey | Out-Null }
+            Invoke-GPWrite -TolerateNotFound { Remove-GPRegistryValue @wr -Confirm:$false -Key $entryKey | Out-Null }
+            # Verified from registry.pol on the write DC before it is reported (and before the
+            # marker below is cleared on the strength of it): a removal the cmdlet did not perform
+            # must not become "RemovedEntry = true".
+            if (Test-EntryRecordsPresent (Read-PolRecords -Path $polPath) "$relBase\$hash") {
+                throw "Removal of $entryKey did not take effect in $gpoLabel (registry.pol still carries records for the key)."
+            }
             $removedEntry = $true
         }
         if ($markerMatches -and $survivorServes) {
@@ -572,14 +579,15 @@ if ($PSCmdlet.ParameterSetName -eq 'Remove') {
         }
         if ($markerMatches -and -not $survivorServes -and ($removedEntry -or $WhatIfPreference)) {
             if ($PSCmdlet.ShouldProcess($gpoLabel, "Clear (Default) marker (would point at removed PolicyID $entryPid)")) {
-                Invoke-GPWrite -TolerateNotFound { Remove-GPRegistryValue @wr -Key $baseKey -ValueName '' | Out-Null }
+                Invoke-GPWrite -TolerateNotFound { Remove-GPRegistryValue @wr -Confirm:$false -Key $baseKey -ValueName '' | Out-Null }
+                if ($null -ne (Get-PolValue (Read-PolRecords -Path $polPath) $relBase '')) { throw "Clearing the (Default) marker in $gpoLabel did not take effect." }
                 $defaultCleared = $true
             }
         }
     }
     if ($ClearDefault -and -not $defaultCleared -and (Get-PolValue $preRecs $relBase '')) {
         if ($PSCmdlet.ShouldProcess($gpoLabel, 'Clear (Default) marker')) {
-            Invoke-GPWrite -TolerateNotFound { Remove-GPRegistryValue @wr -Key $baseKey -ValueName '' | Out-Null }
+            Invoke-GPWrite -TolerateNotFound { Remove-GPRegistryValue @wr -Confirm:$false -Key $baseKey -ValueName '' | Out-Null }
             $defaultCleared = $true
         }
     }
@@ -649,15 +657,21 @@ else {
     if ($PSCmdlet.ShouldProcess($gpoLabel, "Ensure AD Enrollment Policy row under $adTarget (URL=LDAP:, PolicyID=$adPid, Flags=0x14, Cost=0xFFFFFFFF)")) {
         try {
             Invoke-GPWrite {
-                Set-GPRegistryValue @wr -Key $adTarget -ValueName URL          -Type String -Value 'LDAP:' | Out-Null
-                Set-GPRegistryValue @wr -Key $adTarget -ValueName PolicyID     -Type String -Value $adPid | Out-Null
-                Set-GPRegistryValue @wr -Key $adTarget -ValueName FriendlyName -Type String -Value 'Active Directory Enrollment Policy' | Out-Null
-                Set-GPRegistryValue @wr -Key $adTarget -ValueName Flags        -Type DWord -Value 0x14 | Out-Null
-                Set-GPRegistryValue @wr -Key $adTarget -ValueName AuthFlags    -Type DWord -Value 2 | Out-Null
-                Set-GPRegistryValue @wr -Key $adTarget -ValueName Cost         -Type DWord -Value ([uint32]4294967295) | Out-Null
+                Set-GPRegistryValue @wr -Confirm:$false -Key $adTarget -ValueName URL          -Type String -Value 'LDAP:' | Out-Null
+                Set-GPRegistryValue @wr -Confirm:$false -Key $adTarget -ValueName PolicyID     -Type String -Value $adPid | Out-Null
+                Set-GPRegistryValue @wr -Confirm:$false -Key $adTarget -ValueName FriendlyName -Type String -Value 'Active Directory Enrollment Policy' | Out-Null
+                Set-GPRegistryValue @wr -Confirm:$false -Key $adTarget -ValueName Flags        -Type DWord -Value 0x14 | Out-Null
+                Set-GPRegistryValue @wr -Confirm:$false -Key $adTarget -ValueName AuthFlags    -Type DWord -Value 2 | Out-Null
+                Set-GPRegistryValue @wr -Confirm:$false -Key $adTarget -ValueName Cost         -Type DWord -Value ([uint32]4294967295) | Out-Null
             }
         } catch { throw "AD policy row write to $gpoLabel failed: $_ (the CEP entry was NOT written)" }
         Test-GpoEntry $adTarget @{ URL = 'LDAP:'; PolicyID = $adPid; Flags = 0x14; AuthFlags = 2; Cost = [uint32]4294967295 }
+        # Authored values are not the whole story: registry.pol is applied in RECORD ORDER, so a
+        # deletion instruction already sitting after this key's values (a damaged file) makes
+        # clients delete what was just written. The EFFECTIVE state must show the row as well.
+        if (-not (Test-PolEntryUsable (Get-PolEffectiveValues (Read-PolRecords -Path $polPath) "$relBase\$AD_KEY").Values 'LDAP:' "$adPid")) {
+            throw "AD policy row written to $gpoLabel and verified through GPMC, but registry.pol replay shows clients would NOT end up with it (its values are followed by a deletion record - damaged ordering). Run -Remove for the entry, then add it again. The CEP entry was NOT written."
+        }
         $adRow = 'applied'
     } else { $adRow = 'not run' }
 }
@@ -705,15 +719,21 @@ $action = "Write CEP entry '{0}' under {1} (URL={2}, PolicyID={3}, Flags=0x{4:X}
 if ($PSCmdlet.ShouldProcess($gpoLabel, $action)) {
     try {
         Invoke-GPWrite {
-            Set-GPRegistryValue @wr -Key $entryKey -ValueName URL          -Type String -Value $Url | Out-Null
-            Set-GPRegistryValue @wr -Key $entryKey -ValueName PolicyID     -Type String -Value $PolicyId | Out-Null
-            Set-GPRegistryValue @wr -Key $entryKey -ValueName FriendlyName -Type String -Value $PolicyName | Out-Null
-            Set-GPRegistryValue @wr -Key $entryKey -ValueName Flags        -Type DWord -Value ([int]$flags) | Out-Null
-            Set-GPRegistryValue @wr -Key $entryKey -ValueName AuthFlags    -Type DWord -Value ([int]$authFlags) | Out-Null
-            Set-GPRegistryValue @wr -Key $entryKey -ValueName Cost         -Type DWord -Value ([uint32]$Cost) | Out-Null
+            Set-GPRegistryValue @wr -Confirm:$false -Key $entryKey -ValueName URL          -Type String -Value $Url | Out-Null
+            Set-GPRegistryValue @wr -Confirm:$false -Key $entryKey -ValueName PolicyID     -Type String -Value $PolicyId | Out-Null
+            Set-GPRegistryValue @wr -Confirm:$false -Key $entryKey -ValueName FriendlyName -Type String -Value $PolicyName | Out-Null
+            Set-GPRegistryValue @wr -Confirm:$false -Key $entryKey -ValueName Flags        -Type DWord -Value ([int]$flags) | Out-Null
+            Set-GPRegistryValue @wr -Confirm:$false -Key $entryKey -ValueName AuthFlags    -Type DWord -Value ([int]$authFlags) | Out-Null
+            Set-GPRegistryValue @wr -Confirm:$false -Key $entryKey -ValueName Cost         -Type DWord -Value ([uint32]$Cost) | Out-Null
         }
     } catch { throw "CEP entry write to $gpoLabel failed (the entry may be partially written at an already-published GPO version - rerun after fixing the cause): $_" }
     Test-GpoEntry $entryKey @{ URL = $Url; PolicyID = $PolicyId; FriendlyName = $PolicyName; Flags = [int]$flags; AuthFlags = [int]$authFlags; Cost = [uint32]$Cost }
+    # The same effective-state check for the entry itself: the marker, the AE settings and
+    # -ReplaceExisting must never build on an entry clients never see.
+    # (Inline rather than Test-EntryComplete: that helper is defined further down, after this write.)
+    if (-not (Test-PolEntryUsable (Get-PolEffectiveValues (Read-PolRecords -Path $polPath) "$relBase\$hash").Values $Url "$PolicyId")) {
+        throw "CEP entry written to $gpoLabel and verified through GPMC, but registry.pol replay shows clients would NOT end up with it (its values are followed by a deletion record - damaged ordering). Run -Remove for this entry, then add it again."
+    }
     $entryApplied = $true
 }
 # The steps that point AT the entry - the (Default) marker and the removal of the entry's stale
@@ -748,6 +768,15 @@ function Test-EntryCompleteLive {
     } catch { return $false }
 }
 $entryExists = $entryApplied -or $WhatIfPreference -or (Test-EntryComplete $preRecs)
+# Root Flags live under the PolicyServers key ITSELF, so writing them announces GP CEP
+# configuration. Doing that with no usable policy-server entry in scope (the CEP entry was declined
+# AND there is no AD Enrollment Policy row) publishes "PolicyServers configured, zero servers",
+# which by this script's own client model makes clients treat GP CEP as present and stop falling
+# back to the built-in AD enrollment policy - the fleet-wide outage the AD-row ordering exists to
+# prevent. So the root Flags write is gated on a real entry being present (the CEP entry just
+# written or already complete, or the AD row written/already present). -SkipADPolicy alone does
+# NOT satisfy this: it means the AD row was deliberately omitted, not that a server exists.
+$policyServerPresent = $entryExists -or $adRowPresent -or ($adRow -eq 'applied')
 
 # ---- 3. root Flags (DISABLE bits; existing bits preserved; bit-safe for high-bit values) ---
 $existingRoot = Get-PolValue $preRecs $relBase 'Flags'
@@ -759,11 +788,14 @@ if ($newRoot -band 0x2) {
 if ($DisableUserConfigured) { $newRoot = $newRoot -bor 0x4 }
 if ($EnableUserConfigured)  { $newRoot = $newRoot -band (-bnot [int64]0x4) }
 $rootApplied = 'unchanged'
-if (($null -eq $existingRoot) -or ([int64]$existingRoot -ne $newRoot)) {
+if (-not $policyServerPresent -and -not $WhatIfPreference) {
+    $notes.Add("Root Flags NOT written: no usable policy-server entry exists in this GPO scope (the CEP entry was declined and there is no AD Enrollment Policy row). Writing PolicyServers root values would activate GP CEP configuration with no server, and clients in scope would lose the AD enrollment policy.")
+}
+elseif (($null -eq $existingRoot) -or ([int64]$existingRoot -ne $newRoot)) {
     $from = if ($null -ne $existingRoot) { '0x{0:X}' -f [int64]$existingRoot } else { '(absent)' }
     $rootApplied = 'not run'
     if ($PSCmdlet.ShouldProcess($gpoLabel, ('Set root Flags {0} -> 0x{1:X} on {2} (disable bits: 0x2 ignore GP list, 0x4 ignore user-configured)' -f $from, $newRoot, $baseKey))) {
-        Invoke-GPWrite { Set-GPRegistryValue @wr -Key $baseKey -ValueName Flags -Type DWord -Value ([uint32]$newRoot) | Out-Null }
+        Invoke-GPWrite { Set-GPRegistryValue @wr -Confirm:$false -Key $baseKey -ValueName Flags -Type DWord -Value ([uint32]$newRoot) | Out-Null }
         $rootApplied = 'applied'
     }
 }
@@ -774,13 +806,13 @@ if ($SetAsDefault) {
         $notes.Add("(Default) marker NOT set: the CEP entry was declined and does not exist in this GPO scope, so the marker would point at nothing.")
     }
     elseif ($PSCmdlet.ShouldProcess($gpoLabel, "Set (Default) marker = $PolicyId on $baseKey (default enrollment policy = '$PolicyName')")) {
-        Invoke-GPWrite { Set-GPRegistryValue @wr -Key $baseKey -ValueName '' -Type String -Value $PolicyId | Out-Null }
+        Invoke-GPWrite { Set-GPRegistryValue @wr -Confirm:$false -Key $baseKey -ValueName '' -Type String -Value $PolicyId | Out-Null }
         $defaultChanged = $true
     }
 }
 if ($ClearDefault -and (Get-PolValue $preRecs $relBase '')) {
     if ($PSCmdlet.ShouldProcess($gpoLabel, 'Clear (Default) marker')) {
-        Invoke-GPWrite -TolerateNotFound { Remove-GPRegistryValue @wr -Key $baseKey -ValueName '' | Out-Null }
+        Invoke-GPWrite -TolerateNotFound { Remove-GPRegistryValue @wr -Confirm:$false -Key $baseKey -ValueName '' | Out-Null }
         $defaultChanged = $true
     }
 }
@@ -795,10 +827,14 @@ if ($EnableAutoEnrollmentPolicy) {
     }
     if ($PSCmdlet.ShouldProcess($gpoLabel, "Enable Auto-Enrollment under $aeKey (AEPolicy=$AEPolicy, notify at $AEExpirationPercent% on '$AEStore')")) {
         Invoke-GPWrite {
-            Set-GPRegistryValue @wr -Key $aeKey -ValueName AEPolicy -Type DWord -Value ([int]$AEPolicy) | Out-Null
-            Set-GPRegistryValue @wr -Key $aeKey -ValueName OfflineExpirationPercent -Type DWord -Value ([int]$AEExpirationPercent) | Out-Null
-            Set-GPRegistryValue @wr -Key $aeKey -ValueName OfflineExpirationStoreNames -Type String -Value $AEStore | Out-Null
+            Set-GPRegistryValue @wr -Confirm:$false -Key $aeKey -ValueName AEPolicy -Type DWord -Value ([int]$AEPolicy) | Out-Null
+            Set-GPRegistryValue @wr -Confirm:$false -Key $aeKey -ValueName OfflineExpirationPercent -Type DWord -Value ([int]$AEExpirationPercent) | Out-Null
+            Set-GPRegistryValue @wr -Confirm:$false -Key $aeKey -ValueName OfflineExpirationStoreNames -Type String -Value $AEStore | Out-Null
         }
+        # Verify the write took like every other write in this script (the AE block previously got
+        # no verification at all). The deletion-order damage check below covers the **delvals. case
+        # the GPMC read cannot see.
+        Test-GpoEntry $aeKey @{ AEPolicy = [int]$AEPolicy; OfflineExpirationPercent = [int]$AEExpirationPercent; OfflineExpirationStoreNames = $AEStore }
         $aeApplied = $true
     }
 }
@@ -810,7 +846,11 @@ $entries = @(Get-PolEntries $postRecs)
 # write went through: the replacing entry must be complete at this moment - "written and verified
 # earlier this run" does not count, because another writer may have removed or changed it since -
 # or the "superseded" siblings are the only working endpoints for this PolicyID and must stay.
-$entryExists = $WhatIfPreference -or (Test-EntryCompleteLive)
+# BOTH views must agree: the live GPMC read (the API the writes went through) AND the effective
+# state replayed from registry.pol (record order, deletion instructions honoured). GPMC can still
+# expose a row's authored values while a later deletion record wipes them on every client; a
+# replacement that clients never see must not let the working siblings be removed.
+$entryExists = $WhatIfPreference -or ((Test-EntryComplete $postRecs) -and (Test-EntryCompleteLive))
 $dups = @($entries | Where-Object { "$($_.PolicyID)" -eq "$PolicyId" -and $_.Key -ne $hash -and $_.Key -ne $AD_KEY })
 foreach ($d in $dups) {
     if ($ReplaceExisting -and -not $entryExists) {
@@ -823,7 +863,7 @@ foreach ($d in $dups) {
             # complete, and this sibling must still serve the requested PolicyID under a different
             # URL, both as the GPMC API sees them right now. (Invoke-GPWrite's retries only re-run
             # the removal itself, sub-second, on transient errors.)
-            if (-not (Test-EntryCompleteLive)) {
+            if (-not ((Test-EntryComplete (Read-PolRecords -Path $polPath)) -and (Test-EntryCompleteLive))) {
                 $notes.Add("Superseded entry '$($d.URL)' (key $($d.Key)) NOT removed: the replacing CEP entry is no longer complete in the GPO (changed or removed while the prompt was open).")
                 continue
             }
@@ -831,7 +871,7 @@ foreach ($d in $dups) {
                 $notes.Add("Entry at key $($d.Key) NOT removed: it no longer serves PolicyID $PolicyId under a different URL (changed or removed while the prompt was open).")
                 continue
             }
-            Invoke-GPWrite -TolerateNotFound { Remove-GPRegistryValue @wr -Key "$baseKey\$($d.Key)" | Out-Null }
+            Invoke-GPWrite -TolerateNotFound { Remove-GPRegistryValue @wr -Confirm:$false -Key "$baseKey\$($d.Key)" | Out-Null }
             $dupRemoved += $d.URL
         }
     } else {
@@ -844,6 +884,11 @@ foreach ($pk in $polKeys) {
     $label = if ($pk -match '\\([0-9a-f]{40})$') { "entry key $($Matches[1])" } else { 'the PolicyServers root key' }
     Test-PolDeletionOrder $finalRecs $pk $label
 }
+# The AutoEnrollment key sits OUTSIDE the PolicyServers subtree scanned above, so a **delvals.
+# ordered after the AE values (the multi-value "list" form's hazard this script warns about) would
+# silently defeat the Auto-Enrollment write while the GPMC read still shows the authored values.
+# Scan it too whenever this run touched AE.
+if ($EnableAutoEnrollmentPolicy) { Test-PolDeletionOrder $finalRecs $relAe 'the Auto-Enrollment key' }
 $marker = Get-PolValue $finalRecs $relBase ''
 if ($marker) {
     $entriesNow = @(Get-PolEntries $finalRecs)

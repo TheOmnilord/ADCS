@@ -1,11 +1,12 @@
 <#PSScriptInfo
-.VERSION 1.0.3
+.VERSION 1.0.5
 .GUID 689db74d-e668-410a-9a62-0b208179a369
 .AUTHOR Sveinung Svea
 .PROJECTURI https://github.com/TheOmnilord/ADCS
 .LICENSEURI https://github.com/TheOmnilord/ADCS/blob/main/LICENSE
 .TAGS ADCS PKI CertificateServices
 .RELEASENOTES
+1.0.4 - Every known attribute of an import is validated for type, shape and range and the import is refused when one is malformed (a failed cast previously dropped the attribute - msPKI-RA-Signature included - and the template was created without it; 0.4 was coerced to 0, a three-element period array passed as a period); an issuance policy OID that the TARGET forest links to a group via Authentication Mechanism Assurance refuses the import unless -AllowLinkedIssuancePolicy is given (new switch)
 1.0.3 - Help text only: -EnrollPrincipals documents the UPN-only resolution of user@domain keys, -UpgradeCompatibility the legacy-provider rule, -Mode Validate the read-back failure; no code change
 1.0.2 - A user@domain principal in -EnrollPrincipals resolves ONLY as a UPN, and a different object carrying that string as its sAMAccountName is refused (sAMAccountName may contain '@', so a planted account could previously capture a grant meant for the UPN); -UpgradeCompatibility sets CT_FLAG_USE_LEGACY_PROVIDER only for a schema-2 source with a provider list and preserves a schema-3 source's own bit (a v3 KSP template was switched to legacy provider handling); -Mode Validate fails with a terminating error when the throwaway template cannot be read back after creation (previously a warning and exit 0 with nothing validated)
 1.0.1 - The template create is now -ErrorAction Stop with a returned-object check (a non-terminating New-ADObject failure previously printed a green "Created template" line with an empty DN, orphaned the companion OID object and exited 0); after the create the OID is re-queried and, if another template claimed it concurrently, the new template is rolled back and the run fails
@@ -241,6 +242,17 @@
     0x100) is set only for a schema-2 source with a provider list (v2 knows only CryptoAPI CSPs); a
     schema-3 source keeps its own bit, so a v3 template that lists a KSP stays CNG.
 
+.PARAMETER AllowLinkedIssuancePolicy
+    Import/Sync. By default the import is REFUSED when the template carries an issuance policy OID
+    (msPKI-Certificate-Policy / msPKI-RA-Policies) that the TARGET forest already links to a group
+    through Authentication Mechanism Assurance (msDS-OIDToGroupLink): certificates issued from the
+    copy would grant that group's membership at logon to every principal the copy's enrollment ACL
+    admits, with no link ever being copied. Pass this switch to accept such a mapping deliberately
+    (the linked OIDs and groups are then listed in a warning). Every known attribute of the import
+    is also validated for type, shape and range before anything is created - a malformed or
+    tampered export (a non-integer msPKI-RA-Signature, a three-byte validity period, a non-OID
+    application policy) is refused, never silently dropped or coerced.
+
 .PARAMETER KeepArtifacts
     Validate only. Leaves the throwaway templates and the export file in place after the diff
     (default is to remove them). No companion OID object is ever created for the throwaways (they use
@@ -351,8 +363,10 @@
     - Authentication Mechanism Assurance (AMA) links are NOT carried over: an msDS-OIDToGroupLink
       on a source-forest issuance policy OID points at a group DN in THAT forest and cannot be
       copied. If you use AMA, recreate the link in the target forest manually (policy OID object ->
-      a local universal group with no static members); until then, certificates from the synced
-      template grant no AMA group membership there.
+      a local universal group with no static members). The reverse case IS checked: when the
+      copy carries an issuance policy OID that the TARGET forest already links to a group, the
+      import is refused unless -AllowLinkedIssuancePolicy is given, because certificates from the
+      copy would grant that group's membership at logon.
     - v1 templates copy too (the export warns): the object round-trips faithfully, but Windows
       fixes v1 semantics in code - v1 consumers match by NAME, and the definition is not editable
       and never autoenrolls. Import a v1 template under its ORIGINAL name (a renamed copy is
@@ -401,6 +415,8 @@ param(
 
     [switch]$UpgradeCompatibility,
 
+    [switch]$AllowLinkedIssuancePolicy,
+
     [switch]$KeepArtifacts
 )
 
@@ -419,6 +435,10 @@ $script:MultiValueAttributes = @(
     'pKICriticalExtensions', 'pKIDefaultCSPs', 'pKIExtendedKeyUsage'
 )
 $script:ByteAttributes = @('pKIExpirationPeriod', 'pKIKeyUsage', 'pKIOverlapPeriod')
+# Multi-value attributes whose every element must be a dotted OID (the others - pKIDefaultCSPs,
+# msPKI-RA-Application-Policies, msPKI-Supersede-Templates - carry provider strings, packed
+# name/value text and template names).
+$script:OidListAttributes = @('msPKI-Certificate-Application-Policy', 'msPKI-Certificate-Policy', 'msPKI-RA-Policies', 'pKIExtendedKeyUsage', 'pKICriticalExtensions')
 
 # Per-run caches: schema-derived types for attributes the static lists don't know, and the target
 # forest-root domain SID (resolved lazily, only when a grant actually needs it).
@@ -447,6 +467,21 @@ function Convert-ToLatestCompatibility {
     $ver = if ($Attributes.ContainsKey('msPKI-Template-Schema-Version')) { [int]$Attributes['msPKI-Template-Schema-Version'] } else { 1 }
     if ($ver -lt 2) { return [pscustomobject]@{ Upgraded = $false; FromVersion = $ver; Reason = 'schema v1 template - not upgradable in place' } }
     if ($ver -ge 4) { return [pscustomobject]@{ Upgraded = $false; FromVersion = $ver; Reason = 'already at the latest compatibility (schema v4)' } }
+
+    # A schema-2 source carrying msPKI-RA-Application-Policies cannot be upgraded in place: that
+    # attribute's ENCODING is schema-version dependent - a bare list of required application-policy
+    # OIDs at v1/v2, but a packed `name`type`value` string at v3/v4 (this script's own .NOTES states
+    # it, and the msPKI-Key-Security-Descriptor handling depends on the same packed form). Stamping
+    # v4 while leaving the v2 encoding makes a v4-aware CA parse the OID list as packed triples, find
+    # no entry, and stop enforcing the application-policy constraint on the required RA signature -
+    # msPKI-RA-Signature still demands a co-signature, but now from any enrollment agent rather than
+    # one holding the named policy. Refuse (the caller warns and imports at stock compatibility)
+    # rather than silently weaken the co-signing requirement; re-encode the attribute by hand if a
+    # v4 copy is genuinely needed.
+    if ($ver -eq 2 -and $Attributes.ContainsKey('msPKI-RA-Application-Policies') -and
+        $null -ne $Attributes['msPKI-RA-Application-Policies'] -and @($Attributes['msPKI-RA-Application-Policies']).Count -gt 0) {
+        return [pscustomobject]@{ Upgraded = $false; FromVersion = $ver; Reason = 'schema v2 source carries msPKI-RA-Application-Policies, whose encoding differs at v3/v4; upgrading in place would drop the RA-signature application-policy requirement - imported at its stock compatibility instead' }
+    }
 
     $pkf = if ($Attributes.ContainsKey('msPKI-Private-Key-Flag')) { [BitConverter]::ToUInt32([BitConverter]::GetBytes([int]$Attributes['msPKI-Private-Key-Flag']), 0) } else { [uint32]0 }
     # The two compatibility levels are VERSION NIBBLES, not independent bits: CA min-version at
@@ -635,7 +670,7 @@ function Resolve-TemplateOid {
     if ($ExplicitOid) {
         # Internal (Validate) path today, but validate all the same: this value reaches an LDAP
         # filter and becomes the new template's stored identity.
-        if ($ExplicitOid -notmatch '^(0|[1-9]\d*)(\.(0|[1-9]\d*))+$') {
+        if ($ExplicitOid -notmatch '^(0|[1-9]\d*)(\.(0|[1-9]\d*))+\z') {
             throw "The explicit OID '$ExplicitOid' is not a valid dotted OID."
         }
         return @{ Oid = $ExplicitOid; CompanionCn = $null; CompanionContainerDN = $null }
@@ -654,7 +689,7 @@ function Resolve-TemplateOid {
             if (-not $OidRoot) {
                 throw "OidHandling 'GenerateFromRoot' requires -OidRoot (the base OID to generate under, e.g. 1.3.6.1.4.1.311.21.8.<5 arcs>)."
             }
-            if ($OidRoot -notmatch '^(0|[1-9]\d*)(\.(0|[1-9]\d*))+$') {
+            if ($OidRoot -notmatch '^(0|[1-9]\d*)(\.(0|[1-9]\d*))+\z') {
                 throw "-OidRoot '$OidRoot' is not a valid dotted OID (digits and dots only, no leading zeros in an arc)."
             }
             if ($OidRoot -eq '1.3.6.1.4.1.311.21.8') {
@@ -679,7 +714,7 @@ function Resolve-TemplateOid {
             if (-not $SourceOid) {
                 throw "OidHandling 'Preserve' needs the source template's OID, but msPKI-Cert-Template-OID is missing (a v1 template, or exported with -StripOid?). Re-export without -StripOid, or use -OidHandling GenerateFromRoot / GenerateRandom / Generate."
             }
-            if ($SourceOid -notmatch '^(0|[1-9]\d*)(\.(0|[1-9]\d*))+$') {
+            if ($SourceOid -notmatch '^(0|[1-9]\d*)(\.(0|[1-9]\d*))+\z') {
                 # Externally-supplied value: validate before it reaches any LDAP filter or gets written
                 # as the template's identity (a tampered '*' would otherwise wildcard-match and be stored).
                 throw "The source msPKI-Cert-Template-OID ('$SourceOid') is not a valid dotted OID - the export file (or source object) looks corrupted or tampered with."
@@ -870,6 +905,106 @@ function Get-SchemaAttributeType {
     $type
 }
 
+function ConvertTo-ImportAttributeValue {
+    # Converts ONE known template attribute from the import view (JSON export or live AD read) to
+    # the exact value New-ADObject must receive, and REFUSES anything malformed with a terminating
+    # error that names the attribute. The casts used to run bare: under the default error
+    # preference a failed [int] cast is only statement-terminating, so a corrupted (or tampered)
+    # export silently DROPPED the attribute - msPKI-RA-Signature among them, a CA-enforced control -
+    # and the template was created without it. JSON also arrives in shapes a bare cast quietly
+    # coerces: 0.4 -> 0, a three-element period array -> a three-byte "period", "5" -> 5. Every
+    # known attribute is therefore checked for exact type, shape and range, and the whole input
+    # is converted before anything is created. Returns: [int] for the integer attributes, [byte[]]
+    # for the period/key-usage attributes, [object[]] of strings for the multi-value attributes
+    # (the caller casts that to the AD collection type; this function needs no AD module).
+    param([Parameter(Mandatory)][string]$Name, [Parameter(Mandatory)][AllowNull()][AllowEmptyCollection()][AllowEmptyString()]$Value)
+    $fail = { param($why) throw "Import refused: attribute '$Name' is malformed ($why). The export is corrupt or was tampered with - re-export it from the source, or remove the attribute deliberately." }
+    if ($null -eq $Value) { & $fail 'no value' }
+    if ($Name -in $script:IntAttributes) {
+        $v = $Value
+        if ($v -is [System.Collections.IEnumerable] -and $v -isnot [string]) {
+            $arr = @($v)
+            if ($arr.Count -ne 1) { & $fail "expected one integer, got $($arr.Count) values" }
+            $v = $arr[0]
+        }
+        if ($null -eq $v)   { & $fail 'no value' }
+        if ($v -is [string]) { & $fail 'expected an integer, got a string' }
+        if ($v -is [bool])   { & $fail 'expected an integer, got a boolean' }
+        if ($v -is [double] -or $v -is [single] -or $v -is [decimal]) {
+            # Guarded like the byte branch below: a giant or non-finite JSON number (1e40, Infinity,
+            # NaN) overflows the [decimal] cast. Unguarded it throws a raw ".NET cannot convert"
+            # error BEFORE $fail runs - the import is still refused (fail closed), but the message
+            # would not name the attribute, contrary to this function's contract.
+            $dv = try { [decimal]$v } catch { $null }
+            if ($null -eq $dv) { & $fail "value $v is outside the Int32 range" }
+            if ([math]::Truncate($dv) -ne $dv) { & $fail "expected an integer, got $v" }
+            $v = $dv
+        }
+        elseif ($v -isnot [byte] -and $v -isnot [sbyte] -and $v -isnot [int16] -and $v -isnot [uint16] -and
+                $v -isnot [int] -and $v -isnot [uint32] -and $v -isnot [long] -and $v -isnot [uint64]) {
+            & $fail "expected an integer, got $($v.GetType().Name)"
+        }
+        $d = [decimal]$v
+        if ($d -lt [int]::MinValue -or $d -gt [int]::MaxValue) { & $fail "value $v is outside the Int32 range" }
+        return [System.Int32]$d
+    }
+    if ($Name -in $script:ByteAttributes) {
+        if ($Value -is [string]) { & $fail 'expected a byte array, got a string' }
+        $arr = @($Value)
+        $expect = if ($Name -eq 'pKIKeyUsage') { @(1, 2) } else { @(8) }
+        if ($arr.Count -notin $expect) { & $fail "expected $($expect -join ' or ') byte(s), got $($arr.Count)" }
+        $bytes = New-Object byte[] $arr.Count
+        for ($i = 0; $i -lt $arr.Count; $i++) {
+            $b = $arr[$i]
+            if ($null -eq $b -or $b -is [string] -or $b -is [bool]) { & $fail "element $i is not a byte" }
+            $d = try { [decimal]$b } catch { $null }
+            if ($null -eq $d -or [math]::Truncate($d) -ne $d -or $d -lt 0 -or $d -gt 255) { & $fail "element $i ($b) is not a byte (0-255)" }
+            $bytes[$i] = [byte]$d
+        }
+        return , $bytes
+    }
+    if ($Name -in $script:MultiValueAttributes) {
+        $arr = if ($Value -is [string]) { @($Value) } else { @($Value) }
+        $out = New-Object System.Collections.Generic.List[string]
+        foreach ($e in $arr) {
+            if ($null -eq $e) { & $fail 'a $null element' }
+            if ($e -isnot [string]) { & $fail "element '$e' is $($e.GetType().Name), expected a string" }
+            if ($e.Length -eq 0) { & $fail 'an empty element' }
+            if ($e -match '[\x00-\x1F\x7F]') { & $fail 'an element contains control characters' }
+            if ($Name -in $script:OidListAttributes -and $e -notmatch '^\d+(\.\d+)+\z') { & $fail "'$e' is not a dotted OID" }
+            $out.Add($e)
+        }
+        if (-not $out.Count) { & $fail 'no values' }
+        return , [object[]]$out.ToArray()
+    }
+    $Value
+}
+
+function Get-LinkedIssuancePolicy {
+    # Issuance-policy OIDs the import carries (msPKI-Certificate-Policy, msPKI-RA-Policies) that the
+    # TARGET forest already binds to a group through Authentication Mechanism Assurance
+    # (msDS-OIDToGroupLink on the OID object). A copy carrying such an OID issues certificates that
+    # grant that group's membership at logon - to everyone its enrollment ACL admits - with no link
+    # ever being copied: the link already exists here. An export the operator did not author, or
+    # one an attacker edited, can carry exactly such an OID. Returns one record per linked OID:
+    # @{ Oid; OidObjectDN; GroupDN }.
+    param([hashtable]$Attributes, [string]$ConfigNC, [hashtable]$ADParams)
+    $oids = @()
+    foreach ($a in 'msPKI-Certificate-Policy', 'msPKI-RA-Policies') {
+        if ($Attributes.ContainsKey($a) -and $null -ne $Attributes[$a]) { $oids += @($Attributes[$a] | ForEach-Object { "$_" }) }
+    }
+    $oids = @($oids | Where-Object { $_ } | Sort-Object -Unique)
+    if (-not $oids.Count) { return @() }
+    $oidContainerDN = "CN=OID,CN=Public Key Services,CN=Services,$ConfigNC"
+    if (-not (Get-ADObjectIfPresent -Identity $oidContainerDN -ADParams $ADParams)) { return @() }   # no OID container: no links can exist
+    $clauses = ($oids | ForEach-Object { "(msPKI-Cert-Template-OID=$(ConvertTo-LdapFilterValue $_))" }) -join ''
+    # -ErrorAction Stop: "no links" may only mean that a SUCCESSFUL search found none.
+    @(Get-ADObject @ADParams -SearchBase $oidContainerDN -ErrorAction Stop `
+        -LDAPFilter "(&(objectClass=msPKI-Enterprise-Oid)(msDS-OIDToGroupLink=*)(|$clauses))" `
+        -Properties 'msPKI-Cert-Template-OID', 'msDS-OIDToGroupLink' |
+        ForEach-Object { [pscustomobject]@{ Oid = "$($_.'msPKI-Cert-Template-OID')"; OidObjectDN = $_.DistinguishedName; GroupDN = "$($_.'msDS-OIDToGroupLink')" } })
+}
+
 function Import-Template {
     param(
         [Parameter(Mandatory)]
@@ -882,6 +1017,7 @@ function Import-Template {
         [string]$ConfigNC,        # skips the RootDSE read when the caller already has it
         [hashtable]$ADParams,
         [switch]$UpgradeCompatibility,
+        [switch]$AllowLinkedIssuancePolicy,
         [System.Management.Automation.PSCmdlet]$CallerCmdlet
     )
 
@@ -940,14 +1076,13 @@ function Import-Template {
             Write-Verbose "Skipping pKIEnrollmentAccess (ACLs are rebuilt on import, never copied)."
             continue
         }
-        if ($name -in $script:IntAttributes) {
-            $oa[$name] = [System.Int32]$import.$name
+        if ($name -in $script:IntAttributes -or $name -in $script:ByteAttributes) {
+            # Validated and converted, or the import is REFUSED - never dropped or coerced (see
+            # ConvertTo-ImportAttributeValue).
+            $oa[$name] = ConvertTo-ImportAttributeValue -Name $name -Value $import.$name
         }
         elseif ($name -in $script:MultiValueAttributes) {
-            $oa[$name] = [Microsoft.ActiveDirectory.Management.ADPropertyValueCollection]$import.$name
-        }
-        elseif ($name -in $script:ByteAttributes) {
-            $oa[$name] = [System.Byte[]]$import.$name
+            $oa[$name] = [Microsoft.ActiveDirectory.Management.ADPropertyValueCollection](ConvertTo-ImportAttributeValue -Name $name -Value $import.$name)
         }
         elseif ($name -match '^(msPKI-|pKI)') {
             # A PKI attribute the static lists don't know (a schema extension linked to the template
@@ -1001,6 +1136,24 @@ function Import-Template {
         }
         else {
             Write-Warning "-UpgradeCompatibility: $($compat.Reason); the template is imported at its existing compatibility."
+        }
+    }
+
+    # Pre-flight: issuance policies the copy carries must not be ones THIS forest already binds to
+    # a group through Authentication Mechanism Assurance - only the template OID was collision-checked
+    # so far, while a policy OID rides along verbatim. Skipped for Validate's throwaway copies
+    # (-ExplicitOid): they live in the SOURCE forest, where the source template carries the very same
+    # policy legitimately. -AllowLinkedIssuancePolicy accepts the mapping deliberately.
+    if (-not $ExplicitOid) {
+        $linked = @(Get-LinkedIssuancePolicy -Attributes $oa -ConfigNC $configNC -ADParams $ADParams)
+        if ($linked.Count) {
+            $list = ($linked | ForEach-Object { "$($_.Oid) -> $($_.GroupDN)" }) -join '; '
+            if ($AllowLinkedIssuancePolicy) {
+                Write-Warning "The template carries issuance policy OID(s) that THIS forest links to a group via Authentication Mechanism Assurance ($list). Certificates issued from the copy will grant that group's membership at logon to every principal its enrollment ACL admits (-AllowLinkedIssuancePolicy given; proceeding)."
+            }
+            else {
+                throw "Import refused: the template carries issuance policy OID(s) that THIS forest already links to a group via Authentication Mechanism Assurance: $list. Certificates issued from the copy would grant that group's membership at logon to every principal its enrollment ACL admits - a security decision, not a copy detail. Strip the OID from the source's msPKI-Certificate-Policy / msPKI-RA-Policies, or rerun with -AllowLinkedIssuancePolicy to accept the mapping deliberately."
+            }
         }
     }
 
@@ -1255,15 +1408,18 @@ function Resolve-PrincipalSid {
     # never goes into a filter). -ErrorAction Stop: a failed search must fail the run, not silently
     # degrade into a token/not-found path that could resolve a different SID.
     $escName = ConvertTo-LdapFilterValue $name
-    if ($id -notmatch '\\' -and $id -match '@') {
-        # ANY unprefixed value containing '@' is a UPN and is resolved ONLY as one (a stricter shape
-        # test would route an odd-but-real UPN such as 'ann lee@x.test' back to the sAMAccountName
-        # lookup, and with it around the shadow check). sAMAccountName may legally contain '@',
-        # so an attacker with account-creation rights could plant a principal whose sAMAccountName
-        # equals the victim's UPN; consulting sAMAccountName first (as before) would have handed
-        # that principal the grant. The UPN lookup is the authority, and a sAMAccountName match for
-        # the same string that is a DIFFERENT object is refused rather than guessed.
-        $escUpn = ConvertTo-LdapFilterValue $id
+    if ($name -match '@') {
+        # ANY value whose NAME PART (after an optional DOMAIN\ prefix, already validated to name the
+        # target domain) contains '@' is a UPN and is resolved ONLY as one - classifying on $name, not
+        # the raw $id, so the documented DOMAIN\user@domain form takes this branch too (matching on $id
+        # let a 'DOMAIN\'-prefixed key skip straight to the sAMAccountName lookup). A stricter shape
+        # test would route an odd-but-real UPN such as 'ann lee@x.test' back to sAMAccountName, and
+        # with it around the shadow check. sAMAccountName may legally contain '@', so an attacker with
+        # account-creation rights could plant a principal whose sAMAccountName equals the victim's UPN;
+        # consulting sAMAccountName first (as before) would have handed that principal the grant. The
+        # UPN lookup is the authority, and a sAMAccountName match for the same string that is a
+        # DIFFERENT object is refused rather than guessed.
+        $escUpn = ConvertTo-LdapFilterValue $name
         $obj = @(Get-ADObject @ADParams -LDAPFilter "(userPrincipalName=$escUpn)" -Properties objectSid -ErrorAction Stop |
                 Where-Object { $_.objectSid })
         $shadow = @(Get-ADObject @ADParams -LDAPFilter "(sAMAccountName=$escName)" -Properties objectSid -ErrorAction Stop |
@@ -1742,8 +1898,8 @@ Import-Module ActiveDirectory -ErrorAction Stop
 # and a future mode or parameter needs exactly one list updated.
 $modeParams = @{
     Export   = 'Path', 'TemplateName', 'StripIdentity', 'StripOid', 'Server', 'Credential'
-    Import   = 'Path', 'NewTemplateName', 'NewDisplayName', 'OidHandling', 'OidRoot', 'SkipAcl', 'AclBase', 'EnrollPrincipals', 'UpgradeCompatibility', 'Server', 'Credential'
-    Sync     = 'TemplateName', 'NewTemplateName', 'NewDisplayName', 'OidHandling', 'OidRoot', 'SkipAcl', 'AclBase', 'EnrollPrincipals', 'UpgradeCompatibility', 'Server', 'Credential', 'SourceServer', 'SourceCredential'
+    Import   = 'Path', 'NewTemplateName', 'NewDisplayName', 'OidHandling', 'OidRoot', 'SkipAcl', 'AclBase', 'EnrollPrincipals', 'UpgradeCompatibility', 'AllowLinkedIssuancePolicy', 'Server', 'Credential'
+    Sync     = 'TemplateName', 'NewTemplateName', 'NewDisplayName', 'OidHandling', 'OidRoot', 'SkipAcl', 'AclBase', 'EnrollPrincipals', 'UpgradeCompatibility', 'AllowLinkedIssuancePolicy', 'Server', 'Credential', 'SourceServer', 'SourceCredential'
     Validate = 'TemplateName', 'Path', 'KeepArtifacts', 'Server', 'Credential'
 }
 $commonParams = @([System.Management.Automation.PSCmdlet]::CommonParameters) + @([System.Management.Automation.PSCmdlet]::OptionalCommonParameters) + 'Mode'
@@ -1840,6 +1996,7 @@ switch ($Mode) {
             OidRoot              = $OidRoot
             ADParams             = $adParams
             UpgradeCompatibility = $UpgradeCompatibility
+            AllowLinkedIssuancePolicy = $AllowLinkedIssuancePolicy
             CallerCmdlet         = $PSCmdlet
         }
         if ($Mode -eq 'Sync') {

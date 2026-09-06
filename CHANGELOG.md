@@ -8,6 +8,50 @@ Each script also carries its own version in the `PSScriptInfo` header at the top
 Test-ScriptFileInfo .\Submit-CertificateRequests.ps1 | Select-Object Name, Version
 ```
 
+## [1.0.6] — 2026-09-06
+
+Two adversarial review rounds after v1.0.5 — a Codex/gpt-6-astra full-repository review, then a thorough Claude review (13 finders with 3-refuter verification). Every finding was verified against the code before fixing.
+
+### Fixed — Codex (gpt-6-astra) full-repository review
+- **Sync-ADCSTemplate.ps1**
+  - Every known attribute of an import is validated for type, shape and range and converted before anything is created; a malformed value **refuses the import** with the attribute named. The casts ran bare, so under the default error preference a failed `[int]` cast was only statement-terminating and a tampered export silently *dropped* the attribute — `msPKI-RA-Signature`, a CA-enforced control, among them. JSON shapes a bare cast coerced (`0.4` to `0`, a three-element period array, `"5"` to `5`) are refused; OID-list attributes must hold dotted OIDs; a giant or non-finite number (`1e40`, Infinity, NaN) is refused with the attribute named rather than a raw .NET error.
+  - An issuance policy OID (`msPKI-Certificate-Policy` / `msPKI-RA-Policies`) that the **target** forest already links to a group through Authentication Mechanism Assurance refuses the import unless the new `-AllowLinkedIssuancePolicy` switch is given: certificates from the copy would otherwise grant that group's membership at logon to everyone the copy's enrollment ACL admits, with no link ever copied. Validate's throwaway copies are exempt.
+- **Add-CertificateEnrollmentPolicyServerOffline.ps1**
+  - Before any write, every existing key from the hive root down to the target is checked for a registry **symbolic link**, an untrusted owner, or write-class rights for an untrusted principal. A link planted where `PolicyServers` did not exist yet would have carried an elevated first-time write to whatever key it pointed at; `-LiteralPath` stops wildcards, not link traversal.
+  - String values and the `(Default)` marker are written as `REG_SZ` explicitly and every value's **kind** is verified (`Set-ItemProperty` without `-Type` kept an existing wrong kind); the cmdlets inside an approved action pass `-Confirm:$false` and a removal is verified before it is reported.
+- **Add-CertificateEnrollmentPolicyServerToGpo.ps1**
+  - The gates that set the `(Default)` marker and let `-ReplaceExisting` delete siblings require the replacing entry to be complete in **both** the live GPMC view and the effective `registry.pol` replay; a freshly written AD row or CEP entry must also show in the replay, or the run fails. The mutation cmdlets pass `-Confirm:$false` and a removal or marker clear is verified from `registry.pol` before it is reported.
+- **Submit-CertificateRequests.ps1** — `-Mode Retrieve` refuses to deliver a request whose destination already holds the certificate of a *different* request for the same request file, so an older request no longer overwrites a newer certificate.
+
+### Fixed — thorough Claude review (20 confirmed findings)
+- **Set-ADCSTemplateValidity.ps1 → 1.0.4**
+  - **(high)** The script was `begin`/`process`/`end`; under Windows PowerShell 5.1, `powershell.exe -File` with a non-console stdin (a scheduler, CI, WinRM/psexec, or the `< NUL` idiom) never ran the `process{}` block, so a privileged unattended run searched nothing, changed nothing, printed nothing and exited 0. It is now a flat body.
+  - A confirmation failure (non-interactive host, `ConfirmImpact` High, no `-Confirm:$false`) is caught, counted and emitted as an `Error` row instead of escaping the loop uncounted.
+  - The run-level failure is raised with a non-terminating error plus `exit 1` rather than `throw`, so a caller that captures or pipes the structured report keeps it while automation still sees a non-zero exit.
+- **Submit-CertificateRequests.ps1 → 1.0.7**
+  - `Get-RequestFiles` reads the drop folder with `-LiteralPath` and an exact-extension filter: a folder named e.g. `CSR[prod]` was globbed as a character class and matched nothing (exit 0, work undone), and `-Filter '*.req'` also matched longer extensions like `.reqbak` / `.request`, submitting stray backups to the CA.
+  - `Export-TrackingData` writes the checkpoint with `-LiteralPath` and `Remove-RspFile` removes with `-LiteralPath`: a tracking path or request name containing `[ ]` lost the RequestID (resubmitted as a duplicate) or left the `.rsp` behind.
+  - certreq's redirected stdout/stderr are read with `-Encoding Oem`: the default was ANSI on 5.1 but UTF-8 on 7, so a localized CA's `ErrorMessage` differed by engine and was lossy on 7.
+  - `Get-DestinationOwnerConflict` is now **directional** (only a strictly newer request owns the shared destination), so a `-Force` renewal that goes `Pending` can be retrieved instead of blocking every later run forever; and it guards its `[System.IO.Path]` calls (an invalid path character in a hand-edited row threw on 5.1 and aborted the whole batch).
+  - `-Mode Retrieve` computes the redirected destination and stamps a legacy row's `CAConfig` only inside the approved `ShouldProcess` branch, so a declined row is left byte-identical in the tracking file.
+- **Sync-ADCSTemplate.ps1 → 1.0.5**
+  - The documented `DOMAIN\user@domain` principal form now takes the UPN-only resolution and sAMAccountName shadow check (matching on the raw key let a prefixed key skip to the sAMAccountName lookup, so a planted account could still capture the grant).
+  - The dotted-OID validation regexes are anchored with the true end-of-string anchor instead of the end-of-line anchor, so a trailing newline in a tampered `msPKI-Cert-Template-OID` can no longer pass validation and bypass the template-OID uniqueness search.
+  - `-UpgradeCompatibility` refuses a schema-2 source carrying `msPKI-RA-Application-Policies` — its encoding differs at v3/v4, so upgrading in place would silently drop the RA-signature application-policy requirement.
+- **Add-CertificateEnrollmentPolicyServerToGpo.ps1 → 1.0.5** / **Add-CertificateEnrollmentPolicyServerOffline.ps1 → 1.0.5**
+  - Root Flags are no longer written when no usable policy-server entry exists in scope (the CEP entry declined **and** no AD Enrollment Policy row): writing PolicyServers root values there activated GP CEP configuration with zero servers, so clients lost the AD enrollment policy fleet-wide.
+  - (GPO) The Auto-Enrollment write is now verified and its key is included in the deletion-order damage scan — a deletion record ordered after the AE values defeated autoenrollment silently while the run reported `applied=True`.
+- **Templates/**: `MaxCompat/Default/CrossCA.json` is restored to its stock schema v2 (it cannot be upgraded in place — see Sync 1.0.5), and `Templates/README.md`'s provenance count is corrected to the true **8 upgraded defaults + 4 EJBCA variants**.
+- Tests: coverage added for every fix — wildcard-path and exact-extension cases for `Get-RequestFiles` / `Export-TrackingData`, directional and fail-closed cases for `Get-DestinationOwnerConflict`, the anchored-OID assertion, a guard that the validity script carries no begin/process/end blocks, and a Lab test for the retained-overlap refusal.
+
+| Script | Version |
+|---|---|
+| Set-ADCSTemplateValidity.ps1 | **1.0.4** |
+| Submit-CertificateRequests.ps1 | **1.0.7** |
+| Sync-ADCSTemplate.ps1 | **1.0.5** |
+| Add-CertificateEnrollmentPolicyServerOffline.ps1 | **1.0.5** |
+| Add-CertificateEnrollmentPolicyServerToGpo.ps1 | **1.0.5** |
+
 ## [1.0.5] — 2026-09-06
 
 Help text only — no code changes. Each script's comment-based help now describes the behaviour its 1.0.2–1.0.4 fixes introduced, matching the README:
@@ -146,6 +190,7 @@ Initial release.
 | Add-CertificateEnrollmentPolicyServerOffline.ps1 | 1.0.0 |
 | Add-CertificateEnrollmentPolicyServerToGpo.ps1 | 1.0.0 |
 
+[1.0.6]: https://github.com/TheOmnilord/ADCS/compare/v1.0.5...v1.0.6
 [1.0.5]: https://github.com/TheOmnilord/ADCS/compare/v1.0.4...v1.0.5
 [1.0.4]: https://github.com/TheOmnilord/ADCS/compare/v1.0.3...v1.0.4
 [1.0.3]: https://github.com/TheOmnilord/ADCS/compare/v1.0.2...v1.0.3

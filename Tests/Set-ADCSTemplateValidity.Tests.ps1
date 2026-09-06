@@ -134,6 +134,16 @@ Describe 'Set-ADCSTemplateValidity' {
             $errs | Should -BeNullOrEmpty
         }
 
+        It 'is a FLAT script with no begin/process/end blocks (the 5.1 -File + non-console-stdin silent no-op fix must not regress)' {
+            # Under Windows PowerShell 5.1, powershell.exe -File with a non-console stdin (a scheduler,
+            # CI, WinRM/psexec, or the `< NUL` idiom) never runs a process{} block - the script would
+            # search nothing, print nothing and exit 0. The script takes no pipeline input, so it must
+            # run as a flat body; a reintroduced process{} would silently break unattended runs.
+            $ast = [System.Management.Automation.Language.Parser]::ParseFile($script:Val, [ref]$null, [ref]$null)
+            $ast.BeginBlock   | Should -BeNullOrEmpty -Because 'a begin{} implies a process{} that 5.1 -File skips on non-console stdin'
+            $ast.ProcessBlock | Should -BeNullOrEmpty -Because 'the process{} block silently no-ops under 5.1 -File with a redirected/EOF stdin'
+        }
+
         It 'comment-based help binds (Synopsis is real, not auto-generated syntax)' {
             $syn = (Get-Help $script:Val).Synopsis.Trim()
             $syn | Should -Not -BeNullOrEmpty
@@ -288,6 +298,24 @@ Describe 'Set-ADCSTemplateValidity' {
             $out = @(& $script:Val @p 3>&1 6>$null)
             @($out | Where-Object { $_ -is [System.Management.Automation.WarningRecord] }) | Should -Not -BeNullOrEmpty
             @($out | Where-Object { $_ -isnot [System.Management.Automation.WarningRecord] }).Count | Should -Be 0
+        }
+
+        It 'refuses to shorten validity below the RETAINED overlap: Error row, template unchanged, non-zero exit (v1.0.2 fix, previously untested)' {
+            # Prior test left this template at validity 100 Days, overlap 4 Weeks (28 days). A new
+            # validity of 20 Days with NO -OverlapPeriod would leave the 28-day overlap longer than the
+            # validity - an invalid pair - so the run must report an Error, change nothing, and exit 1.
+            $before = script:Get-LabTpl
+            $p = @{ TemplateName = $script:TplName; ValidityPeriod = 20; ValidityPeriodUnit = 'Days'; Confirm = $false }
+            if ($LabServer) { $p.Server = $LabServer }
+            $global:LASTEXITCODE = 0
+            $out = @(& $script:Val @p 3>&1 6>$null 2>$null)
+            $rows = @($out | Where-Object { $_.PSObject.Properties['Status'] })
+            $rows.Count | Should -Be 1
+            $rows[0].Status | Should -BeLike 'Error*' -Because 'the retained overlap is not shorter than the new validity'
+            $after = script:Get-LabTpl
+            script:ToHex ([byte[]]$after.pKIExpirationPeriod) | Should -BeExactly (script:ToHex ([byte[]]$before.pKIExpirationPeriod)) -Because 'the template must be left untouched'
+            [int]$after.'msPKI-Template-Minor-Revision' | Should -Be ([int]$before.'msPKI-Template-Minor-Revision')
+            $LASTEXITCODE | Should -Be 1 -Because 'a run with an error exits non-zero (Write-Error + exit 1) while the structured report survives'
         }
     }
 }

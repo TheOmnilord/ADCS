@@ -298,6 +298,19 @@ Describe 'Add-CertificateEnrollmentPolicyServerOffline' {
             [int]$k.GetValue('Cost')      | Should -Be 0x7FFFFFFD
         }
 
+        It 'Add repairs a value left with the wrong KIND (a REG_DWORD PolicyID becomes the REG_SZ clients expect); every kind is verified' {
+            $k = "$script:HiveCU\$script:ExpectedKey"
+            New-ItemProperty -LiteralPath $k -Name PolicyID -Value 241064013 -PropertyType DWord -Force | Out-Null
+            (Get-Item -LiteralPath $k).GetValueKind('PolicyID') | Should -Be ([Microsoft.Win32.RegistryValueKind]::DWord)
+            $o = & $script:Cep -Url $script:LabUrl -PolicyName $script:LabName -Location LocalUser -Confirm:$false 3>$null
+            $o.EntryApplied | Should -BeTrue
+            $k2 = Get-Item -LiteralPath $k
+            $k2.GetValueKind('PolicyID') | Should -Be ([Microsoft.Win32.RegistryValueKind]::String) -Because 'Set-ItemProperty without -Type keeps an existing kind; the script must force REG_SZ'
+            $k2.GetValue('PolicyID') | Should -BeExactly $script:ExpectedPid
+            foreach ($n in 'URL', 'FriendlyName') { $k2.GetValueKind($n) | Should -Be ([Microsoft.Win32.RegistryValueKind]::String) }
+            foreach ($n in 'Flags', 'AuthFlags', 'Cost') { $k2.GetValueKind($n) | Should -Be ([Microsoft.Win32.RegistryValueKind]::DWord) }
+        }
+
         It 'rerunning the same Add is an idempotent update (values unchanged, EntryApplied)' {
             $o = & $script:Cep -Url $script:LabUrl -PolicyName $script:LabName -Location LocalUser -Confirm:$false 3>$null
             $o.EntryApplied | Should -BeTrue
@@ -340,6 +353,63 @@ Describe 'Add-CertificateEnrollmentPolicyServerOffline' {
             $o.DefaultCleared | Should -BeTrue
             Test-Path -LiteralPath "$script:HiveCU\$script:ExpectedKey" | Should -BeFalse
             (Get-Item -LiteralPath $script:HiveCU).GetValue('') | Should -BeNullOrEmpty
+        }
+
+        It 'the registry path check detects a SYMBOLIC LINK and refuses it (extracted checker, throwaway HKCU keys)' {
+            # The REAL checker and its native shim, extracted from the script.
+            $ast = [System.Management.Automation.Language.Parser]::ParseFile($script:Cep, [ref]$null, [ref]$null)
+            $shim = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.IfStatementAst] -and $n.Extent.Text -match 'CepRegNative' }, $true)
+            $shim | Should -Not -BeNullOrEmpty
+            . ([scriptblock]::Create($shim[0].Extent.Text))
+            foreach ($name in 'Test-RegistryKeyIsLink', 'Assert-ProtectedRegistryPath') {
+                $def = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name }, $false)
+                $def | Should -Not -BeNullOrEmpty
+                . ([scriptblock]::Create($def[0].Extent.Text))
+            }
+            if (-not ('PesterRegLink' -as [type])) {
+                Add-Type -TypeDefinition @"
+using System; using System.Runtime.InteropServices;
+public static class PesterRegLink {
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern int RegCreateKeyExW(IntPtr hKey, string lpSubKey, int Reserved, string lpClass, uint dwOptions, uint samDesired, IntPtr lpSecurityAttributes, out IntPtr phkResult, out uint lpdwDisposition);
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern int RegSetValueExW(IntPtr hKey, string lpValueName, int Reserved, uint dwType, byte[] lpData, uint cbData);
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern int RegOpenKeyExW(IntPtr hKey, string lpSubKey, uint ulOptions, uint samDesired, out IntPtr phkResult);
+    [DllImport("ntdll.dll")] public static extern int NtDeleteKey(IntPtr KeyHandle);
+    [DllImport("advapi32.dll")] public static extern int RegCloseKey(IntPtr hKey);
+}
+"@
+            }
+            $hkcu = [IntPtr]::new(-2147483647)   # HKEY_CURRENT_USER
+            $sid  = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+            $targetRel = "Software\$script:Prefix-linktarget"; $linkRel = "Software\$script:Prefix-link"
+            New-Item -Path "HKCU:\$targetRel" -Force | Out-Null
+            $script:CreatedKeys.Add("HKCU:\$targetRel")
+            # A VOLATILE registry symbolic link (REG_OPTION_VOLATILE 0x1 | REG_OPTION_CREATE_LINK 0x2) - gone at
+            # reboot at the latest - whose REG_LINK (6) 'SymbolicLinkValue' names the throwaway target key.
+            $h = [IntPtr]::Zero; $disp = [uint32]0
+            [PesterRegLink]::RegCreateKeyExW($hkcu, $linkRel, 0, $null, 0x3, 0xF003F, [IntPtr]::Zero, [ref]$h, [ref]$disp) | Should -Be 0
+            try {
+                $linkTarget = [System.Text.Encoding]::Unicode.GetBytes("\Registry\User\$sid\$targetRel")
+                [PesterRegLink]::RegSetValueExW($h, 'SymbolicLinkValue', 0, 6, $linkTarget, [uint32]$linkTarget.Length) | Should -Be 0
+            } finally { [void][PesterRegLink]::RegCloseKey($h) }
+            try {
+                (Get-Item -LiteralPath "HKCU:\$linkRel").Name | Should -Not -BeNullOrEmpty -Because 'the provider follows the link to the target - which is exactly why the checker must look at the link object'
+                Test-RegistryKeyIsLink -HiveHandle $hkcu -SubKey $linkRel   | Should -BeTrue  -Because 'the key IS a link'
+                Test-RegistryKeyIsLink -HiveHandle $hkcu -SubKey $targetRel | Should -BeFalse -Because 'a real key is not'
+                Test-RegistryKeyIsLink -HiveHandle $hkcu -SubKey 'Software' | Should -BeFalse
+                { Assert-ProtectedRegistryPath -Path "HKCU:\$linkRel\PolicyServers" }   | Should -Throw -ExpectedMessage '*SYMBOLIC LINK*'
+                { Assert-ProtectedRegistryPath -Path "HKCU:\$targetRel\PolicyServers" } | Should -Not -Throw
+            }
+            finally {
+                # Delete the LINK itself through a handle opened with REG_OPTION_OPEN_LINK - never its
+                # target through the link (Remove-Item would follow it).
+                $lh = [IntPtr]::Zero
+                if ([PesterRegLink]::RegOpenKeyExW($hkcu, $linkRel, 0x8, 0x10000, [ref]$lh) -eq 0) {   # DELETE
+                    try { [void][PesterRegLink]::NtDeleteKey($lh) } finally { [void][PesterRegLink]::RegCloseKey($lh) }
+                }
+            }
         }
 
         It 'LocalMachine add/remove round-trip (elevated session)' -Skip:(-not $script:LabElevated) {

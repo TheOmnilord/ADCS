@@ -1,11 +1,12 @@
 <#PSScriptInfo
-.VERSION 1.0.3
+.VERSION 1.0.5
 .GUID 61adf5d1-6eb5-4f41-8670-e9da72134570
 .AUTHOR Sveinung Svea
 .PROJECTURI https://github.com/TheOmnilord/ADCS
 .LICENSEURI https://github.com/TheOmnilord/ADCS/blob/main/LICENSE
 .TAGS ADCS PKI CertificateServices
 .RELEASENOTES
+1.0.4 - Every existing key on the target path is checked before any write: a registry symbolic link, an untrusted owner or write-class rights for an untrusted principal refuse the run (a link planted where PolicyServers did not exist yet would have carried an elevated first-time write to whatever key it pointed at); string values and the (Default) marker are written as REG_SZ explicitly and every value's KIND is verified (Set-ItemProperty kept an existing wrong kind and the string compare accepted it; a REG_SZ root Flags with the right number is now repaired to a DWORD); the cmdlets inside an approved action pass -Confirm:$false and a removal is verified before it is reported (a declined nested Remove-Item prompt reported a removal that never happened and could clear the marker of an entry that still existed)
 1.0.3 - Help text only: -ReplaceExisting documents the complete-row requirement; no code change
 1.0.2 - A pre-existing AD-policy row or CEP entry counts as complete only with URL, PolicyID, FriendlyName and DWORD Flags/AuthFlags/Cost present (URL + PolicyID alone is what an interrupted write leaves), for the prerequisite, the (Default) marker and -ReplaceExisting alike
 1.0.1 - For the GP locations the domain objectGUID for the AD Enrollment Policy row is resolved BEFORE the CEP entry is written; on a domain-joined machine a lookup failure now aborts the run with nothing written (previously the entry was written first and the failure became a warning, leaving a GP configuration that removes the AD enrollment policy); on a workgroup machine the row is still skipped with a warning
@@ -250,6 +251,94 @@ $key  = -join ($sha1.ComputeHash([System.Text.Encoding]::Unicode.GetBytes($Url.T
                ForEach-Object { $_.ToString('x2') })
 $target = "$hive\$key"
 
+# ---- registry path protection ---------------------------------------------------------------
+# The writes below are privileged (an elevated session for three of the four locations) and land
+# at a path the script builds, so every EXISTING key from the hive root down to the deepest
+# existing component of the target must be (a) a real key, not a registry SYMBOLIC LINK - a link
+# planted where 'PolicyServers' does not exist yet would carry an elevated first-time write to
+# whatever protected key it points at (Get-Item/New-Item follow links silently; -LiteralPath only
+# stops wildcards) - (b) owned by a trusted principal, and (c) free of write-class grants (create
+# subkey, set value, delete, WRITE_DAC, WRITE_OWNER) to untrusted principals, who could otherwise
+# plant such a link or swap the key between this check and the write. Trusted: SYSTEM,
+# Administrators, TrustedInstaller, the running account and its Domain/Enterprise Admins, and the
+# CREATOR OWNER / OWNER RIGHTS placeholders (they resolve to the running account for keys this
+# script creates). The default ACLs of HKLM\SOFTWARE\Microsoft\Cryptography, HKLM\SOFTWARE\Policies
+# and the user's own HKCU pass; a misdelegated parent is refused - fail closed, no override.
+if (-not ('CepRegNative' -as [type])) {
+    Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class CepRegNative {
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern int RegOpenKeyExW(IntPtr hKey, string lpSubKey, uint ulOptions, uint samDesired, out IntPtr phkResult);
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern int RegQueryValueExW(IntPtr hKey, string lpValueName, IntPtr lpReserved, out uint lpType, byte[] lpData, ref uint lpcbData);
+    [DllImport("advapi32.dll")]
+    public static extern int RegCloseKey(IntPtr hKey);
+}
+"@
+}
+function Test-RegistryKeyIsLink {
+    # $true when the key at hive-relative $SubKey is a registry symbolic link. Opened with
+    # REG_OPTION_OPEN_LINK (0x8) the handle is the LINK object itself, which carries the REG_LINK
+    # value 'SymbolicLinkValue'; a real key opened the same way has no such value.
+    param([IntPtr]$HiveHandle, [string]$SubKey)
+    $h = [IntPtr]::Zero
+    $rc = [CepRegNative]::RegOpenKeyExW($HiveHandle, $SubKey, 0x8, 0x1, [ref]$h)   # KEY_QUERY_VALUE
+    if ($rc -ne 0) { throw "Registry key '$SubKey' could not be opened for the link check (Win32 error $rc)." }
+    try {
+        $type = [uint32]0; $cb = [uint32]0
+        $q = [CepRegNative]::RegQueryValueExW($h, 'SymbolicLinkValue', [IntPtr]::Zero, [ref]$type, $null, [ref]$cb)
+        return ($q -eq 0 -or $q -eq 234)   # ERROR_SUCCESS / ERROR_MORE_DATA: the value exists -> a link
+    }
+    finally { [void][CepRegNative]::RegCloseKey($h) }
+}
+function Assert-ProtectedRegistryPath {
+    param([string]$Path)   # HKLM:\... or HKCU:\...; every EXISTING component is checked, root first
+    $isCU = $Path -like 'HKCU:*'
+    $hiveHandle = if ($isCU) { [IntPtr]::new(-2147483647) } else { [IntPtr]::new(-2147483646) }   # HKEY_CURRENT_USER / HKEY_LOCAL_MACHINE
+    $hivePrefix = if ($isCU) { 'HKCU:' } else { 'HKLM:' }
+    $rootName   = if ($isCU) { 'HKEY_CURRENT_USER' } else { 'HKEY_LOCAL_MACHINE' }
+    $me = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+    $trusted = @{ 'S-1-5-18' = 1; 'S-1-5-32-544' = 1; 'S-1-3-0' = 1; 'S-1-3-4' = 1
+                  'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464' = 1 }
+    $trusted[$me.User.Value] = 1
+    if ($me.User.AccountDomainSid) {
+        $trusted["$($me.User.AccountDomainSid.Value)-512"] = 1
+        $trusted["$($me.User.AccountDomainSid.Value)-519"] = 1
+    }
+    $writeMask = ([int64][System.Security.AccessControl.RegistryRights]'CreateSubKey, SetValue, Delete, ChangePermissions, TakeOwnership') -bor 0x10000000 -bor 0x40000000   # + GENERIC_ALL, GENERIC_WRITE
+    $sub = ''
+    foreach ($p in @(($Path -replace '^HK(CU|LM):\\?', '') -split '\\' | Where-Object { $_ })) {
+        $sub = if ($sub) { "$sub\$p" } else { $p }
+        $full = "$hivePrefix\$sub"
+        if (-not (Test-Path -LiteralPath $full)) { break }   # the rest does not exist yet: this run creates it under the parent just checked
+        if (Test-RegistryKeyIsLink -HiveHandle $hiveHandle -SubKey $sub) {
+            throw "Refusing to write: registry key '$full' is a SYMBOLIC LINK. A link on the path would carry this run's privileged writes to whatever key it points at. Remove the link (and find out who planted it) before rerunning."
+        }
+        # Get-Acl -LiteralPath is broken for registry keys on Windows PowerShell 5.1 (it reports the
+        # key as missing); the provider-qualified -Path form works on both engines, and escaping the
+        # key name keeps -Path literal in effect.
+        $acl = Get-Acl -Path ("Registry::$rootName\" + [System.Management.Automation.WildcardPattern]::Escape($sub)) -ErrorAction Stop
+        $owner = $acl.GetOwner([System.Security.Principal.SecurityIdentifier])
+        if (-not $owner) { throw "The owner of registry key '$full' could not be read; refusing to write." }
+        if (-not $trusted.ContainsKey($owner.Value)) {
+            throw "Refusing to write: registry key '$full' is owned by untrusted principal $($owner.Value) (an owner can always re-permission and replace a key). Fix the key's ownership before rerunning."
+        }
+        $bad = @()
+        foreach ($rule in $acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])) {
+            if ($rule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow) { continue }
+            $sid = $rule.IdentityReference.Value
+            if ($trusted.ContainsKey($sid)) { continue }
+            if ((([int64][int]$rule.RegistryRights) -band 0xFFFFFFFF) -band $writeMask) { $bad += $sid }
+        }
+        if ($bad.Count) {
+            throw "Refusing to write: registry key '$full' grants write-class rights (create subkey / set value / delete / change permissions / take ownership) to untrusted principal(s) $(@($bad | Sort-Object -Unique) -join ', '), who could plant a symbolic link or swap the key while this run writes. Restrict the key's ACL before rerunning."
+        }
+    }
+}
+Assert-ProtectedRegistryPath -Path $target
+
 function ConvertTo-DwordInt([long]$v) { [BitConverter]::ToInt32([BitConverter]::GetBytes([uint32]$v), 0) }
 function Get-CepEntries {
     if (Test-Path -LiteralPath $hive) {
@@ -277,20 +366,25 @@ function Write-CepEntry {
     param([string]$EntryPath, [hashtable]$Strings, [hashtable]$Dwords)
     if (-not (Test-Path -LiteralPath $EntryPath)) {
         $parent = Split-Path -Path $EntryPath -Parent
-        if (-not (Test-Path -LiteralPath $parent)) { New-Item -Path $parent -Force | Out-Null }  # -Force only creates missing parents here (guarded)
-        New-Item -Path $EntryPath | Out-Null   # leaf WITHOUT -Force: never recreate/wipe an existing key
+        if (-not (Test-Path -LiteralPath $parent)) { New-Item -Path $parent -Force -Confirm:$false | Out-Null }  # -Force only creates missing parents here (guarded)
+        New-Item -Path $EntryPath -Confirm:$false | Out-Null   # leaf WITHOUT -Force: never recreate/wipe an existing key
     }
-    foreach ($n in $Strings.Keys) { Set-ItemProperty -LiteralPath $EntryPath -Name $n -Value $Strings[$n] }
-    foreach ($n in $Dwords.Keys)  { New-ItemProperty -LiteralPath $EntryPath -Name $n -Value $Dwords[$n] -PropertyType DWord -Force | Out-Null }
+    # -Type String, always: Set-ItemProperty without -Type KEEPS an existing value's kind when the
+    # conversion succeeds, so a PolicyID some earlier tool left as REG_DWORD would stay a DWORD while
+    # the string compare below read it back as equal. -Confirm:$false on every cmdlet: inside an
+    # already-approved action they must not raise their own prompts (a declined inner prompt would
+    # return normally and leave the entry half-written).
+    foreach ($n in $Strings.Keys) { Set-ItemProperty -LiteralPath $EntryPath -Name $n -Value ([string]$Strings[$n]) -Type String -Confirm:$false }
+    foreach ($n in $Dwords.Keys)  { New-ItemProperty -LiteralPath $EntryPath -Name $n -Value $Dwords[$n] -PropertyType DWord -Force -Confirm:$false | Out-Null }
     $chk = Get-Item -LiteralPath $EntryPath
     $bad = @()
     foreach ($n in $Strings.Keys) {
         $got = $chk.GetValue($n)
-        if ($null -eq $got -or [string]$got -cne [string]$Strings[$n]) { $bad += $n }
+        if ($null -eq $got -or [string]$got -cne [string]$Strings[$n] -or $chk.GetValueKind($n) -ne [Microsoft.Win32.RegistryValueKind]::String) { $bad += "$n (value or kind)" }
     }
     foreach ($n in $Dwords.Keys) {
         $got = $chk.GetValue($n)
-        if ($null -eq $got -or [int]$got -ne [int]$Dwords[$n]) { $bad += $n }
+        if ($null -eq $got -or [int]$got -ne [int]$Dwords[$n] -or $chk.GetValueKind($n) -ne [Microsoft.Win32.RegistryValueKind]::DWord) { $bad += "$n (value or kind)" }
     }
     if ($bad) { throw "Post-write verification failed for value(s): $($bad -join ', ') under $EntryPath" }
 }
@@ -308,7 +402,11 @@ if ($PSCmdlet.ParameterSetName -eq 'Remove') {
         $markerMatches = $marker0 -and ("$marker0" -eq "$entryPid")
         $survivorServes = @($entries0 | Where-Object { $_.Key -ne $key -and "$($_.PolicyID)" -eq "$marker0" }).Count -gt 0
         if ($PSCmdlet.ShouldProcess($target, "Remove CEP entry (PolicyID=$entryPid)")) {
-            try { Remove-Item -LiteralPath $target -Recurse -Force } catch { throw "Failed to remove ${target}: $_" }
+            # -Confirm:$false: the script's own prompt above IS the approval. A nested Remove-Item
+            # prompt that the operator declined returned normally, and this run then reported a
+            # removal that never happened - and cleared the marker of an entry that still existed.
+            try { Remove-Item -LiteralPath $target -Recurse -Force -Confirm:$false } catch { throw "Failed to remove ${target}: $_" }
+            if (Test-Path -LiteralPath $target) { throw "Removal of $target did not take effect (the key still exists)." }
             $removedEntry = $true
         }
         if ($markerMatches -and $survivorServes) {
@@ -481,10 +579,19 @@ function Test-EntryComplete {
     Test-RegEntryUsable -Key (Get-Item -LiteralPath $target) -ExpectUrl $Url -ExpectPolicyId "$PolicyId"
 }
 $entryExists = $entryApplied -or $WhatIfPreference -or (Test-EntryComplete)
+# Root Flags live under the PolicyServers key ITSELF; writing them with no usable policy-server
+# entry in this location (the CEP entry declined AND no AD Enrollment Policy row) activates GP CEP
+# configuration with no server, so clients lose the AD enrollment policy. Gate on a real entry.
+# (-SkipADPolicy alone does not count: it means the AD row was deliberately omitted, not that a
+# server exists.)
+$policyServerPresent = $entryExists -or $adRowPresent -or ($adRow -eq 'applied')
 
 # ---- 3. root Flags (GP locations; DISABLE bits, preserved across runs) ---------------------
 if ($isGP) {
     $existing = if (Test-Path -LiteralPath $hive) { (Get-Item -LiteralPath $hive).GetValue('Flags') } else { $null }
+    # The kind matters as much as the number: a Flags left as REG_SZ by some other tool is not a
+    # value the client reads, so it is rewritten as a DWORD even when its number is already right.
+    $existingKind = if ($null -ne $existing) { try { (Get-Item -LiteralPath $hive).GetValueKind('Flags') } catch { $null } } else { $null }
     $newFlags = if ($null -ne $existing) { [int]$existing } else { 0 }
     if ($newFlags -band 0x2) {
         Write-Warning 'Existing root Flags had bit 0x2 set (clients IGNORE the GP-provided policy list). Clearing it.'
@@ -492,11 +599,15 @@ if ($isGP) {
     }
     if ($DisableUserConfigured) { $newFlags = $newFlags -bor 0x4 }
     if ($EnableUserConfigured)  { $newFlags = $newFlags -band (-bnot 0x4) }
-    if (($null -eq $existing) -or ([int]$existing -ne $newFlags)) {
+    if (-not $policyServerPresent -and -not $WhatIfPreference) {
+        $notes.Add("Root Flags NOT written: no usable policy-server entry exists (the CEP entry was declined and there is no AD Enrollment Policy row). Writing PolicyServers root values would activate GP CEP configuration with no server, and clients would lose the AD enrollment policy.")
+    }
+    elseif (($null -eq $existing) -or ([int]$existing -ne $newFlags) -or ($existingKind -ne [Microsoft.Win32.RegistryValueKind]::DWord)) {
         $from = if ($null -ne $existing) { '0x{0:X}' -f [int]$existing } else { '(absent)' }
         if ($PSCmdlet.ShouldProcess($hive, ('Set root Flags {0} -> 0x{1:X} (disable bits: 0x2 ignore GP list, 0x4 ignore user-configured)' -f $from, $newFlags))) {
-            if (-not (Test-Path -LiteralPath $hive)) { New-Item -Path $hive -Force | Out-Null }
-            New-ItemProperty -LiteralPath $hive -Name Flags -Value $newFlags -PropertyType DWord -Force | Out-Null
+            if (-not (Test-Path -LiteralPath $hive)) { New-Item -Path $hive -Force -Confirm:$false | Out-Null }
+            New-ItemProperty -LiteralPath $hive -Name Flags -Value $newFlags -PropertyType DWord -Force -Confirm:$false | Out-Null
+            if ((Get-Item -LiteralPath $hive).GetValueKind('Flags') -ne [Microsoft.Win32.RegistryValueKind]::DWord) { throw "Root Flags under $hive did not end up as a DWORD." }
         }
     }
 }
@@ -507,8 +618,9 @@ if ($SetAsDefault) {
         $notes.Add("(Default) marker NOT set: the CEP entry was declined and does not exist under $hive, so the marker would point at nothing.")
     }
     elseif ($PSCmdlet.ShouldProcess($hive, "Set (Default) marker = $PolicyId (default enrollment policy = '$PolicyName')")) {
-        if (-not (Test-Path -LiteralPath $hive)) { New-Item -Path $hive -Force | Out-Null }
-        Set-ItemProperty -LiteralPath $hive -Name '(default)' -Value $PolicyId
+        if (-not (Test-Path -LiteralPath $hive)) { New-Item -Path $hive -Force -Confirm:$false | Out-Null }
+        Set-ItemProperty -LiteralPath $hive -Name '(default)' -Value ([string]$PolicyId) -Type String -Confirm:$false
+        if ((Get-Item -LiteralPath $hive).GetValueKind('') -ne [Microsoft.Win32.RegistryValueKind]::String) { throw "The (Default) marker under $hive did not end up as a REG_SZ." }
         $defaultChanged = $true
     }
 }
@@ -541,7 +653,8 @@ foreach ($d in $dups) {
                 $notes.Add("Entry at key $($d.Key) NOT removed: it no longer serves PolicyID $PolicyId under a different URL (changed or removed while the prompt was open).")
                 continue
             }
-            Remove-Item -LiteralPath "$hive\$($d.Key)" -Recurse -Force
+            Remove-Item -LiteralPath "$hive\$($d.Key)" -Recurse -Force -Confirm:$false
+            if (Test-Path -LiteralPath "$hive\$($d.Key)") { throw "Removal of superseded entry $($d.Key) did not take effect (the key still exists)." }
             $dupRemoved += $d.URL
         }
     } else {

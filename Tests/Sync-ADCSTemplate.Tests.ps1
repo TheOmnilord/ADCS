@@ -68,12 +68,17 @@ Describe 'Sync-ADCSTemplate' {
         # (The script has a mandatory -Mode and runs main logic on load, so it cannot be dot-sourced
         # wholesale; extracting the function definitions gives their real bodies with no side effects.)
         $ast = [System.Management.Automation.Language.Parser]::ParseFile($script:Sync, [ref]$null, [ref]$null)
-        foreach ($name in 'Get-RandomHex', 'ConvertTo-LdapFilterValue', 'New-SyntheticOidBase', 'Get-AttrCanonical', 'Compare-TemplateAttributes', 'Convert-ToLatestCompatibility') {
+        foreach ($name in 'Get-RandomHex', 'ConvertTo-LdapFilterValue', 'New-SyntheticOidBase', 'Get-AttrCanonical', 'Compare-TemplateAttributes', 'Convert-ToLatestCompatibility', 'ConvertTo-ImportAttributeValue') {
             $def = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name }, $false)
             if ($def) { . ([scriptblock]::Create($def[0].Extent.Text)) }
         }
-        # Get-AttrCanonical references $script:ByteAttributes - mirror the script's definition.
-        $script:ByteAttributes = @('pKIExpirationPeriod', 'pKIKeyUsage', 'pKIOverlapPeriod')
+        # Get-AttrCanonical and ConvertTo-ImportAttributeValue reference the script's attribute-type
+        # lists: extract the very assignments, so the tests can never drift from the script.
+        foreach ($listName in '$script:IntAttributes', '$script:MultiValueAttributes', '$script:ByteAttributes', '$script:OidListAttributes') {
+            $asg = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq $listName }, $true)
+            $asg | Should -Not -BeNullOrEmpty -Because "$listName must be defined in the script"
+            . ([scriptblock]::Create($asg[0].Extent.Text))
+        }
 
         # Asserts that a DACL is EXACTLY the expected grants: one Allow ACE per expected
         # (SID, right, object GUID), nothing inherited, no deny, no ACE for any other principal, and
@@ -192,6 +197,66 @@ Describe 'Sync-ADCSTemplate' {
             $tgt = [pscustomobject]@{ 'flags' = 1; 'msPKI-Extra' = 'surprise' }
             $diff = Compare-TemplateAttributes -Source $src -Target $tgt
             ($diff | Where-Object Attribute -eq 'msPKI-Extra') | Should -Not -BeNullOrEmpty
+        }
+
+        It 'ConvertTo-ImportAttributeValue: integer attributes accept only integral values in the Int32 range - anything else is REFUSED, never dropped or coerced' {
+            ConvertTo-ImportAttributeValue -Name 'msPKI-RA-Signature' -Value 1          | Should -Be 1
+            (ConvertTo-ImportAttributeValue -Name 'msPKI-RA-Signature' -Value 1) -is [int] | Should -BeTrue
+            ConvertTo-ImportAttributeValue -Name 'msPKI-RA-Signature' -Value ([long]2)   | Should -Be 2
+            ConvertTo-ImportAttributeValue -Name 'msPKI-RA-Signature' -Value 3.0        | Should -Be 3
+            ConvertTo-ImportAttributeValue -Name 'msPKI-Private-Key-Flag' -Value (-1)   | Should -Be -1
+            ConvertTo-ImportAttributeValue -Name 'msPKI-RA-Signature' -Value @(4)       | Should -Be 4
+            # A giant or non-finite JSON number overflows the [decimal] cast; it must still be
+            # refused with the ATTRIBUTE-NAMED message (a bare cast threw a raw ".NET cannot convert"
+            # error that did not name the attribute), on both 5.1 and 7.
+            foreach ($bad in @(0.4, '5', 'abc', $true, @(1, 2), 4294967296, 1e40, ([double]::PositiveInfinity), ([double]::NaN))) {
+                { ConvertTo-ImportAttributeValue -Name 'msPKI-RA-Signature' -Value $bad } |
+                    Should -Throw -ExpectedMessage '*Import refused*msPKI-RA-Signature*' -Because "'$bad' must be refused with the attribute named (a bare cast dropped, coerced, or threw an un-attributed error)"
+            }
+            { ConvertTo-ImportAttributeValue -Name 'msPKI-RA-Signature' -Value @() }   | Should -Throw -ExpectedMessage '*Import refused*'
+            { ConvertTo-ImportAttributeValue -Name 'msPKI-RA-Signature' -Value $null } | Should -Throw -ExpectedMessage '*Import refused*'
+            { ConvertTo-ImportAttributeValue -Name 'msPKI-RA-Signature' -Value '' }    | Should -Throw -ExpectedMessage '*Import refused*'
+        }
+
+        It 'ConvertTo-ImportAttributeValue: period attributes are exactly 8 bytes, key usage 1-2, every element a byte' {
+            $p = ConvertTo-ImportAttributeValue -Name 'pKIExpirationPeriod' -Value @(0, 64, 57, 135, 46, 225, 254, 255)
+            $p -is [byte[]] | Should -BeTrue
+            $p.Count | Should -Be 8
+            (ConvertTo-ImportAttributeValue -Name 'pKIKeyUsage' -Value @(160, 0)).Count | Should -Be 2
+            (ConvertTo-ImportAttributeValue -Name 'pKIKeyUsage' -Value @(128)).Count    | Should -Be 1
+            { ConvertTo-ImportAttributeValue -Name 'pKIOverlapPeriod' -Value @(1, 2, 3) } | Should -Throw -ExpectedMessage '*Import refused*pKIOverlapPeriod*' -Because 'a bare [byte[]] cast accepted a three-byte "period"'
+            { ConvertTo-ImportAttributeValue -Name 'pKIKeyUsage' -Value @(1, 2, 3) }     | Should -Throw -ExpectedMessage '*Import refused*'
+            { ConvertTo-ImportAttributeValue -Name 'pKIExpirationPeriod' -Value @(0, 64, 57, 135, 46, 225, 254, 256) }  | Should -Throw -ExpectedMessage '*not a byte*'
+            { ConvertTo-ImportAttributeValue -Name 'pKIExpirationPeriod' -Value @(0, 64, 57, 135, 46, 225, 254, 'ff') } | Should -Throw -ExpectedMessage '*not a byte*'
+            { ConvertTo-ImportAttributeValue -Name 'pKIExpirationPeriod' -Value 'AEA5hy7h/v8=' } | Should -Throw -ExpectedMessage '*got a string*'
+        }
+
+        It 'ConvertTo-ImportAttributeValue: multi-value attributes take non-empty strings only; OID lists must be dotted OIDs' {
+            # the function returns ONE array of strings (the caller casts it to the AD collection type)
+            $one = ConvertTo-ImportAttributeValue -Name 'pKIExtendedKeyUsage' -Value '1.3.6.1.5.5.7.3.1'
+            $one -is [array] | Should -BeTrue
+            $one.Count | Should -Be 1
+            $one[0] | Should -BeExactly '1.3.6.1.5.5.7.3.1'
+            (ConvertTo-ImportAttributeValue -Name 'msPKI-Certificate-Policy' -Value @('1.3.6.1.4.1.311.21.8.1.2', '1.3.6.1.4.1.311.21.8.1.3')).Count | Should -Be 2
+            (ConvertTo-ImportAttributeValue -Name 'pKIDefaultCSPs' -Value @('1,Microsoft RSA SChannel Cryptographic Provider')).Count | Should -Be 1
+            { ConvertTo-ImportAttributeValue -Name 'msPKI-Certificate-Policy' -Value 'not-an-oid' }   | Should -Throw -ExpectedMessage '*not a dotted OID*'
+            { ConvertTo-ImportAttributeValue -Name 'msPKI-Certificate-Policy' -Value @('1.2.3', 5) }  | Should -Throw -ExpectedMessage '*expected a string*'
+            { ConvertTo-ImportAttributeValue -Name 'pKIExtendedKeyUsage' -Value @() }                | Should -Throw -ExpectedMessage '*no values*'
+            { ConvertTo-ImportAttributeValue -Name 'pKIDefaultCSPs' -Value "1,Provider`r`nX" }        | Should -Throw -ExpectedMessage '*control characters*'
+            { ConvertTo-ImportAttributeValue -Name 'msPKI-Supersede-Templates' -Value @('') }        | Should -Throw -ExpectedMessage '*empty element*'
+        }
+
+        It 'the dotted-OID validation pattern is anchored with \z, so a trailing newline cannot slip past the OID uniqueness guard' {
+            # $ matches before a trailing LF, so a tampered msPKI-Cert-Template-OID ending in "\n"
+            # passed validation and then missed the (msPKI-Cert-Template-OID=<oid>) uniqueness search
+            # (AD does not fold the newline). \z anchors at the true end of the string.
+            $pat = '^(0|[1-9]\d*)(\.(0|[1-9]\d*))+\z'
+            '1.3.6.1.4.1.311.21.8.1.2'            | Should -Match $pat
+            ("1.3.6.1.4.1.311.21.8.1.2" + "`n")   | Should -Not -Match $pat -Because 'a trailing LF must not pass ($ would have allowed it)'
+            ("1.3.6.1.4.1.311.21.8.1.2" + "`r`n") | Should -Not -Match $pat
+            # tie the assertion to the real code: Resolve-TemplateOid must use \z, not $
+            (Get-Content -LiteralPath $script:Sync -Raw) | Should -Match ([regex]::Escape('(\.(0|[1-9]\d*))+\z')) -Because 'the OID validations must be anchored with \z'
+            (Get-Content -LiteralPath $script:Sync -Raw) | Should -Not -Match ([regex]::Escape('(\.(0|[1-9]\d*))+$')) -Because 'no OID validation may still use the newline-permissive $'
         }
 
         It 'Convert-ToLatestCompatibility: CSP-based v2 -> v4 with the exact stock v4 bytes (0x06060100)' {
@@ -357,6 +422,13 @@ Describe 'Sync-ADCSTemplate' {
                 Should -Throw -ExpectedMessage '*not applicable to -Mode Export*'
         }
 
+        It 'rejects -AllowLinkedIssuancePolicy for -Mode Export and -Mode Validate (Import/Sync only)' {
+            { & $script:Sync -Mode Export -Path x.json -TemplateName K -AllowLinkedIssuancePolicy } |
+                Should -Throw -ExpectedMessage '*AllowLinkedIssuancePolicy*'
+            { & $script:Sync -Mode Validate -TemplateName K -AllowLinkedIssuancePolicy } |
+                Should -Throw -ExpectedMessage '*AllowLinkedIssuancePolicy*'
+        }
+
         It 'rejects -UpgradeCompatibility for -Mode Validate' {
             { & $script:Sync -Mode Validate -TemplateName K -UpgradeCompatibility } |
                 Should -Throw -ExpectedMessage '*not applicable to -Mode Validate*'
@@ -516,6 +588,17 @@ Describe 'Sync-ADCSTemplate' {
             $t = script:Get-ADObjectRetry -AdParams $script:AP -Identity $r.DN -Properties 'msPKI-Template-Schema-Version', 'msPKI-Private-Key-Flag'
             [int]$t.'msPKI-Template-Schema-Version' | Should -Be 4
             [BitConverter]::ToUInt32([BitConverter]::GetBytes([int]$t.'msPKI-Private-Key-Flag'), 0) | Should -Be ([uint32]0x06060100)
+        }
+
+        It 'Import REFUSES a malformed export before creating anything (a bad msPKI-RA-Signature is not dropped)' {
+            $tampered = Join-Path $script:TmpDir 'tampered.json'
+            $obj = [System.IO.File]::ReadAllText($script:ExportFile, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+            $obj | Add-Member -NotePropertyName 'msPKI-RA-Signature' -NotePropertyValue 'abc' -Force
+            [System.IO.File]::WriteAllText($tampered, ($obj | ConvertTo-Json -Depth 8), [System.Text.UTF8Encoding]::new($true))
+            $cn = script:New-LabName
+            { & $script:Sync -Mode Import -Path $tampered -Server $AronsServer -NewTemplateName $cn -NewDisplayName $cn -OidHandling GenerateRandom -SkipAcl *>$null } |
+                Should -Throw -ExpectedMessage '*Import refused*msPKI-RA-Signature*'
+            (Get-ADObject @script:AP -SearchBase $script:TplBase -LDAPFilter "(cn=$cn)") | Should -BeNullOrEmpty -Because 'nothing may be created from a malformed export'
         }
 
         It 'a plain import (no -UpgradeCompatibility) preserves the source schema version' {
