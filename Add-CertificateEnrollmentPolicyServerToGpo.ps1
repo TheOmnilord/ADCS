@@ -1,11 +1,12 @@
 <#PSScriptInfo
-.VERSION 1.0.6
+.VERSION 1.0.7
 .GUID 54763db6-2359-401f-8960-ef0de5911aaf
 .AUTHOR Sveinung Svea
 .PROJECTURI https://github.com/TheOmnilord/ADCS
 .LICENSEURI https://github.com/TheOmnilord/ADCS/blob/main/LICENSE
 .TAGS ADCS PKI CertificateServices
 .RELEASENOTES
+1.0.7 - Help text only: the comment-based help is rewritten to the repository writing style (STYLE.md, derived from ASD-STE100 Simplified Technical English) - short sentences, active voice, no figurative language, acronyms defined, a CAUTION line on -ReplaceExisting and -Remove; every fact, condition and default is kept; no code change
 1.0.6 - The root-Flags gate recognises any pre-existing USABLE policy-server entry (a complete row - URL, PolicyID, FriendlyName and numeric Flags/AuthFlags/Cost - not an incomplete fragment) in the scope, not only the requested CEP entry and the AD row: a declined requested entry no longer wrongly blocks a legitimate root-Flags change when another working server exists, while an incomplete fragment cannot make clearing 0x2 activate a zero-server list
 1.0.5 - Root Flags are no longer written when no usable policy-server entry exists in scope (the CEP entry declined AND no AD Enrollment Policy row): writing PolicyServers root values there activated GP CEP configuration with zero servers, so clients lost the AD enrollment policy fleet-wide; the Auto-Enrollment write is now verified (Test-GpoEntry) and its key is included in the deletion-order damage scan (a **delvals. ordered after the AE values previously defeated autoenrollment silently while the run reported applied=True)
 1.0.4 - The gates that let the (Default) marker be set and -ReplaceExisting delete siblings now require the replacing entry to be complete in BOTH the live GPMC view and the EFFECTIVE registry.pol replay (a row whose authored values a later deletion record wipes was accepted from the GPMC view alone); a freshly written AD row or CEP entry must also show in the replay, else the run fails; the GPO mutation cmdlets pass -Confirm:$false inside approved actions and a removal or marker clear is verified from registry.pol before it is reported (a declined nested prompt reported a removal that never happened)
@@ -17,168 +18,219 @@
 
 <#
 .SYNOPSIS
-    Writes (or removes) a certificate enrollment policy (CEP) server directly in a domain GPO -
-    offline with respect to the policy server: no "Validate Server" round-trip, ever.
+    Writes or removes a Certificate Enrollment Policy (CEP) server in a domain Group Policy
+    Object (GPO) without any contact with the policy server.
 
 .DESCRIPTION
-    The "Certificate Services Client - Certificate Enrollment Policy" setting is plain
-    registry-based policy ([MS-GPREG]) stored in the GPO's Registry.pol. This script authors
-    those values with Set-GPRegistryValue, which also handles what hand-editing SYSVOL would
-    get wrong: AD + GPT.INI version bumps and registering the Registry CSE on the GPO. Values
-    authored here appear in the GPME Public Key Policies dialog exactly as if clicked in.
+    The "Certificate Services Client - Certificate Enrollment Policy" setting is registry-based
+    policy, as [MS-GPREG] defines it, and the GPO stores it in its registry.pol file. The
+    script writes those values with Set-GPRegistryValue. That cmdlet also does the work that a
+    manual edit of SYSVOL would miss. It increments the GPO version in AD and in GPT.INI. It
+    registers the Registry client-side extension (CSE) on the GPO. The values appear in the
+    Public Key Policies dialog of the Group Policy Management Editor (GPME) exactly as if you
+    had entered them there.
 
-    Derivations (computed locally, no server contact):
-      * Subkey name = SHA-1 over the UTF-16LE bytes of the invariant-lowercased URL
-      * PolicyID    = Java String.hashCode() of the policy name (EJBCA MSAE behavior).
-                      For CEP servers that return a GUID (e.g. Microsoft CEP) pass -PolicyId.
+    The script never contacts the policy server. It computes every value locally, so there is
+    no "Validate Server" round-trip. The derivations are:
+      * The subkey name is the SHA-1 hash over the UTF-16LE bytes of the URL in invariant
+        lower case.
+      * The PolicyID is the Java String.hashCode() of the policy name. This is the EJBCA MSAE
+        behavior. For a CEP server that returns a GUID, for example Microsoft CEP, pass
+        -PolicyId.
 
-    By default the script ALSO ensures the built-in AD enrollment policy row ("LDAP:", subkey
-    37c9dc30f207f27f61a2f7c3aed598a6e2920b54, PolicyID = the domain object's objectGUID,
-    Cost 0xFFFFFFFF): enabling GP-based CEP configuration suppresses the client-synthesized
-    AD default policy, so a GPO carrying only your CEP entry would silently REMOVE the AD
-    enrollment policy from every client in scope and stop autoenrollment against AD-published
-    templates. Opt out only deliberately, with -SkipADPolicy. The AD row is never treated as
-    a removable duplicate by -ReplaceExisting.
+    By default the script ALSO makes sure that the built-in AD enrollment policy row exists.
+    That row has URL "LDAP:", subkey 37c9dc30f207f27f61a2f7c3aed598a6e2920b54, PolicyID = the
+    objectGUID of the domain object, and Cost 0xFFFFFFFF. Enabling GP-based CEP configuration
+    suppresses the AD default policy that clients synthesize on their own. A GPO that lists
+    only your CEP entry would therefore REMOVE the AD enrollment policy from every client in
+    scope, without an error. Auto-Enrollment against AD-published templates would stop on
+    those clients.
 
-    The PolicyServers root Flags are DISABLE bits (EnrollmentPolicyFlags): 0x2 makes clients
-    ignore the whole GP-provided list (never set; cleared with a warning if found), 0x4 makes
-    clients ignore user-configured servers. Existing bits are preserved across runs: rerunning
-    without -DisableUserConfigured does NOT clear a previously set 0x4 (use
-    -EnableUserConfigured to clear it explicitly).
+    Opt out only deliberately, with -SkipADPolicy. -ReplaceExisting never treats the AD row as
+    a removable duplicate.
 
-    Robustness: all writes run with ErrorActionPreference Stop and each value is written with
-    its own Set-GPRegistryValue call - the cmdlet's multi-value "list" form is deliberately
-    avoided because it plants a **delVals. deletion record that, ordered after
-    individually-authored values, makes clients DELETE the whole entry. The script detects
-    and warns about such mis-ordered deletion records in the GPO. Entries are verified by
-    read-back (including detection of missing values); transient SYSVOL/registry.pol
-    contention is retried. State inspection reads registry.pol from the PDC emulator (or
-    -Server when given) so reads and writes see the same replica. Still avoid editing the
-    same GPO concurrently from two sessions or GPME - Set-GPRegistryValue is an unlocked
-    read-modify-write and concurrent writers can silently lose values; the read-back makes
-    this script detect such loss for its own entry.
+    The root Flags value on the PolicyServers key holds DISABLE bits (EnrollmentPolicyFlags).
+    Bit 0x2 makes clients ignore the whole list that Group Policy provides. The script never
+    sets 0x2; when it finds the bit set, it clears the bit and writes a warning. Bit 0x4 makes
+    clients ignore user-configured servers. The script preserves the existing bits across
+    runs: a rerun without -DisableUserConfigured does NOT clear a previously set 0x4. Pass
+    -EnableUserConfigured to clear it explicitly.
 
-    Requires the GroupPolicy module (GPMC / RSAT) and permission to edit the GPO.
-    Supports -WhatIf / -Confirm.
+    Robustness: every write runs with ErrorActionPreference Stop. The script writes each value
+    with its own Set-GPRegistryValue call. It deliberately avoids the multi-value "list" form
+    of the cmdlet. That form creates a **delVals. deletion record. When such a record is
+    ordered after individually written values, clients DELETE the whole entry. The script
+    detects such mis-ordered deletion records in the GPO and warns about them.
+
+    The script verifies every entry by read-back, and the read-back also detects missing
+    values. The script retries transient contention on SYSVOL and registry.pol. State
+    inspection reads registry.pol from the Primary Domain Controller (PDC) emulator, or from
+    -Server when you give it. Reads and writes therefore see the same replica.
+
+    Still, do not edit the same GPO at the same time from two sessions or from GPME.
+    Set-GPRegistryValue is an unlocked read-modify-write, and concurrent writers can lose
+    values without an error. The read-back lets this script detect such a loss for its own
+    entry.
+
+    The script requires the GroupPolicy module and permission to edit the GPO. The Group
+    Policy Management Console (GPMC) or the Remote Server Administration Tools (RSAT) install
+    that module. The script supports -WhatIf and -Confirm.
 
 .PARAMETER GpoName
-    Display name of an existing GPO, or its GUID. The name lookup is tried FIRST; only if no
-    GPO has that display name is the value treated as a GUID. Create and link a GPO first if
-    needed:  New-GPO -Name 'PKI - Enrollment Policy' | New-GPLink -Target 'OU=...,DC=...'
+    The display name of an existing GPO, or its GUID. The script tries the name lookup FIRST.
+    The script treats the value as a GUID only when no GPO has that display name. If you need
+    a GPO, create and link it first, for example:
+    New-GPO -Name 'PKI - Enrollment Policy' | New-GPLink -Target 'OU=...,DC=...'
 
 .PARAMETER Url
-    Full CEP URI - must match the server exactly (the SHA-1 subkey name and the clients'
-    GetPolicies calls use it verbatim). Trimmed; must be absolute http/https; control
-    characters rejected. Rerunning with a DIFFERENT URL does not remove the old entry - the
-    script warns about same-PolicyID siblings; pass -ReplaceExisting to delete them.
+    The full CEP URI. It must match the server exactly: the SHA-1 subkey name and the
+    GetPolicies calls of the clients use it verbatim. The script trims the value and refuses
+    control characters. The value must be an absolute http or https URI. A rerun with a
+    DIFFERENT URL does not remove the old entry: the script warns about siblings with the
+    same PolicyID. Pass -ReplaceExisting to delete them.
 
 .PARAMETER PolicyName
-    The EJBCA MSAE alias "Policy Name". Becomes FriendlyName and (unless -PolicyId is given)
-    the PolicyID hash input - hashed VERBATIM; renaming it in EJBCA changes the PolicyID and
-    orphans deployed entries.
+    The "Policy Name" of the EJBCA MSAE alias. It becomes the FriendlyName. Unless you give
+    -PolicyId, it is also the input of the PolicyID hash. The script hashes it VERBATIM. A
+    rename in EJBCA changes the PolicyID and orphans the deployed entries.
 
 .PARAMETER PolicyId
-    Explicit PolicyID for non-EJBCA servers (must match the server's GetPolicies response).
+    An explicit PolicyID for servers other than EJBCA. It must match the GetPolicies response
+    of the server.
 
 .PARAMETER Scope
-    Machine (default) = Computer Configuration (HKLM), User = User Configuration (HKCU).
+    Machine is the default and means Computer Configuration (HKLM). User means User
+    Configuration (HKCU).
 
 .PARAMETER Authentication
-    Client authentication type for the CEP endpoint: Anonymous (1), Kerberos (2, default,
-    = "Windows integrated"), UsernamePassword (4), Certificate (8).
+    The client authentication type for the CEP endpoint:
+      * Anonymous = 1.
+      * Kerberos = 2. This is the default and means "Windows integrated".
+      * UsernamePassword = 4.
+      * Certificate = 8.
 
 .PARAMETER Cost
-    Priority; lower = preferred among endpoints sharing a PolicyID. Full DWORD range
-    1..4294967295; default 0x7FFFFFFD ("Priority: Default"). Pass large values in decimal
-    (a 0xFFFFFFFF literal is parsed by PowerShell as Int32 -1).
+    The priority. Among endpoints that share a PolicyID, clients prefer the lower value. The
+    script accepts the full DWORD range 1..4294967295. The default is 0x7FFFFFFD, which the
+    dialog shows as "Priority: Default". Pass large values in decimal: PowerShell parses a
+    0xFFFFFFFF literal as Int32 -1.
 
 .PARAMETER NoAutoEnroll
-    Leave "Enable for automatic enrollment and renewal" off (clears entry Flags bit 0x10).
+    Leaves "Enable for automatic enrollment and renewal" off. This clears bit 0x10 of the
+    entry Flags.
 
 .PARAMETER AllowUntrustedIssuer
-    Equivalent to UNchecking "Require strong validation during enrollment" (sets Flags 0x20).
+    Equivalent to clearing the "Require strong validation during enrollment" checkbox. This
+    sets bit 0x20 of the entry Flags.
 
 .PARAMETER NoClientId
-    Do not send the ClientId attribute (clears Flags bit 0x4; default matches GPME's 0x14).
+    Does not send the ClientId attribute. This clears bit 0x4 of the entry Flags. The default
+    matches the 0x14 that GPME writes.
 
 .PARAMETER SetAsDefault
-    Write this policy's PolicyID into the unnamed "(Default)" REG_SZ value on the
-    PolicyServers key (the dialog's Default checkbox). Interactive preselection only.
+    Writes the PolicyID of this policy into the unnamed "(Default)" REG_SZ value on the
+    PolicyServers key. That value is the Default checkbox of the dialog. It affects
+    interactive preselection only.
 
 .PARAMETER ClearDefault
-    Remove the unnamed "(Default)" marker.
+    Removes the unnamed "(Default)" marker.
 
 .PARAMETER SkipADPolicy
-    Do not write the AD enrollment policy row into the GPO. Background: as soon as a GPO
-    delivers ANY CEP configuration, clients in scope stop auto-generating the built-in
-    "Active Directory Enrollment Policy" and use only the entries the GPO lists. A GPO
-    without the LDAP: row therefore TAKES AWAY the AD enrollment policy from its clients,
-    and autoenrollment against AD-published templates (the internal enterprise CA) stops.
-    The script writes the row by default to prevent that; pass this switch only when that
-    removal is intended (no internal ADCS, or a deliberate migration off AD enrollment).
+    Does not write the AD enrollment policy row into the GPO. Background: as soon as a GPO
+    delivers ANY CEP configuration, clients in scope stop generating the built-in "Active
+    Directory Enrollment Policy" on their own. They then use only the entries that the GPO
+    lists. A GPO without the LDAP: row therefore TAKES AWAY the AD enrollment policy from its
+    clients. Auto-Enrollment against AD-published templates, that is, the internal enterprise
+    CA, stops. The script writes the row by default to prevent that.
+
+    Pass this switch only when you intend that removal: there is no internal AD CS, or you
+    deliberately migrate off AD enrollment.
 
 .PARAMETER ReplaceExisting
-    Remove sibling entries sharing this PolicyID under a different URL (stale/typo entries).
-    The AD policy row is never removed by this. Without the switch the script only warns,
-    since multiple URLs per PolicyID is also the legitimate redundant-endpoint pattern. The
-    cleanup (like the (Default) marker and the AD-row prerequisite) acts only when the entry
-    that replaces the siblings is COMPLETE at that moment - written and verified by this run, or
-    already present with URL and PolicyID as requested AND FriendlyName plus DWORD Flags,
-    AuthFlags and Cost; URL + PolicyID alone (what an interrupted write leaves) does not count.
+    Removes sibling entries that share this PolicyID under a different URL, for example stale
+    or mistyped entries. The switch never removes the AD policy row. Without the switch the
+    script only warns, because multiple URLs per PolicyID is also the legitimate pattern for
+    redundant endpoints. The cleanup acts only when the entry that replaces the siblings is
+    COMPLETE at that moment. The same rule applies to the (Default) marker and to the AD-row
+    prerequisite.
+
+    Complete means one of two things. Either this run wrote and verified the entry. Or the
+    entry was already present with URL and PolicyID as requested AND with FriendlyName plus
+    DWORD Flags, AuthFlags and Cost. URL + PolicyID alone does not count: that is what an
+    interrupted write leaves.
+
+    CAUTION: the script deletes sibling entries from the GPO, and every client the GPO
+    applies to loses them.
 
 .PARAMETER DisableUserConfigured
-    Set root Flags bit 0x4 (clients ignore user-configured policy servers). Preserved on
-    later runs; clear with -EnableUserConfigured.
+    Sets bit 0x4 of the root Flags, so clients ignore user-configured policy servers. Later
+    runs preserve the bit. Clear it with -EnableUserConfigured.
 
 .PARAMETER EnableUserConfigured
-    Clear root Flags bit 0x4.
+    Clears bit 0x4 of the root Flags.
 
 .PARAMETER EnableAutoEnrollmentPolicy
-    Also write the "Certificate Services Client - Auto-Enrollment" setting into the same GPO
-    scope: AEPolicy (default 7 = enabled + renew/update + template update), expiration
-    notification percent (default 10) and store (default MY). If the GPO already carries
-    different Auto-Enrollment values the script WARNS with old -> new before its confirmation
-    gate. Without autoenrollment enabled somewhere, the policy list alone enrolls nothing.
+    Also writes the "Certificate Services Client - Auto-Enrollment" setting into the same GPO
+    scope. The values are AEPolicy, the expiration notification percent, and the store.
+    AEPolicy defaults to 7, which means enabled + renew/update + template update. The percent
+    defaults to 10 and the store defaults to MY. If the GPO already holds different
+    Auto-Enrollment values, the script WARNS with old -> new before its confirmation gate.
+    Without Auto-Enrollment enabled somewhere, the policy list alone enrolls nothing.
 
 .PARAMETER AEPolicy
-    AEPolicy value to write with -EnableAutoEnrollmentPolicy (default 7; 0x8000=32768 writes
-    it disabled).
+    The AEPolicy value that the script writes with -EnableAutoEnrollmentPolicy. The default
+    is 7. The value 0x8000, decimal 32768, writes it disabled.
 
 .PARAMETER AEExpirationPercent
-    OfflineExpirationPercent to write with -EnableAutoEnrollmentPolicy (default 10).
+    The OfflineExpirationPercent value that the script writes with -EnableAutoEnrollmentPolicy.
+    The default is 10.
 
 .PARAMETER AEStore
-    OfflineExpirationStoreNames to write with -EnableAutoEnrollmentPolicy (default 'MY').
+    The OfflineExpirationStoreNames value that the script writes with
+    -EnableAutoEnrollmentPolicy. The default is 'MY'.
 
 .PARAMETER Domain
-    Optional: domain for the GroupPolicy cmdlets and the AD/SYSVOL lookups.
+    Optional. The domain for the GroupPolicy cmdlets and for the AD and SYSVOL lookups.
 
 .PARAMETER Server
-    Optional: domain controller to target - used for BOTH the GroupPolicy cmdlets and the
-    registry.pol state reads, keeping them on the same replica.
+    Optional. The domain controller to target. The script uses it for BOTH the GroupPolicy
+    cmdlets and the registry.pol state reads, so they stay on the same replica.
 
 .PARAMETER Remove
-    Removal mode: delete the entry for -Url from the GPO scope, clear the (Default) marker if
-    it pointed at that entry's PolicyID and no remaining entry still serves that PolicyID,
-    and report what remains (remaining entries, actual root Flags, Auto-Enrollment). Other
-    entries and shared configuration are left alone.
+    Removal mode. The script deletes the entry for -Url from the GPO scope. The script clears
+    the (Default) marker only when both of these conditions hold:
+      * The marker pointed at the PolicyID of the removed entry.
+      * No remaining entry still serves that PolicyID.
+    The script then reports what remains: the remaining entries, the actual root Flags, and
+    Auto-Enrollment. The script leaves other entries and the shared configuration alone.
+
+    CAUTION: the script deletes the entry and can clear the (Default) marker, for every client
+    the GPO applies to.
 
 .EXAMPLE
     .\Add-CertificateEnrollmentPolicyServerToGpo.ps1 -GpoName 'PKI - Enrollment Policy' -Url 'https://pki.example.net/ejbca/msae/CEPService?alias' -PolicyName 'Example PKI Service' -EnableAutoEnrollmentPolicy -WhatIf
 
+    Previews every operation in the Machine scope, including the Auto-Enrollment setting,
+    without any change to the GPO.
+
 .EXAMPLE
     .\Add-CertificateEnrollmentPolicyServerToGpo.ps1 -GpoName 'PKI - Enrollment Policy' -Url 'https://pki.example.net/ejbca/msae/CEPService?alias' -Scope User -Remove
 
+    Removes the entry for that URL from the User scope of the GPO.
+
 .NOTES
-    Complete teardown of everything this script can write, per scope prefix H (HKLM for
-    -Scope Machine, HKCU for User), all via Remove-GPRegistryValue -Name <GPO>:
-      -Key 'H\SOFTWARE\Policies\Microsoft\Cryptography\PolicyServers\<entry-hash>'   (each entry)
-      -Key 'H\SOFTWARE\Policies\Microsoft\Cryptography\PolicyServers\37c9dc30f207f27f61a2f7c3aed598a6e2920b54'  (AD row)
-      -Key 'H\SOFTWARE\Policies\Microsoft\Cryptography\PolicyServers' -ValueName 'Flags'
-      -Key 'H\SOFTWARE\Policies\Microsoft\Cryptography\PolicyServers' -ValueName ''    ((Default) marker)
-      -Key 'H\SOFTWARE\Policies\Microsoft\Cryptography\AutoEnrollment'                 (if AE was enabled)
-    Clients pick changes up at the next GP refresh; force with gpupdate, then trigger
-    enrollment with "certutil -pulse" (machine) / "certutil -user -pulse" (user).
+    A complete teardown removes everything this script can write in one scope. H is the
+    scope prefix: HKLM for -Scope Machine, HKCU for -Scope User. Run
+    Remove-GPRegistryValue -Name <GPO> with each of these argument sets:
+      * -Key 'H\SOFTWARE\Policies\Microsoft\Cryptography\PolicyServers\<entry-hash>' (once for each entry)
+      * -Key 'H\SOFTWARE\Policies\Microsoft\Cryptography\PolicyServers\37c9dc30f207f27f61a2f7c3aed598a6e2920b54' (the AD row)
+      * -Key 'H\SOFTWARE\Policies\Microsoft\Cryptography\PolicyServers' -ValueName 'Flags' (the root Flags)
+      * -Key 'H\SOFTWARE\Policies\Microsoft\Cryptography\PolicyServers' -ValueName '' (the (Default) marker)
+      * -Key 'H\SOFTWARE\Policies\Microsoft\Cryptography\AutoEnrollment' (only if Auto-Enrollment was enabled)
+
+    Clients load the changes at the next Group Policy refresh. Run gpupdate to force the
+    refresh. Then start enrollment with "certutil -pulse" for the Machine scope, or with
+    "certutil -user -pulse" for the User scope.
 #>
 # NOTE: deliberately NO '#Requires -Modules GroupPolicy'. On PowerShell 7 the GroupPolicy
 # module is not visible to Get-Module -ListAvailable (it lives only in the Windows PowerShell

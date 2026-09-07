@@ -8,6 +8,25 @@ Each script also carries its own version in the `PSScriptInfo` header at the top
 Test-ScriptFileInfo .\Submit-CertificateRequests.ps1 | Select-Object Name, Version
 ```
 
+## [1.0.9] — 2026-09-07
+
+Help text and documentation only; no code changed. The operator-facing text of this repository now follows a writing style derived from ASD-STE100 Simplified Technical English.
+
+### Changed - writing style
+
+- The operator-facing text now follows `STYLE.md`, a style derived from ASD-STE100 Simplified Technical English (Issue 9, 2025). It applies to the comment-based help of every script, to the README, and to the newest section of the CHANGELOG. Older CHANGELOG sections and the `.RELEASENOTES` lines are a historical record and stay as they are.
+- `Tests\Style.Tests.ps1` (Static tier) checks the rules that a tool can check. Sentences must have 25 words or fewer, and paragraphs 6 sentences or fewer. Banned figurative or ambiguous words are refused. Every accept-risk switch must have a `CAUTION:` line in its help and a `> **CAUTION**` block in the README. CI runs the checks on both engines.
+- `CLAUDE.md` states the rules and the gate for every future change.
+- The help of every script and the README were rewritten to the style. No code changed. Each script's version is bumped for the help change, as for v1.0.5.
+
+| Script | Version |
+|---|---|
+| Set-ADCSTemplateValidity.ps1 | **1.0.5** |
+| Submit-CertificateRequests.ps1 | **1.0.10** |
+| Sync-ADCSTemplate.ps1 | **1.0.7** |
+| Add-CertificateEnrollmentPolicyServerOffline.ps1 | **1.0.7** |
+| Add-CertificateEnrollmentPolicyServerToGpo.ps1 | **1.0.7** |
+
 ## [1.0.8] — 2026-09-07
 
 A whole-tree `/security-review` of all five scripts, with independent false-positive filtering, ran after v1.0.7. It found one confirmed finding, fixed here. An iterative Codex/Astra (gpt-6-astra, high effort) adversarial review then examined the fix. Three rounds found further defects in the fix itself; each was verified and fixed. Round 4 returned an explicit *approve*.
@@ -250,6 +269,7 @@ Initial release.
 | Add-CertificateEnrollmentPolicyServerOffline.ps1 | 1.0.0 |
 | Add-CertificateEnrollmentPolicyServerToGpo.ps1 | 1.0.0 |
 
+[1.0.9]: https://github.com/TheOmnilord/ADCS/compare/v1.0.8...v1.0.9
 [1.0.8]: https://github.com/TheOmnilord/ADCS/compare/v1.0.7...v1.0.8
 [1.0.7]: https://github.com/TheOmnilord/ADCS/compare/v1.0.6...v1.0.7
 [1.0.6]: https://github.com/TheOmnilord/ADCS/compare/v1.0.5...v1.0.6

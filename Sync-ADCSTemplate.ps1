@@ -1,11 +1,12 @@
 <#PSScriptInfo
-.VERSION 1.0.6
+.VERSION 1.0.7
 .GUID 689db74d-e668-410a-9a62-0b208179a369
 .AUTHOR Sveinung Svea
 .PROJECTURI https://github.com/TheOmnilord/ADCS
 .LICENSEURI https://github.com/TheOmnilord/ADCS/blob/main/LICENSE
 .TAGS ADCS PKI CertificateServices
 .RELEASENOTES
+1.0.7 - Help text only: the comment-based help is rewritten to the repository writing style (STYLE.md, derived from ASD-STE100 Simplified Technical English) - short sentences, active voice, no figurative language, acronyms defined, a CAUTION line on -SkipAcl and -AllowLinkedIssuancePolicy; every fact, condition and default is kept; no code change
 1.0.6 - ConvertTo-ImportAttributeValue checks integrality and range in the value's OWN numeric type before any [decimal] cast: a tiny double (1e-30) cast to decimal underflowed to 0 and was silently coerced to 0 (integer and byte-element branches both); Convert-ToLatestCompatibility computes and validates every replacement value - including the minor-revision increment, which now throws on Int32.MaxValue overflow - BEFORE mutating $Attributes, so a failure no longer leaves a template half-upgraded (v4 schema/flags with an un-bumped revision) while still reporting Upgraded; the Authentication Mechanism Assurance import guard scans only msPKI-Certificate-Policy (the issuance policies stamped into the ISSUED certificate), no longer msPKI-RA-Policies (which constrains the enrollment-agent SIGNING certificate and is not stamped into the issued cert, so an AMA link on it never grants the enrollee) - it was falsely refusing templates that merely require a signing-cert application policy
 1.0.5 - The DOMAIN\user@domain principal form now takes the UPN-only resolution and sAMAccountName shadow check (matching on the raw key let a prefixed key skip to the sAMAccountName lookup, so a planted sAMAccountName could still capture the grant); the dotted-OID validation regexes are anchored with \z instead of $ (a trailing newline in a tampered msPKI-Cert-Template-OID passed validation and bypassed the template-OID uniqueness search); -UpgradeCompatibility refuses a schema-2 source carrying msPKI-RA-Application-Policies (its encoding differs at v3/v4, so upgrading in place would silently drop the RA-signature application-policy requirement)
 1.0.4 - Every known attribute of an import is validated for type, shape and range and the import is refused when one is malformed (a failed cast previously dropped the attribute - msPKI-RA-Signature included - and the template was created without it; 0.4 was coerced to 0, a three-element period array passed as a period); an issuance policy OID that the TARGET forest links to a group via Authentication Mechanism Assurance refuses the import unless -AllowLinkedIssuancePolicy is given (new switch)
@@ -19,214 +20,261 @@
 
 <#
 .SYNOPSIS
-    Copies a certificate template from one AD forest to another using direct attribute copy -
-    either through a JSON file (Export/Import) or forest-to-forest in a single run (Sync).
-    Optionally renames the template, either preserves or regenerates the template OID, and applies
-    standard AD CS permissions after import. Works even against a target forest that has never had
-    AD CS (Certificate Services) installed.
+    Copies a certificate template from one AD forest to another, through a JSON file
+    (Export/Import) or directly forest-to-forest in one run (Sync).
 
 .DESCRIPTION
-    This is a direct attribute-level template copy (no certutil), performed entirely over ADWS.
-    It uses the ActiveDirectory PowerShell module for ALL modes, so the module is required for
-    Export as well as Import/Sync.
+    The script copies the template attribute by attribute, without certutil, entirely over Active
+    Directory Web Services (ADWS). It uses the ActiveDirectory PowerShell module for ALL modes, so
+    the module is required for Export as well as for Import and Sync. The script can rename the
+    template. It can keep the OID (object identifier) of the template, or generate a new OID. It
+    applies standard AD CS (Active Directory Certificate Services) permissions after the import.
+    The target forest can be one that has never had AD CS installed.
 
       -Mode Export
-          Run in the SOURCE forest. Reads the template's functional attributes (flags, revision,
-          and all msPKI-*/pKI* attributes) via ADWS and writes them to a JSON file. Forest-specific
-          data is deliberately NOT exported: the security descriptor, distinguishedName, and
-          objectCategory are left out because they are derived/reapplied in the target forest.
-          The source template OID and identity fields (name/displayName) can additionally be
-          stripped from the file (-StripOid / -StripIdentity).
+          Run this mode in the SOURCE forest. The script reads the functional attributes of the
+          template through ADWS: flags, revision, and all msPKI-* and pKI* attributes. It writes
+          them to a JSON file. The script deliberately does NOT export forest-specific data: the
+          security descriptor, distinguishedName, and objectCategory. The target forest derives
+          these values, or the script reapplies them there. You can also remove the source template
+          OID and the identity fields (name and displayName) from the file with -StripOid and
+          -StripIdentity.
 
       -Mode Import
-          Run in the TARGET forest. Recreates the template from the JSON file via ADWS:
-            * handles the template OID per -OidHandling (Preserve carries the source OID; Generate
-              mints under the forest's real OID root; GenerateFromRoot mints under a base you supply
-              in -OidRoot; GenerateRandom mints under a synthesized base). Every mode also registers an
-              OID "display" object so Windows resolves the OID to the template name. Only "Generate"
-              needs a pre-existing PKI OID root (i.e. AD CS deployed once);
-            * derives the container DN from the TARGET forest's configuration NC and lets AD
-              assign objectClass/objectCategory automatically;
-            * lets you rename the template (internal cn and display name) via parameters;
-            * sets template permissions (unless -SkipAcl), from a base chosen by -AclBase plus optional
-              -EnrollPrincipals additions. -AclBase Standard (default) writes the standard Kerberos
-              Authentication ACL, replacing the schema default so admins are not left with Full Control:
-              Authenticated Users -> Read; Domain Admins and Enterprise Admins -> Read/Write/Enroll;
-              Domain Controllers, Enterprise RODCs and Enterprise Domain Controllers -> Enroll/Autoenroll
-              (Read comes via Authenticated Users); SYSTEM is not granted. Other -AclBase values keep or
-              extend AD's schema-default ACL instead. This ACL is what a consumer such as EJBCA reads to
-              decide who may enrol.
-          Requires Enterprise Admin (or delegated write access to the Certificate Templates and
-          OID containers in the Configuration partition).
+          Run this mode in the TARGET forest. The script recreates the template from the JSON file
+          through ADWS. The script:
+            * handles the template OID as -OidHandling says. Preserve keeps the source OID. Generate
+              generates a new OID under the real OID root of the forest. GenerateFromRoot generates a
+              new OID under a base you supply in -OidRoot. GenerateRandom generates a new OID under a
+              synthesized base.
+            * registers an OID "display" object for every -OidHandling value, so Windows resolves the
+              OID to the template name. Only Generate needs a pre-existing PKI OID root, that is, a
+              forest where AD CS was deployed once.
+            * derives the container DN from the Configuration partition of the TARGET forest. It lets
+              Active Directory assign objectClass and objectCategory automatically.
+            * lets you rename the template (internal cn and display name) with -NewTemplateName and
+              -NewDisplayName.
+            * sets the template permissions, unless you pass -SkipAcl. The base comes from -AclBase;
+              -EnrollPrincipals adds optional grants on top. The default, -AclBase Standard, writes the
+              standard Kerberos Authentication ACL. It replaces the schema default, so admins are not
+              left with Full Control. Other -AclBase values keep or extend the schema-default ACL of
+              Active Directory instead. A consumer such as EJBCA reads this ACL to decide who may
+              enroll.
+            * writes these entries in the standard Kerberos Authentication ACL: Authenticated Users
+              get Read. Domain Admins and Enterprise Admins get Read, Write, and Enroll. Domain
+              Controllers, Enterprise RODCs, and Enterprise Domain Controllers get Enroll and
+              Autoenroll. Their Read comes through Authenticated Users. The script grants nothing to
+              SYSTEM.
+
+          Import requires Enterprise Admin rights, or delegated write access to the Certificate
+          Templates and OID containers in the Configuration partition.
 
       -Mode Sync
-          Direct forest-to-forest copy in one run - no intermediate file. Reads the template from a
-          DC in the SOURCE forest (-SourceServer, optionally -SourceCredential) and recreates it on
-          the TARGET side exactly as -Mode Import would (-Server / discovered DC, optionally
-          -Credential) - including -OidHandling, -NewTemplateName / -NewDisplayName, and the full
-          ACL handling described under -Mode Import. It feeds the read attributes straight into
-          the import pipeline, so no JSON serialization happens at all; -Mode Validate proves the
-          fidelity of this direct pipeline and of the file pipeline separately.
+          A direct forest-to-forest copy in one run, with no intermediate file. The script reads
+          the template from a domain controller (DC) in the SOURCE forest, named by -SourceServer,
+          with -SourceCredential when needed. It recreates the template on the TARGET side exactly
+          as -Mode Import does. The target is -Server, or a discovered DC, with -Credential when
+          needed. Sync supports -OidHandling, -NewTemplateName, -NewDisplayName, and the full ACL
+          handling described under -Mode Import.
 
-          Authentication: with a (two-way) trust between the forests, the identity running the
-          script can typically read the source as-is (Authenticated Users has read access to
-          templates) while holding Enterprise Admin rights in the target - then only -SourceServer
-          is needed. Without a trust, or when running as neither identity, pass -SourceCredential
-          and/or -Credential: explicit credentials against explicitly named servers need no trust
-          at all.
+          The script sends the attributes it read straight into the import pipeline, so no JSON
+          serialization happens at all. -Mode Validate proves the fidelity of this direct pipeline
+          and of the file pipeline separately.
+
+          Authentication: with a two-way trust between the forests, the identity that runs the
+          script can usually read the source as-is. Authenticated Users has read access to
+          templates. When that identity also holds Enterprise Admin rights in the target, only
+          -SourceServer is needed. Without a trust, or when you run as neither identity, pass
+          -SourceCredential, -Credential, or both. Explicit credentials against explicitly named
+          servers need no trust at all.
 
       -Mode Validate
-          Proves round-trip fidelity in a single forest, without touching a CA - for BOTH copy
-          pipelines. It reads a source template and (1) exports it to a (temp) JSON file and
-          imports that under a throwaway name, exercising the Export/Import file flow, then
-          (2) feeds the live attribute view directly into the import under a second throwaway
-          name, exercising exactly what -Mode Sync does (live AD values reach the import casts
-          untouched by JSON, so the file check cannot stand in for it). Each throwaway gets a
-          unique OID that needs no OID root; every copied attribute of each copy is diffed -
-          byte[] attributes included. Any mismatch makes the run FAIL with a terminating error
-          (non-zero exit code), so Validate can gate automation; cleanup still runs first. A
-          throwaway that cannot be read back after its confirmed creation fails the run the same
-          way (nothing was validated), never as a warning with exit 0. By
-          default the throwaway templates and the temp file are removed afterwards (keep them for
-          inspection with -KeepArtifacts). Requires the same write access as Import.
+          Proves round-trip fidelity in a single forest, for BOTH copy pipelines, without touching
+          a CA. The script reads a source template. First, it exports the template to a JSON file,
+          temporary unless you give -Path, and imports that file under a throwaway name. This
+          exercises the Export/Import
+          file flow. Then it sends the live attribute view directly into the import under a second
+          throwaway name. This exercises exactly what -Mode Sync does.
+
+          Live Active Directory values reach the import casts untouched by JSON, so the file check
+          cannot stand in for the direct check. Each throwaway template gets a unique OID that
+          needs no OID root. The script compares every copied attribute of each copy with the
+          source, byte[] attributes included. Any mismatch makes the run FAIL with a terminating
+          error and a non-zero exit code, so automation can use the exit code to decide. Cleanup
+          still runs first. A throwaway template that the script cannot read back after its
+          confirmed creation fails the run the same way, because nothing was validated.
+
+          The script never reports that read-back failure as a warning with exit 0. By default the
+          script removes the throwaway templates and the temporary file afterwards. Pass
+          -KeepArtifacts to keep them for inspection. Validate requires the same write access as
+          Import.
 
     No CA required:
-      * Export, Import and Validate operate ONLY on the certificate TEMPLATE objects in AD's
-        Configuration partition. No CA has to be installed, online, or reachable, and no AD CS
-        role / RSAT "AD CS Tools" is needed (only the AD PowerShell module).
-      * With the default -OidHandling Preserve, Import/Validate need NO PKI OID root, so the target
-        forest can be one that never had AD CS. It only needs the (CA-independent) Certificate
-        Templates container, part of every forest's Public Key Services structure; the script checks
-        for it and fails clearly if the whole structure is somehow absent.
-      * Preserve, GenerateFromRoot and GenerateRandom need no PKI OID root - only the (CA-independent)
-        Certificate Templates and OID containers, present in every forest. Only -OidHandling Generate
-        requires the forest's actual "CN=OID,..." base OID (present once AD CS has been deployed once);
-        without it, Generate fails with a clear message pointing you to the other modes.
-      * This moves a template DEFINITION - not an issued certificate, and no private keys. A CA is
-        only involved later, when you publish the imported template on an issuing CA so it can
-        enroll certificates from it.
+      * Export, Import, and Validate operate ONLY on the certificate TEMPLATE objects in the
+        Configuration partition of Active Directory. No CA has to be installed, online, or
+        reachable. The AD CS role and the RSAT "AD CS Tools" are not needed. Only the
+        ActiveDirectory PowerShell module is needed.
+      * Import and Validate need NO PKI OID root with the default -OidHandling Preserve. The target
+        forest can therefore be one that never had AD CS. The target forest needs only the
+        Certificate Templates container, which does not depend on a CA. This container is part of
+        the Public Key Services structure of every forest. The script checks for it and fails with
+        a clear message when the whole structure is absent.
+      * Preserve, GenerateFromRoot, and GenerateRandom need no PKI OID root. They need only the
+        Certificate Templates and OID containers, which do not depend on a CA and exist in every
+        forest. Only -OidHandling Generate requires the actual "CN=OID,..." base OID of the forest,
+        which exists once AD CS has been deployed there once. Without it, Generate fails with a
+        clear message that names the other -OidHandling values.
+      * The script moves a template DEFINITION. It moves no issued certificate and no private key.
+        A CA takes part only later, when you publish the imported template on an issuing CA. The
+        CA can then enroll certificates from it.
 
     Identity / OID / placement handling:
-      * OID: -OidHandling Preserve (default) reuses the source template's OID (so do NOT combine it
-        with -StripOid on export); Generate / GenerateFromRoot / GenerateRandom instead mint a new OID
-        (from the forest's real root, a supplied -OidRoot, or a synthesized base, respectively).
-      * objectCategory and the DN suffix (everything after "CN=Certificate Templates,...") are
-        derived from the TARGET forest automatically - you never edit them by hand.
-      * The new internal name (cn) and display name come from -NewTemplateName / -NewDisplayName.
-        If you did not strip identity on export, the source name/displayName in the file are used
-        as fallbacks.
+      * OID: the default, -OidHandling Preserve, reuses the OID of the source template. Do NOT
+        combine Preserve with -StripOid on export. Generate, GenerateFromRoot, and GenerateRandom
+        instead generate a new OID. Generate uses the real root of the forest. GenerateFromRoot
+        uses the -OidRoot you supply. GenerateRandom uses a synthesized base.
+      * The script derives objectCategory and the DN suffix from the TARGET forest automatically.
+        The DN suffix is everything after "CN=Certificate Templates,...". You never edit them by
+        hand.
+      * The new internal name (cn) and the new display name come from -NewTemplateName and
+        -NewDisplayName. If you did not strip the identity on export, the script uses the source
+        name and displayName from the file as fallbacks.
 
 .PARAMETER Mode
-    "Export", "Import", "Sync", or "Validate". The file-based and direct flows mix freely: a JSON
-    exported earlier imports into a remote forest with -Mode Import -Server <target DC> (plus
-    -Credential when needed), and -Mode Export equally accepts -Server/-Credential to read from a
-    remote source forest.
+    "Export", "Import", "Sync", or "Validate". The file-based flow and the direct flow mix freely.
+    A JSON file exported earlier imports into a remote forest with -Mode Import -Server <target DC>,
+    plus -Credential when needed. In the same way, -Mode Export accepts -Server and -Credential to
+    read from a remote source forest.
 
 .PARAMETER Path
-    JSON file path. Written on Export, read on Import. Required for Export and Import; not used by
-    Sync (no intermediate file is involved). On Validate it is optional: if given, the intermediate
-    export is written there and kept for inspection; if omitted, a temporary file is used and
-    deleted afterwards.
+    The path of the JSON file. Export writes it, and Import reads it. It is required for Export and
+    Import; Sync does not use it, because no intermediate file is involved. On Validate it is
+    optional. If you give it, the script writes the intermediate export there and keeps the file
+    for inspection. If you omit it, the script uses a temporary file and deletes it afterwards.
 
 .PARAMETER TemplateName
-    Export/Validate/Sync. The internal name (cn) of the source template to read. cn is unique
-    within the templates container, so this matches exactly one template.
+    Export, Validate, and Sync. The internal name (cn) of the source template to read. The cn is
+    unique within the templates container, so this name matches exactly one template.
     Default: "KerberosAuthentication".
 
 .PARAMETER StripIdentity
-    Export only. Removes the source name and displayName from the JSON file, forcing you to supply
-    -NewTemplateName / -NewDisplayName on import.
+    Export only. Removes the source name and displayName from the JSON file. You must then supply
+    -NewTemplateName and -NewDisplayName on import.
 
 .PARAMETER StripOid
-    Export only. Removes the source msPKI-Cert-Template-OID from the JSON file. Only safe when the
-    import mints a new OID (-OidHandling Generate, GenerateFromRoot, or GenerateRandom); with the
-    default -OidHandling Preserve the import needs that OID and will error if it was stripped.
+    Export only. Removes the source msPKI-Cert-Template-OID from the JSON file. This is safe only
+    when the import generates a new OID, that is, with -OidHandling Generate, GenerateFromRoot, or
+    GenerateRandom. With the default -OidHandling Preserve, the import needs that OID and fails
+    with an error when the OID was stripped.
 
 .PARAMETER NewTemplateName
-    Import/Sync. New internal name (cn) for the template in the target forest. Letters (non-ASCII
-    included), digits, non-edge spaces and . _ - ( ) are allowed; characters that carry meaning in a
-    DN (, + = " \ ; < >) and the LDAP wildcard (*) and / # are rejected. Parentheses are permitted
-    and escaped where a name reaches an LDAP filter. Falls back to the source's name if omitted.
+    Import and Sync. The new internal name (cn) for the template in the target forest. The script
+    allows letters (non-ASCII included), digits, spaces that are not at an edge, and the
+    characters period (.), underscore (_), hyphen (-), and parentheses. The script rejects the
+    characters that have a meaning in a DN (, + = " \ ; < >), the LDAP wildcard (*), and the
+    characters / and #. Parentheses are permitted; the script escapes them where a name reaches an
+    LDAP filter. If you omit it, the script uses the name of the source.
 
 .PARAMETER NewDisplayName
-    Import/Sync. New display name for the template in the target forest. Falls back to the
-    source's displayName if omitted.
+    Import and Sync. The new display name for the template in the target forest. If you omit it,
+    the script uses the displayName of the source.
 
 .PARAMETER OidHandling
-    Import/Sync. How the template's OID is chosen. Every mode also registers a companion
-    msPKI-Enterprise-Oid "display" object (when the OID container exists) so Windows resolves the OID
-    to the template name.
-      Preserve         (default) carry the source template's OID from the file. Needs no PKI OID root,
-                       so it works in a forest that never had AD CS.
-      Generate         mint a fresh OID under the target forest's REAL enterprise OID root. Requires
-                       that AD CS was provisioned in the target forest at least once.
-      GenerateFromRoot mint under the base OID you pass in -OidRoot (no AD CS needed). Use the same
-                       root across imports to give those templates a shared, stable base.
-      GenerateRandom   mint under a freshly synthesized, forest-independent base (no AD CS, no input).
+    Import and Sync. How the script chooses the OID of the template. Every value also registers a
+    companion msPKI-Enterprise-Oid "display" object when the OID container exists, so Windows
+    resolves the OID to the template name.
+      * Preserve (default): keeps the OID of the source template from the file. Needs no PKI OID
+        root, so it works in a forest that never had AD CS.
+      * Generate: generates a new OID under the REAL enterprise OID root of the target forest.
+        Requires that AD CS was provisioned in the target forest at least once.
+      * GenerateFromRoot: generates a new OID under the base OID you pass in -OidRoot. No AD CS is
+        needed. Use the same root across imports to give those templates a shared, stable base.
+      * GenerateRandom: generates a new OID under a freshly synthesized, forest-independent base.
+        No AD CS is needed, and no input is needed.
 
 .PARAMETER OidRoot
-    Import/Sync. Required with -OidHandling GenerateFromRoot: the base OID to generate the template OID
-    under, e.g. "1.3.6.1.4.1.311.21.8.100000001.100000002.100000003.100000004.100000005". Supplying
-    it with any other -OidHandling is rejected up front (it would otherwise be silently ignored).
+    Import and Sync. Required with -OidHandling GenerateFromRoot: the base OID under which the
+    script generates the template OID, for example
+    "1.3.6.1.4.1.311.21.8.100000001.100000002.100000003.100000004.100000005". The script rejects
+    -OidRoot with any other -OidHandling value before it does anything else, because it would
+    otherwise ignore the value without a message.
 
 .PARAMETER Server
-    Optional domain controller to target for configuration-partition operations - on Sync this is
-    the TARGET side (the source side is -SourceServer). If omitted on Import/Sync/Validate, a
-    writable DC in the CURRENT forest is discovered and used consistently for the write and the
-    follow-up ACL step; point it at a DC in another forest (with -Credential as needed) to operate
-    there instead. Required whenever -Credential is given, so the credentials are guaranteed to be
-    used against the forest you intend.
+    The optional domain controller (DC) to target for Configuration partition operations. On Sync
+    this is the TARGET side; the source side is -SourceServer. If you omit it on Import, Sync, or
+    Validate, the script discovers a writable DC in the CURRENT forest. The script then uses that
+    DC consistently for the write and for the follow-up ACL step. Point -Server at a DC in another
+    forest, with -Credential as needed, to operate there instead. -Server is required whenever you
+    give -Credential, so the script is guaranteed to use the credentials against the forest you
+    intend.
 
 .PARAMETER Credential
-    Optional credentials used against -Server - the TARGET side for Import/Sync/Validate, the
-    SOURCE side for Export (which has no target side). Covers every operation the mode performs:
-    config-partition reads and writes, principal lookups, and the ACL write (all over ADWS).
-    Combined with -Server it lets Export read from - or Import/Sync write to - a forest you are
-    not logged on to, with no trust required. Requires -Server (see above).
+    The optional credentials the script uses against -Server. That is the TARGET side for Import,
+    Sync, and Validate, and the SOURCE side for Export, which has no target side. The credentials
+    cover every operation the mode performs: Configuration partition reads and writes, principal
+    lookups, and the ACL write, all over ADWS. Combined with -Server, -Credential lets Export read
+    from a forest you are not logged on to, with no trust required. In the same way it lets Import
+    and Sync write to such a forest. Requires -Server (see -Server above).
 
 .PARAMETER SourceServer
-    Sync only (required there). A domain controller, or domain name, in the SOURCE forest to read
-    the template from.
+    Sync only, and required there. A domain controller, or a domain name, in the SOURCE forest from
+    which the script reads the template.
 
 .PARAMETER SourceCredential
-    Sync only. Optional credentials used against -SourceServer. Omit to read as the current
-    identity (works across a trust, or when running inside the source forest itself).
+    Sync only. The optional credentials the script uses against -SourceServer. Omit it to read as
+    the current identity. That works across a trust, or when you run inside the source forest
+    itself.
 
 .PARAMETER SkipAcl
-    Import/Sync. Skips the permission setup after import. Mutually exclusive with -EnrollPrincipals
-    and with an explicit -AclBase.
+    Import and Sync. Skips the permission setup after the import. It is mutually exclusive with
+    -EnrollPrincipals and with an explicit -AclBase.
+
+    CAUTION: the template keeps the schema-default DACL. Admins and SYSTEM get Full Control, and
+    no principal gets Enroll until you apply permissions yourself.
 
 .PARAMETER AclBase
-    Import/Sync. The base the template ACL is built from; -EnrollPrincipals (if any) is always added on
-    top. Default: Standard. NOTE: the default is the KERBEROS AUTHENTICATION set (DC-oriented) - when
-    it applies only by default to a template whose name does not look like a Kerberos Authentication
-    copy, the script warns so the DC-oriented grants are a conscious choice, not an accident.
-      Standard           the script's standard Kerberos Authentication set (see -Mode Import above),
-                         REPLACING AD's schema-default ACL (so admins are not left with Full Control).
-      Schema             leave AD's schema-default ACL as created (Domain/Enterprise Admins Full
-                         Control, SYSTEM Full Control, Authenticated Users Read) and only add
-                         -EnrollPrincipals to it.
-      SchemaPlusStandard keep the schema-default ACL AND add the Standard set on top (nothing removed).
-      PrincipalsOnly     no base - the ACL is exactly your -EnrollPrincipals (which is then required),
-                         replacing the schema default.
+    Import and Sync. The base from which the script builds the template ACL. The script always
+    adds -EnrollPrincipals, when given, on top of the base. Default: Standard, the KERBEROS
+    AUTHENTICATION set, which is oriented to domain controllers (DCs). NOTE: when that set applies
+    only by default to a template whose name does not look like a Kerberos Authentication copy,
+    the script warns. The warning makes the DC-oriented grants a conscious choice, not an accident.
+      * Standard: the standard Kerberos Authentication set of the script (see -Mode Import above).
+        It REPLACES the schema-default ACL of Active Directory, so admins are not left with Full
+        Control.
+      * Schema: leaves the schema-default ACL of Active Directory as created, and only adds
+        -EnrollPrincipals to it. The schema default is: Domain Admins and Enterprise Admins Full
+        Control, SYSTEM Full Control, Authenticated Users Read.
+      * SchemaPlusStandard: keeps the schema-default ACL AND adds the Standard set on top. The
+        script removes nothing.
+      * PrincipalsOnly: no base. The ACL is exactly your -EnrollPrincipals, which is then required,
+        and it replaces the schema default.
 
 .PARAMETER EnrollPrincipals
-    Import/Sync. Hashtable mapping each principal to the rights it should receive; these grants are
-    ADDED on top of the -AclBase base (and are the sole content when -AclBase PrincipalsOnly). Keys: a
-    SID (S-1-5-...), a sAMAccountName or UPN (user@domain), optionally DOMAIN\-prefixed - the prefix
-    must name the target domain, or a well-known token (DomainControllers, DomainComputers,
-    DomainUsers, DomainAdmins, EnterpriseAdmins, EnterpriseRODCs, EnterpriseDomainControllers,
-    AuthenticatedUsers, Everyone). Resolution is fail-closed: a bare string that matches BOTH a
-    well-known token AND a directory object with a DIFFERENT SID is refused (a planted account
-    cannot hijack a token, and a token cannot shadow a distinct real group - disambiguate with a
-    SID or a DOMAIN\ prefix); the built-in groups' own names (e.g. 'Domain Admins') resolve
-    normally, since both readings yield the same SID. A name matching more than one object
-    (duplicate UPNs) is refused rather than guessed. A key containing '@' (user@domain) resolves
-    ONLY as a UPN: sAMAccountName may legally contain '@', so a different object carrying that
-    string as its sAMAccountName is refused as a planted or colliding account. Values: one
-    or more of Read, Write, Enroll, Autoenroll, FullControl. Named principals are looked up in the
-    target (-Server) domain; use a SID for a principal in another domain. Validated up front, before
-    anything is created. Example:
+    Import and Sync. A hashtable that maps each principal to the rights the script grants to it.
+    The script ADDS these grants on top of the -AclBase base. With -AclBase PrincipalsOnly they
+    are the sole content of the ACL. The script validates the hashtable and resolves every
+    principal first, before it creates anything.
+
+    Keys: a SID (S-1-5-...), a sAMAccountName, a UPN (user@domain), or a well-known token. A
+    sAMAccountName or a UPN may have a DOMAIN\ prefix; the prefix must name the target domain. The
+    well-known tokens are DomainControllers, DomainComputers, DomainUsers, DomainAdmins,
+    EnterpriseAdmins, EnterpriseRODCs, EnterpriseDomainControllers, AuthenticatedUsers, and
+    Everyone. The script looks up named principals in the target (-Server) domain. Use a SID for a
+    principal in another domain.
+
+    Resolution fails closed. The script refuses a bare string that matches BOTH a well-known token
+    AND a directory object with a DIFFERENT SID. This way an account placed by an attacker cannot
+    hijack a token, and a token cannot shadow a distinct real group. Disambiguate with a SID or
+    with a DOMAIN\ prefix. The names of the built-in groups themselves, for example
+    'Domain Admins', resolve normally, because both readings yield the same SID. The script
+    refuses a name that matches more than one object (duplicate UPNs) rather than guess.
+
+    A key that contains '@' (user@domain) resolves ONLY as a UPN. A sAMAccountName may legally
+    contain '@', so the script refuses a different object that has that string as its
+    sAMAccountName. It treats that object as an account placed to capture the grant, or as a
+    colliding account.
+
+    Values: one or more of Read, Write, Enroll, Autoenroll, FullControl. Example:
         -AclBase PrincipalsOnly -EnrollPrincipals @{
             'DomainControllers'    = 'Enroll','Autoenroll'
             'AuthenticatedUsers'   = 'Read'
@@ -234,55 +282,78 @@
         }
 
 .PARAMETER UpgradeCompatibility
-    Import/Sync. Raises the imported template to the newest compatibility the Certificate Templates
-    MMC offers - Certification Authority: Windows Server 2016, Certificate recipient:
-    Windows 10 / Windows Server 2016 - as it is created in the target forest (schema version 4 plus
-    the matching private-key-flag bits). Only schema v2/v3 templates can be upgraded in place; a
-    schema v1 template is imported unchanged with a warning (v1 built-ins are read-only in the MMC),
-    and a template already at v4 is left as-is. The source template/export is not modified; only the
-    copy written to the target is upgraded. The legacy-provider bit (CT_FLAG_USE_LEGACY_PROVIDER,
-    0x100) is set only for a schema-2 source with a provider list (v2 knows only CryptoAPI CSPs); a
-    schema-3 source keeps its own bit, so a v3 template that lists a KSP stays CNG.
+    Import and Sync. Raises the imported template to the newest compatibility that the Certificate
+    Templates MMC (Microsoft Management Console) snap-in offers. The script applies the upgrade as
+    it creates the template in the target forest. That compatibility is Certification Authority:
+    Windows Server 2016, and Certificate recipient: Windows 10 / Windows Server 2016. It means
+    schema version 4 plus the matching private-key-flag bits.
+
+    Only schema v2 and v3 templates can be upgraded in place. The script imports a schema v1
+    template unchanged, with a warning, because v1 built-in templates are read-only in the MMC. It
+    leaves a template already at v4 as-is. The script does not modify the source template or the
+    export; it upgrades only the copy it writes to the target.
+
+    The script also imports a schema v2 source that has msPKI-RA-Application-Policies at its
+    existing compatibility, with a warning. The encoding of that attribute differs at v3 and v4. An
+    upgrade in place would drop the registration authority (RA) signature application-policy
+    requirement.
+
+    The script sets the legacy-provider bit (CT_FLAG_USE_LEGACY_PROVIDER, 0x100) only for a
+    schema-2 source with a provider list. The reason: v2 knows only CryptoAPI cryptographic service
+    providers (CSPs). A schema-3 source keeps its own bit, so a v3 template that lists a key
+    storage provider (KSP) stays on Cryptography Next Generation (CNG).
 
 .PARAMETER AllowLinkedIssuancePolicy
-    Import/Sync. By default the import is REFUSED when the template carries an issuance policy OID
-    (in msPKI-Certificate-Policy - the issuance policies stamped into the ISSUED certificate) that the TARGET forest already links to a group
-    through Authentication Mechanism Assurance (msDS-OIDToGroupLink): certificates issued from the
-    copy would grant that group's membership at logon to every principal the copy's enrollment ACL
-    admits, with no link ever being copied. Pass this switch to accept such a mapping deliberately
-    (the linked OIDs and groups are then listed in a warning). Every known attribute of the import
-    is also validated for type, shape and range before anything is created - a malformed or
-    tampered export (a non-integer msPKI-RA-Signature, a three-byte validity period, a non-OID
-    application policy) is refused, never silently dropped or coerced.
+    Import and Sync. By default the script REFUSES the import when the template has an issuance
+    policy OID that the TARGET forest already links to a group. Such a link is an Authentication
+    Mechanism Assurance (AMA) link, stored in msDS-OIDToGroupLink. The script scans
+    msPKI-Certificate-Policy, which holds the issuance policies stamped into the ISSUED
+    certificate.
+
+    Certificates issued from the copy would grant the membership of that group at logon to every
+    principal the enrollment ACL of the copy admits. No link is ever copied. Pass this switch to
+    accept such a mapping deliberately; the script then lists the linked OIDs and groups in a
+    warning.
+
+    CAUTION: certificates from the copy would give the membership of the linked group at logon to
+    everyone the enrollment ACL of the copy admits.
+
+    The script also validates every known attribute of the import for type, shape, and range
+    before it creates anything. It refuses a malformed or tampered export, for example a
+    non-integer msPKI-RA-Signature, a three-byte validity period, or a non-OID application policy.
+    It never drops or coerces such an attribute without an error.
 
 .PARAMETER KeepArtifacts
-    Validate only. Leaves the throwaway templates and the export file in place after the diff
-    (default is to remove them). No companion OID object is ever created for the throwaways (they use
-    a self-contained explicit OID), so there is none to keep.
+    Validate only. Leaves the throwaway templates and the export file in place after the
+    comparison. By default the script removes them. The script never creates a companion OID
+    object for the throwaway templates, because they use a self-contained explicit OID. So there
+    is no companion object to keep.
 
 .EXAMPLE
     # Source forest - export the built-in Kerberos Authentication template:
     .\Sync-ADCSTemplate.ps1 -Mode Export -Path .\KerberosAuth.json
 
 .EXAMPLE
-    # Source forest - export a custom template as a name-neutral copy (identity stripped; the OID
-    # stays in the file so the default -OidHandling Preserve works on import - add -StripOid only
-    # when the import will mint a new OID with one of the Generate modes):
+    # Source forest - export a custom template as a name-neutral copy. The identity is stripped.
+    # The OID stays in the file, so the default -OidHandling Preserve works on import. Add
+    # -StripOid only when the import will generate a new OID with one of the Generate values:
     .\Sync-ADCSTemplate.ps1 -Mode Export -TemplateName "XX-KerberosAuthentication" `
         -Path .\XX.json -StripIdentity
 
 .EXAMPLE
-    # Target forest with NO AD CS (default) - import under a new name, carrying the source OID:
+    # Target forest with NO AD CS (the default case) - import under a new name and keep the
+    # source OID:
     .\Sync-ADCSTemplate.ps1 -Mode Import -Path .\XX.json `
         -NewTemplateName "YY-KerberosAuthentication" -NewDisplayName "YY-Kerberos Authentication"
 
 .EXAMPLE
-    # Target forest that HAS its own PKI - mint a fresh target-forest OID instead of carrying it:
+    # Target forest that HAS its own PKI - generate a new target-forest OID instead of keeping
+    # the source OID:
     .\Sync-ADCSTemplate.ps1 -Mode Import -Path .\XX.json -OidHandling Generate `
         -NewTemplateName "YY-KerberosAuthentication" -NewDisplayName "YY-Kerberos Authentication"
 
 .EXAMPLE
-    # No AD CS in the target, but you want a fresh (synthetic) OID with a Windows-resolvable name:
+    # No AD CS in the target, but you want a new synthetic OID that Windows resolves to the name:
     .\Sync-ADCSTemplate.ps1 -Mode Import -Path .\XX.json -OidHandling GenerateRandom `
         -NewTemplateName "YY-KerberosAuthentication" -NewDisplayName "YY-Kerberos Authentication"
 
@@ -294,7 +365,8 @@
     .\Sync-ADCSTemplate.ps1 -Mode Import -Path .\XX.json -NewTemplateName "YY-KerberosAuthentication" -NewDisplayName "YY-Kerberos Authentication" -WhatIf
 
 .EXAMPLE
-    # Standard Kerberos Auth ACL (default) PLUS a template-admin group that EJBCA will read:
+    # The standard Kerberos Authentication ACL (default) PLUS a template-admin group that EJBCA
+    # will read:
     .\Sync-ADCSTemplate.ps1 -Mode Import -Path .\KerberosAuth.json -EnrollPrincipals @{
         'NOREFJELL\PKI-Admins' = 'FullControl'
     }
@@ -307,7 +379,8 @@
     }
 
 .EXAMPLE
-    # Direct sync, no file - run in the TARGET forest and pull from the source forest over the trust:
+    # Direct sync with no file - run in the TARGET forest and read from the source forest over
+    # the trust:
     .\Sync-ADCSTemplate.ps1 -Mode Sync -SourceServer dc01.source.example `
         -TemplateName "XX-KerberosAuthentication" `
         -NewTemplateName "YY-KerberosAuthentication" -NewDisplayName "YY-Kerberos Authentication"
@@ -319,62 +392,73 @@
         -Server dc01.b.example -Credential (Get-Credential B\ent.admin)
 
 .EXAMPLE
-    # Mixed flow: import a previously exported JSON straight into another forest, no logon there:
+    # Mixed flow: import a JSON file exported earlier straight into another forest, with no logon
+    # there:
     .\Sync-ADCSTemplate.ps1 -Mode Import -Path .\KerberosAuth.json `
         -Server dc01.b.example -Credential (Get-Credential B\ent.admin)
 
 .EXAMPLE
-    # Prove both copy pipelines (file and direct/Sync) preserve every functional attribute
-    # (creates and removes one throwaway copy per pipeline):
+    # Prove that both copy pipelines (file and direct/Sync) preserve every functional attribute.
+    # This creates and removes one throwaway copy per pipeline:
     .\Sync-ADCSTemplate.ps1 -Mode Validate -TemplateName "KerberosAuthentication"
 
 .NOTES
-    - Requires the ActiveDirectory PowerShell module (RSAT) for all modes. certutil and the
-      AD CS role are no longer used or required, and no CA needs to be reachable.
-    - ALL directory access - including the ACL write - runs over ADWS (TCP 9389); no LDAP (389)
-      connectivity is needed. -Server (and -SourceServer) values are always used VERBATIM - the
-      script never substitutes an endpoint the operator did not type. Name ONE DC: a DOMAIN name
-      (DNS or NetBIOS) locates a different DC per connection, so the create, read-back and ACL
-      steps could hit different replicas - the script detects that case and warns loudly (and a
-      lagging read-back fails the run rather than leaving a template mis-secured).
-    - Parameters a mode does not consume are rejected up front (e.g. -StripOid with -Mode Import,
-      -OidRoot without -OidHandling GenerateFromRoot, -AclBase with -SkipAcl) rather than silently
-      ignored.
-    - PKI attributes the built-in type lists don't know (a genuine schema extension linked to the
-      pKICertificateTemplate class) are typed automatically from the TARGET forest's schema; an
-      attribute is dropped with a warning when the target schema cannot type it, does not permit it
-      on the template class, or types it single-valued while the source value is empty or
-      multi-valued (schema divergence between the forests). (Note: v3/v4 CNG algorithm settings are
-      NOT separate directory attributes - they travel packed inside msPKI-RA-Application-Policies,
-      which is copied as-is.)
-    - v3/v4 templates can embed a private-key SDDL (msPKI-Key-Security-Descriptor) packed inside
-      msPKI-RA-Application-Policies; it is copied verbatim and any domain SIDs in it are
-      SOURCE-forest SIDs - the script warns so the key ACL can be reviewed in the target forest.
-    - -Mode Validate exits non-zero when any attribute differs, so it can gate CI/automation.
-    - With -OidHandling Preserve (default) the target forest need not have (or ever have had) AD CS;
-      it only needs the Certificate Templates container. -OidHandling Generate needs the target
-      forest's PKI OID root (present after AD CS has been deployed there once).
-    - Run Export in the source forest and Import in the target forest (or point -Server, with
-      -Credential as needed, at a DC in the relevant forest). -Mode Sync does both sides in one
-      run and needs ADWS reachability to a DC in EACH forest from where it runs; it refuses to
-      proceed when source and target resolve to the same forest unless -Server was given
-      explicitly (guarding against a forgotten -Server silently targeting the source forest).
-    - Import/Sync do NOT publish the template to any CA; publish/issue it from the CA afterwards.
-    - The security descriptor is intentionally not carried across forests; Import/Sync reapply
-      standard permissions instead (unless -SkipAcl).
-    - Authentication Mechanism Assurance (AMA) links are NOT carried over: an msDS-OIDToGroupLink
-      on a source-forest issuance policy OID points at a group DN in THAT forest and cannot be
-      copied. If you use AMA, recreate the link in the target forest manually (policy OID object ->
-      a local universal group with no static members). The reverse case IS checked: when the
-      copy carries an issuance policy OID that the TARGET forest already links to a group, the
-      import is refused unless -AllowLinkedIssuancePolicy is given, because certificates from the
-      copy would grant that group's membership at logon.
-    - v1 templates copy too (the export warns): the object round-trips faithfully, but Windows
-      fixes v1 semantics in code - v1 consumers match by NAME, and the definition is not editable
-      and never autoenrolls. Import a v1 template under its ORIGINAL name (a renamed copy is
-      invisible to Windows v1 consumers); for non-Windows consumers such as EJBCA, which read the
-      object and its ACL directly, a v1 copy works like any other. To get editable/autoenroll
-      behavior, duplicate it as v2+ in the source forest first.
+    - The script requires the ActiveDirectory PowerShell module, from the Remote Server
+      Administration Tools (RSAT), for all modes. The script no longer uses or requires certutil or
+      the AD CS role. No CA needs to be reachable.
+    - ALL directory access, including the ACL write, runs over Active Directory Web Services
+      (ADWS, TCP 9389). No LDAP (389) connectivity is needed. The script always uses the -Server
+      and -SourceServer values VERBATIM; it never substitutes an endpoint the operator did not
+      type. Name ONE DC. A DOMAIN name (DNS or NetBIOS) locates a different DC per connection, so
+      the create, read-back, and ACL steps could reach different replicas. The script detects that
+      case and warns; a lagging read-back fails the run rather than leave the template mis-secured.
+    - The script rejects a parameter that the mode does not consume before it does anything else,
+      rather than ignore it without a message. Examples: -StripOid with -Mode Import, -OidRoot
+      without -OidHandling GenerateFromRoot, and -AclBase with -SkipAcl.
+    - The script types a PKI attribute that its built-in type lists do not know from the schema of
+      the TARGET forest automatically. Such an attribute is a genuine schema extension linked to
+      the pKICertificateTemplate class. The script drops the attribute with a warning when the
+      target schema cannot type it. It also drops the attribute when the target schema does not
+      permit it on the template class. It also drops the attribute when the target schema types it
+      single-valued while the source value is empty or multi-valued. Each of these cases is a
+      schema divergence between the forests.
+    - Note: v3 and v4 Cryptography Next Generation (CNG) algorithm settings are NOT separate
+      directory attributes. They are packed inside msPKI-RA-Application-Policies, which the script
+      copies as-is.
+    - A v3 or v4 template can embed a private-key Security Descriptor Definition Language (SDDL)
+      string (msPKI-Key-Security-Descriptor) packed inside msPKI-RA-Application-Policies. The
+      script copies it verbatim. Any domain SIDs in it are SOURCE-forest SIDs. The script warns, so
+      that you can review the key ACL in the target forest.
+    - -Mode Validate exits non-zero when any attribute differs, so continuous integration (CI) and
+      automation can use its exit code to decide.
+    - With the default -OidHandling Preserve, the target forest does not need AD CS now, and it
+      never needed AD CS. It needs only the Certificate Templates container. -OidHandling Generate
+      needs the PKI OID root of the target forest, which exists after AD CS has been deployed
+      there once.
+    - Run Export in the source forest and Import in the target forest. Or point -Server, with
+      -Credential as needed, at a DC in the relevant forest. -Mode Sync does both sides in one run.
+      It needs ADWS reachability to a DC in EACH forest from the machine where it runs. The script
+      refuses to proceed when the source and the target resolve to the same forest, unless you
+      gave -Server explicitly. This guards against a forgotten -Server that targets the source
+      forest without a message.
+    - Import and Sync do NOT publish the template to any CA. Publish and issue it from the CA
+      afterwards.
+    - The script intentionally does not copy the security descriptor across forests. Import and
+      Sync reapply standard permissions instead, unless you pass -SkipAcl.
+    - The script does NOT copy Authentication Mechanism Assurance (AMA) links. An
+      msDS-OIDToGroupLink on an issuance policy OID of the source forest points at a group DN in
+      THAT forest, and cannot be copied. If you use AMA, recreate the link in the target forest
+      manually: policy OID object -> a local universal group with no static members.
+    - The script DOES check the reverse case. When the copy has an issuance policy OID that the
+      TARGET forest already links to a group, the script refuses the import. Pass
+      -AllowLinkedIssuancePolicy to accept it. The reason for the refusal: certificates from the
+      copy would grant the membership of that group at logon.
+    - A v1 template copies too, and the export warns. The object round-trips faithfully, but
+      Windows fixes the v1 semantics in code. The v1 consumers match by NAME, the definition is not
+      editable, and it never autoenrolls. Import a v1 template under its ORIGINAL name, because a
+      renamed copy is invisible to Windows v1 consumers. For a non-Windows consumer such as EJBCA,
+      which reads the object and its ACL directly, a v1 copy works like any other template. To get
+      an editable template that autoenrolls, duplicate it as v2 or later in the source forest first.
 #>
 
 [CmdletBinding(SupportsShouldProcess)]

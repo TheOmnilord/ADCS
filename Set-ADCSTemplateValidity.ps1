@@ -1,11 +1,12 @@
 ﻿<#PSScriptInfo
-.VERSION 1.0.4
+.VERSION 1.0.5
 .GUID 48b937ae-18bd-4710-9de9-5ae76f7c9a72
 .AUTHOR Sveinung Svea
 .PROJECTURI https://github.com/TheOmnilord/ADCS
 .LICENSEURI https://github.com/TheOmnilord/ADCS/blob/main/LICENSE
 .TAGS ADCS PKI CertificateServices
 .RELEASENOTES
+1.0.5 - Help text only: the comment-based help is rewritten to the repository writing style (STYLE.md, derived from ASD-STE100 Simplified Technical English) - short sentences, active voice, no figurative language, acronyms defined; every fact, condition and default is kept; no code change
 1.0.4 - The script is now a flat body instead of begin/process/end: under Windows PowerShell 5.1, `powershell.exe -File` with a non-console stdin (a scheduler, CI, WinRM/psexec, or the `< NUL` idiom) never ran the process{} block, so the run searched nothing, changed nothing, printed nothing and exited 0. A confirmation failure (non-interactive host, ConfirmImpact High, no -Confirm:$false) is now caught, counted and emitted as an Error row instead of escaping the loop uncounted. The run-level failure is raised with a non-terminating error plus `exit 1` rather than `throw`, so the structured report is preserved for a caller that captures or pipes it while automation still sees a non-zero exit code
 1.0.3 - Help text only: -OverlapPeriod documents the retained-overlap refusal; no code change
 1.0.2 - When the overlap is not being set, a template whose EXISTING renewal overlap is not shorter than the new validity is reported as an error and left unchanged (previously the validity was shortened beneath the retained overlap, an invalid pair; the begin-block check only covered an explicitly supplied overlap)
@@ -15,53 +16,74 @@
 
 <#
 .SYNOPSIS
-    Sets the validity period (and optionally the renewal overlap period) on one or more ADCS certificate templates.
+    Sets the validity period, and optionally the renewal overlap period, on one or more Active Directory Certificate Services (AD CS) certificate templates.
 
 .DESCRIPTION
-    Queries Active Directory for certificate templates matching the specified name pattern(s) (wildcards supported)
-    and updates their pKIExpirationPeriod attribute. Optionally updates pKIOverlapPeriod as well.
+    The script searches Active Directory (AD) for the certificate templates whose name matches
+    a pattern in -TemplateName. A pattern can contain the wildcard *. The script writes the new
+    validity period to the pKIExpirationPeriod attribute of each matched certificate template.
+    When you pass -OverlapPeriod, the script also writes the new renewal overlap period to the
+    pKIOverlapPeriod attribute.
 
-    Uses System.DirectoryServices directly - no ActiveDirectory PowerShell module required.
+    The script uses System.DirectoryServices directly. It does not require the ActiveDirectory
+    PowerShell module.
 
-    After modifying templates, you may need to run 'certutil -pulse' on the CA server(s) to pick up changes.
+    After the script changes certificate templates, a certification authority (CA) server does
+    not always load the changes at once. To make a CA server load the changes, run
+    'certutil -pulse' on that CA server. The script prints this reminder in its summary when it
+    modified at least one certificate template.
 
 .PARAMETER TemplateName
-    One or more template CN names to match. Supports the LDAP wildcard * (any run of characters,
-    including none). There is no single-character wildcard in LDAP filters: a ? matches a literal
-    question mark. Examples: "WebServer", "User*", "*VPN*"
+    One or more certificate template names to match. The name is the common name (CN) of the
+    certificate template object in Active Directory. A name can contain the Lightweight
+    Directory Access Protocol (LDAP) wildcard *. The wildcard * matches any run of characters,
+    including no characters. LDAP filters have no single-character wildcard: a ? matches a
+    literal question mark. Examples: "WebServer", "User*", "*VPN*".
 
 .PARAMETER ValidityPeriod
-    The numeric value for the new validity period (1–9999).
+    The number of units in the new validity period. The value must be between 1 and 9999.
 
 .PARAMETER ValidityPeriodUnit
-    The unit for ValidityPeriod: Years, Months, Weeks, Days, or Hours.
-    AD uses 365 days/year and 30 days/month.
+    The unit of -ValidityPeriod: Years, Months, Weeks, Days, or Hours. Active Directory (AD)
+    counts 365 days in a year and 30 days in a month.
 
 .PARAMETER OverlapPeriod
-    Optional. The numeric value for the renewal overlap period (1–9999).
-    Must be specified together with OverlapPeriodUnit, and must be shorter than the validity period.
-    When omitted, each template keeps its existing overlap - and a template whose existing overlap
-    is not shorter than the new validity (a 30-day validity over a stock 6-week overlap) is reported
-    as an error and left unchanged; pass a shorter overlap to change both together.
+    Optional. The number of units in the new renewal overlap period. The value must be between
+    1 and 9999. You must pass -OverlapPeriodUnit together with -OverlapPeriod. The overlap
+    period must be shorter than the validity period.
+
+    When you omit -OverlapPeriod, each certificate template keeps its existing overlap period.
+    The script then compares that existing overlap period with the new validity period. When
+    the existing overlap period is not shorter than the new validity period, the script reports
+    an error. It changes nothing on that certificate template. For example, a new validity
+    period of 30 days is shorter than the 6-week overlap period of a standard certificate
+    template. To change both periods together, pass an -OverlapPeriod that is shorter than the
+    new validity period.
 
 .PARAMETER OverlapPeriodUnit
-    Optional. The unit for OverlapPeriod: Years, Months, Weeks, Days, or Hours.
+    Optional. The unit of -OverlapPeriod: Years, Months, Weeks, Days, or Hours. You must
+    pass -OverlapPeriod together with -OverlapPeriodUnit.
 
 .PARAMETER Server
-    Optional. Target a specific domain controller (not CA server) for the LDAP connection.
-    Example: dc01.domain.com. This is the DC to query/write AD objects, not the Certificate Authority.
+    Optional. The domain controller (DC) for the Lightweight Directory Access Protocol (LDAP)
+    connection, for example dc01.domain.com. The script reads and writes the certificate
+    template objects in Active Directory (AD) through this DC. Pass a DC, not a certification
+    authority (CA) server. When you omit -Server, the script uses the DC that Windows selects.
 
 .EXAMPLE
     .\Set-ADCSTemplateValidity.ps1 -TemplateName "Web*" -ValidityPeriod 2 -ValidityPeriodUnit Years -WhatIf
-    Preview which templates would be changed.
+    Shows which certificate templates the script would change. With -WhatIf, the script changes
+    nothing.
 
 .EXAMPLE
     .\Set-ADCSTemplateValidity.ps1 -TemplateName "User*","Computer*" -ValidityPeriod 1 -ValidityPeriodUnit Years -OverlapPeriod 6 -OverlapPeriodUnit Weeks
-    Set validity to 1 year and overlap to 6 weeks on all User* and Computer* templates.
+    Sets the validity period to 1 year and the renewal overlap period to 6 weeks. The script
+    applies this to every certificate template whose name matches User* or Computer*.
 
 .EXAMPLE
     .\Set-ADCSTemplateValidity.ps1 -TemplateName "ExactTemplate" -ValidityPeriod 365 -ValidityPeriodUnit Days -Server dc01.domain.com -Confirm:$false
-    Set validity on a specific DC without confirmation prompt.
+    Sets the validity period through the domain controller dc01.domain.com. With -Confirm:$false,
+    the script does not ask for confirmation before it changes each certificate template.
 #>
 
 # NOTE: '#Requires' deliberately sits AFTER the help comment - placed before it, Get-Help

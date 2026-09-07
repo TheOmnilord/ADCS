@@ -1,11 +1,12 @@
 <#PSScriptInfo
-.VERSION 1.0.9
+.VERSION 1.0.10
 .GUID 6f98f16e-0c56-4a72-ba31-443938175c06
 .AUTHOR Sveinung Svea
 .PROJECTURI https://github.com/TheOmnilord/ADCS
 .LICENSEURI https://github.com/TheOmnilord/ADCS/blob/main/LICENSE
 .TAGS ADCS PKI CertificateServices
 .RELEASENOTES
+1.0.10 - Help text only: the comment-based help is rewritten to the repository writing style (STYLE.md, derived from ASD-STE100 Simplified Technical English) - short sentences, active voice, no figurative language, acronyms defined, a CAUTION line on -Force and -AllowUnprotectedOutputFolder; every fact, condition and default is kept; no code change
 1.0.9 - The run lock and the per-run log are created only AFTER the tracking folder has passed the same chain check every delivery gets, the exact lock and log names are refused if a reparse point (even a dangling link, seen via File.GetAttributes which does not follow links) already occupies them, and both are opened with CreateNew: previously the lock was opened FIRST with OpenOrCreate + DeleteOnClose, so a link planted at <TrackingFile>.lock by a user who could write to the tracking folder was opened through and its TARGET deleted when the folder check then refused the folder and the finally disposed the handle (arbitrary file delete as the elevated account); the log moves from the unvalidated working directory to beside the tracking file (name made unique per run with a random suffix, so runs sharing a folder cannot collide on CreateNew) and is written with -LiteralPath; -OutputFolder's deepest existing ancestor - and every component created beneath it - is judged as the PARENT of a folder about to be created (reparse point, owner, swap rights, and what a folder created inside would INHERIT: an inheritable delete/write/re-permission grant, inherit-only or not, would make the new folder its holder's to swap for a junction or to keep a handle to across any later ACL check, so it is refused BEFORE creation; what files would inherit is not judged there, since none are written there and the final folder is judged in full once it exists) and the missing components are then created one at a time with the native CreateDirectoryW, which fails on any existing name - a junction planted after the check via a tolerated create-subfolder right is refused instead of being created through (New-Item -Force and Directory.CreateDirectory create through an existing name); each created component is judged structurally before anything is created beneath it (an inherit-only grant that confers nothing on the anchor is fully effective on a folder created in it, and would let its holder swap that folder for a junction); -OutputFolder components ending in a space or a period are refused (Win32 trims them from a leaf but keeps them in a parent, so one name would denote two directories); the native create uses the extended \\?\ form (no MAX_PATH limit, no normalization); the ambiguous-component guard runs inside the chain check itself, so the tracking folder (parent of the lock and the log) and every per-row destination are covered as well as -OutputFolder; every path is first reduced to one canonical DOS form (\\?\ and \\.\ prefixes stripped, / normalized) so an extended path cannot carry / or .. past the checks into the literal native create, and \\.\C:\ is no longer mistaken for a UNC server named "."; certreq's stdout/stderr capture files are created beside the log in the validated tracking folder (reparse point at the name refused, CreateNew, unique per call) instead of via Path.GetTempFileName() under %TEMP% - which for a SYSTEM or service run is C:\Windows\Temp, where any local user can create files and a dangling symbolic link at the next tmpXXXX.tmp name would have had certreq's output written through it, as the elevated account, into a file of the planter's choosing (pre-existing since 1.0.0)
 1.0.8 - Get-DestinationOwnerConflict skips only the SAME row by reference identity, not every row sharing the RequestID number (RequestIDs are per CA, so a different CA's request with the same number is a different request that can share the destination and must still be considered); SubmitTime is parsed and compared as DateTimeOffset (instants) instead of local DateTime, which reversed ordering across the DST fall-back hour
 1.0.7 - Get-RequestFiles reads the drop folder with -LiteralPath and an EXACT-extension filter (a folder named e.g. CSR[prod] was globbed as a character class and matched nothing, exiting 0 with work undone; -Filter '*.req' also matched longer extensions like .reqbak/.request, submitting stray backups); Export-TrackingData writes the checkpoint and Remove-RspFile removes the .rsp with -LiteralPath (a tracking path or request name with [ ] lost the RequestID or left the .rsp behind); certreq stdout/stderr are read with -Encoding Oem (default was ANSI on 5.1 but UTF-8 on 7, so the persisted ErrorMessage differed and was lossy on 7); Get-DestinationOwnerConflict is directional on SubmitTime (a -Force renewal that goes Pending can be retrieved) and guards its System.IO.Path calls (an invalid path char threw on 5.1 and aborted the batch); -Mode Retrieve computes the redirected destination and stamps a legacy row's CAConfig only inside the approved ShouldProcess branch, so a declined row stays byte-identical
@@ -20,155 +21,235 @@
 
 <#
 .SYNOPSIS
-    Batch submission and retrieval of certificates via ADCS (certreq.exe).
+    Submits certificate requests in a batch to an Active Directory Certificate Services (AD CS) CA
+    with certreq.exe, and retrieves the issued certificates.
 
 .DESCRIPTION
-    Submits all .req/.csr/.txt files from a folder to an ADCS CA,
-    tracks request IDs in a CSV file, and can retrieve issued certificates
-    later based on stored request IDs.
+    The script submits certificate requests to an Active Directory Certificate Services (AD CS)
+    certification authority (CA). It takes every .req, .csr and .txt file in one folder and
+    submits each file with certreq.exe. The script records the RequestID of each request in a
+    comma-separated values (CSV) tracking file. On a later run the script can retrieve the issued
+    certificates with the recorded RequestIDs.
 
 .PARAMETER InputPath
-    Folder containing .req/.csr/.txt request files for submission.
-    Required when -Mode is Submit or Both. Not used, and not required, for -Mode Retrieve.
+    The folder that holds the .req, .csr and .txt request files to submit.
+    The parameter is required when -Mode is Submit or Both.
+    The script does not use it, and does not require it, when -Mode is Retrieve.
 
 .PARAMETER CAConfig
-    CA configuration string for certreq, e.g. "CA01.domain.com\Contoso Issuing CA 1".
-    Always required.
+    The CA configuration string that the script passes to certreq, for example
+    "CA01.domain.com\Contoso Issuing CA 1". The parameter is always required.
 
 .PARAMETER CertificateTemplate
-    Certificate template name used for submission.
-    Required when -Mode is Submit or Both. Not used, and not required, for -Mode Retrieve.
+    The name of the certificate template that the script uses for the submission.
+    The parameter is required when -Mode is Submit or Both.
+    The script does not use it, and does not require it, when -Mode is Retrieve.
 
 .PARAMETER TrackingFile
-    Path to the CSV file that tracks request IDs and statuses.
-    Relative paths are resolved against the current directory and stored as absolute paths.
+    The path of the comma-separated values (CSV) tracking file that records the RequestID and the
+    status of each request. The script resolves a relative path against the current working
+    directory and stores it as an absolute path. The default is .\CertTracking.csv.
 
 .PARAMETER OutputFolder
-    Folder where issued certificates (.cer) are saved.
-    Relative paths are resolved against the current directory and stored as absolute paths.
-    In Retrieve mode each row is written to the path recorded at submit time; pass -OutputFolder
-    explicitly to redirect retrieved .cer files there instead (the tracking row is updated).
+    The folder where the script saves the issued certificates as .cer files. The script resolves
+    a relative path against the current working directory and stores it as an absolute path. The
+    default is .\Certificates.
+    In Retrieve mode the script writes each certificate to the path that its tracking row recorded
+    at submit time. Pass -OutputFolder explicitly to redirect the retrieved .cer files to that
+    folder instead. The script then updates the tracking row.
 
 .PARAMETER Mode
-    Submit   = Submit new certificate requests.
-    Retrieve = Retrieve issued certificates for unresolved requests.
-    Both     = Run Submit, then Retrieve.
+    The mode of the run. The default is Submit.
+    - Submit: the script submits the new certificate requests.
+    - Retrieve: the script retrieves the issued certificates for the unresolved requests.
+    - Both: the script runs Submit, then Retrieve.
 
 .PARAMETER KeepRspFile
-    By default, the .rsp file created next to each .cer (at both submit and retrieve) is deleted.
-    Specify -KeepRspFile to leave it in place.
+    By default the script deletes the .rsp file that certreq creates next to each .cer file. This
+    applies at submit and at retrieve. Pass -KeepRspFile to keep the .rsp file in place.
 
 .PARAMETER Force
-    Resubmit request files that already have a tracked RequestID without prompting.
-    Without -Force, the script asks y/n for each already-submitted file (default = No / skip).
+    With -Force the script resubmits a request file that already has a tracked RequestID, and it
+    does not prompt. Without -Force the script asks Yes or No for each file that it has already
+    submitted. The default answer is No, and the script then skips the file.
+
+    CAUTION: The script resubmits without a prompt, so the CA can issue a second certificate for a request it already holds.
+    On delivery the script moves the previous certificate aside as <name>.superseded-<UTC stamp>.cer
+    and never deletes it. If the CA later issues the earlier request, -Mode Retrieve refuses to
+    deliver it over the newer certificate and reports the row for reconciliation.
 
 .PARAMETER AllowUnprotectedOutputFolder
-    By default the script refuses to deliver certificates into (or through) a folder that an
-    untrusted principal owns, or can delete, rename or write to - trusted being SYSTEM,
-    Administrators, TrustedInstaller, the running account, its Domain/Enterprise Admins and
-    -TrustedOutputPrincipal - because such a user could swap the folder for a junction (or, with
-    mere write-data / write-attributes rights, turn an empty folder into one in place) while a
-    certificate is being delivered and redirect the privileged write. The delivery folder is also
-    refused when its ACL would hand an untrusted principal write, append, delete, write-attributes
-    or re-permission rights on the FILES created inside it (an inheritable "files" entry,
-    inherit-only or not): the staging file certreq writes and the delivered certificate inherit
-    such a grant. CREATOR OWNER entries resolve to the running account and are trusted; a CREATOR
-    GROUP entry resolves to its primary group and is not (name S-1-3-1 in -TrustedOutputPrincipal
-    to accept it). Pass this
-    switch to accept those risks (e.g. a shared drop folder whose ACL cannot be tightened); the
-    conditions are then only warned about.
+    By default the script refuses to deliver a certificate into, or through, a folder that an
+    untrusted principal owns. It also refuses a folder that an untrusted principal can delete,
+    rename or write to. The trusted principals are:
+    - SYSTEM.
+    - BUILTIN\Administrators.
+    - TrustedInstaller.
+    - The running account, and its Domain Admins and Enterprise Admins groups.
+    - The principals named in -TrustedOutputPrincipal.
+
+    Every other principal is untrusted. An untrusted user with delete or rename rights can replace
+    the folder with a junction while the script delivers a certificate. With only write-data or
+    write-attributes rights, the user can turn an empty folder into a junction in place. Either
+    change redirects the privileged write.
+
+    The script also checks what the access control list (ACL) of the delivery folder gives to the
+    files created inside it. It refuses the folder when an inheritable "files" entry, inherit-only
+    or not, gives an untrusted principal write, append, delete, write-attributes or re-permission
+    rights. The staging file that certreq writes and the delivered certificate inherit such an
+    entry.
+
+    A CREATOR OWNER entry resolves to the running account, and the script trusts it. A CREATOR
+    GROUP entry resolves to the primary group of the running account, and the script does not
+    trust it. To accept a CREATOR GROUP entry, name S-1-3-1 in -TrustedOutputPrincipal.
+
+    Pass this switch to accept those risks, for example for a shared drop folder whose ACL cannot
+    be tightened. The script then only writes a warning for each condition.
+    CAUTION: With this switch an untrusted user can redirect the privileged write, or alter the certificate before or after delivery.
 
 .PARAMETER TrustedOutputPrincipal
-    Additional principals (SIDs or account names, e.g. 'CONTOSO\PKI-Operators') that may own, or
-    hold delete/rename/write rights on, the folders certificates are delivered through (including
-    file-inheritable write rights in the delivery folder itself), on top of
-    the built-in trusted set (see -AllowUnprotectedOutputFolder). Use it when the output folders
-    are managed by a dedicated operator group rather than by Administrators.
+    Additional trusted principals, as security identifiers (SIDs) or account names, for example
+    'CONTOSO\PKI-Operators'. The script adds them to the built-in trusted set that the help of
+    -AllowUnprotectedOutputFolder describes. A principal in this set may own the folders that the
+    script delivers certificates through. It may also hold delete, rename or write rights on those
+    folders, including file-inheritable write rights in the delivery folder itself. Use this
+    parameter when a dedicated operator group, and not Administrators, manages the output folders.
 
 .EXAMPLE
     .\Submit-CertificateRequests.ps1 -InputPath "C:\CSRs" `
         -CAConfig "CA01.domain.com\Contoso Issuing CA 1" `
         -CertificateTemplate "WebServer" -Mode Submit
 
+    Submits every request file in C:\CSRs to the CA with the WebServer certificate template. The
+    script records each RequestID in the default tracking file .\CertTracking.csv and delivers the
+    issued certificates to the default output folder .\Certificates.
+
 .EXAMPLE
     .\Submit-CertificateRequests.ps1 -CAConfig "CA01.domain.com\Contoso Issuing CA 1" -Mode Retrieve
+
+    Retrieves the issued certificates for every unresolved request in the tracking file. The
+    script writes each certificate to the path that its tracking row recorded at submit time.
 
 .EXAMPLE
     .\Submit-CertificateRequests.ps1 -InputPath "C:\CSRs" `
         -CAConfig "CA01.domain.com\Contoso Issuing CA 1" `
         -CertificateTemplate "WebServer" -Mode Submit -WhatIf
 
+    Shows which request files the script would submit, and submits nothing. A -WhatIf run takes
+    no run lock, writes no per-run log and does not change the tracking file.
+
 .NOTES
-    - Status detection: whether a request was issued is decided by certreq's exit code plus the
-      presence of the certificate it wrote (into a fresh temp file, so the file is unambiguously
-      this run's output), which is language-independent. On success the certificate is delivered
-      to the destination; a file already there (a -Force resubmit; a retry of an unresolved row)
-      is moved aside as <name>.superseded-<UTC stamp>.cer - never deleted - and that copy is
-      removed again only when the fresh certificate is byte-identical. The RequestID and the finer
-      Pending/Denied dispositions are parsed from certreq's console text, which Windows localizes;
-      on a non-English CA/client those may parse as Unknown (a retrieval is then retried on the
-      next -Mode Retrieve, never silently finalized) and a missing RequestID is reported so the
-      row can be completed by hand from the CA database.
-    - One run per tracking file: the script holds an exclusive lock file (<TrackingFile>.lock,
-      removed when the run ends) for its whole run and refuses to start while another run - on
-      this or any other machine, via any alias of the path - holds it. The tracking file's name is
-      canonicalized first (an 8.3 short name resolves to the long name, so both spellings share
-      one lock) and a hard-linked or symlinked tracking file is refused (a second name elsewhere
-      could not share the lock). The lock, and the per-run log (CertBatch_<stamp>_<id>.log, unique
-      per run, written BESIDE the tracking file rather than in the working directory), are created only after the
-      tracking folder has passed the same chain check every delivery gets; a reparse point already
-      sitting at either name - even a dangling link - is refused, and both are opened with
-      CreateNew, so an existing occupant fails instead of being written (or deleted) through.
-      certreq's console output is captured in files created the same way beside the log - never
-      under %TEMP%, which a SYSTEM or service run shares with every local user. A -WhatIf run
-      takes no lock and writes no log (it never writes the CSV).
-    - certreq always writes into a private temp file; the destination is touched only after a
-      successful write (a pending, denied or failed request never disturbs it). A row's
-      OutputCertFile is an identifier inside an operator-chosen boundary, not an authority: it
-      must be a rooted .cer path in an existing folder beneath the tracking file's folder or the
-      run's -OutputFolder (canonically, with no junction/symlink in between, re-checked right
-      before delivery; the destination itself must not be a folder or a link), and RequestID must
-      be numeric; rows failing this are skipped with an error. If an issued certificate cannot be
-      delivered (locked destination, denied rename), the row is recorded as Status 'Undelivered'
-      with its RequestID kept and the certificate left in its staging file beside the destination (path in ErrorMessage): it counts
-      as submitted on later runs (never resubmitted automatically) and -Mode Retrieve re-fetches
-      it; an Undelivered row with no RequestID is reported for manual reconciliation. A submission
-      certreq reports as SUCCESSFUL but whose reply yields neither a RequestID nor a certificate
-      (localized output) is recorded as 'Unknown' and counts as submitted the same way: never
-      resubmitted automatically (a later Submit asks, or needs -Force) and listed by Retrieve for
-      reconciliation. Values that reach the certreq command line (-CAConfig, -CertificateTemplate,
-      RequestID, paths) must not contain double quotes or control characters.
-    - Every row records the CA it was submitted to (CAConfig column). -Mode Retrieve refuses rows
-      submitted to a different CA - RequestIDs are per CA, so another CA's request with the same
-      number is an unrelated certificate - and stamps rows from older tracking files (no CAConfig)
-      with the run's -CAConfig. Certificate file names are allocated before anything is submitted
-      and must be unique within the batch and against the destinations already recorded for other
-      request files (prod.req, prod.csr and prod.req.txt never share a .cer); an unresolvable
-      clash aborts the run before any submission.
-    - A run in which any request failed or needs attention (Error, Denied, Undelivered, Unknown,
-      or a Retrieve row skipped as invalid) ends with a terminating error after the summary and
-      the final checkpoint, so automation gating on the exit code does not treat a partial batch
-      as success; Pending is not a failure. A nonexistent or non-folder -InputPath is an error
-      too (an existing empty folder is an empty batch).
-    - Output folders must not be swappable by untrusted users: every folder from the destination up
-      to the volume/share root is checked, and the script REFUSES to deliver when any of them is a
-      reparse point (junction/symlink/mount point), is owned by an untrusted principal, can be
-      deleted, renamed or written to by one (delete/rename lets such a user replace it with a
-      junction between the path check and the privileged delivery; write-data or write-attributes
-      access on a directory handle is all FSCTL_SET_REPARSE_POINT needs, so "create files" rights
-      let them turn an EMPTY folder - e.g. a freshly created output folder - into a junction in
-      place), or has a security descriptor that cannot be read. Trusted principals are SYSTEM,
-      BUILTIN\Administrators, TrustedInstaller, the running account, its Domain Admins /
-      Enterprise Admins, and anything named in -TrustedOutputPrincipal;
-      -AllowUnprotectedOutputFolder downgrades the refusals to warnings. Only the create-SUBFOLDER
-      right by itself (what the C:\ root grants Users on itself) and inherit-only ACEs are
-      tolerated: neither can set a reparse point on the folder, a pre-planted junction is refused by
-      the reparse-point checks, an attacker-created subfolder is refused by the owner check, and a
-      folder or junction planted under the exact destination name in the moment between check and
-      delivery receives no file, because every
-      delivery is a no-overwrite rename (File.Move) that fails when anything occupies the name
-      instead of moving the file into it. The .rsp companion written with -KeepRspFile and the
-      tracking-file replacement follow the same rule.
+    - Status detection. The script uses two signals to decide that the CA issued a request. These
+      are the exit code of certreq, and the presence of the certificate file that certreq wrote.
+      Because certreq writes into a new staging file, that file is without doubt the output of
+      this run. The decision does not depend on the language of Windows. On success the script
+      delivers the certificate to the destination.
+    - A file can already exist at the destination, after a -Force resubmit or a retry of an
+      unresolved row. The script moves that file aside as <name>.superseded-<UTC stamp>.cer and
+      never deletes it. The script removes that copy again only when the new certificate is
+      byte-identical to it.
+    - The script parses the RequestID and the finer Pending and Denied dispositions from the
+      console text of certreq. Windows localizes that text. On a CA or a client that is not
+      English, the script can parse those as Unknown. The script then retries the retrieval on the
+      next -Mode Retrieve, and it does not record the row as final. The script reports a missing
+      RequestID, so that you can complete the row by hand from the CA database.
+    - One run per tracking file. The script holds an exclusive run lock, the file
+      <TrackingFile>.lock, for its whole run and removes it when the run ends. The script refuses
+      to start while another run holds that lock. This applies to a run on this machine or on any
+      other machine, and through any alias of the path.
+    - The script canonicalizes the name of the tracking file first. An 8.3 short name resolves to
+      the long name, so both spellings share one lock. The script refuses a tracking file that is
+      a hard link or a symbolic link, because a second name elsewhere could not share the lock.
+    - The script creates the run lock and the per-run log only after the tracking folder has
+      passed the chain check. That is the same chain check that every delivery gets. The per-run
+      log is CertBatch_<stamp>_<id>.log, unique per run, and the script writes it beside the
+      tracking file, not in the working directory. The script refuses a reparse point that already
+      sits at either name, even a dangling link. The script opens both files with CreateNew, so an
+      existing occupant makes the open fail. The script never writes through, or deletes through,
+      an existing occupant.
+    - The script captures the console output of certreq in capture files that it creates the same
+      way, beside the per-run log. It never creates them under %TEMP%, because a SYSTEM or service
+      run shares %TEMP% with every local user. A -WhatIf run takes no run lock and writes no
+      per-run log, because it never writes the tracking file.
+    - Staging and delivery. The script always directs certreq to write into a private staging
+      file. The script touches the destination only after a successful write. A pending, denied or
+      failed request never disturbs the destination.
+    - The OutputCertFile of a tracking row is an identifier inside a boundary that the operator
+      chooses. It is not an authority. The value must be a rooted .cer path in an existing folder.
+      That folder must lie beneath the folder of the tracking file or beneath the -OutputFolder of
+      the run. The script compares canonical paths. The path must not contain a junction or a
+      symbolic link between that root and the file.
+    - The script checks the OutputCertFile again immediately before delivery. The destination
+      itself must not be a folder or a link. The RequestID of the row must be numeric. The script
+      skips a row that fails these checks and writes an error.
+    - The script can fail to deliver an issued certificate, for example when the destination is
+      locked or the rename is denied. The script then records the row with Status 'Undelivered'
+      and keeps its RequestID. The certificate stays in its staging file beside the destination,
+      and the ErrorMessage column holds its path. On later runs the row counts as submitted, and
+      the script never resubmits it automatically. -Mode Retrieve retrieves the certificate again.
+      The script reports an Undelivered row that has no RequestID for manual reconciliation.
+    - Sometimes certreq reports a submission as successful, but its reply yields neither a
+      RequestID nor a certificate, for example because the output is localized. The script records
+      that row as 'Unknown', and the row counts as submitted in the same way. The script never
+      resubmits it automatically: a later Submit asks, or needs -Force. -Mode Retrieve lists the
+      row for reconciliation.
+    - Values that reach the certreq command line must not contain double quotes or control
+      characters. These values are -CAConfig, -CertificateTemplate, the RequestID and the paths.
+    - Every row records the CA that the script submitted it to, in the CAConfig column. In -Mode
+      Retrieve the script refuses a row that it submitted to a different CA. RequestIDs are per
+      CA, so the request with the same number at another CA is an unrelated certificate. A row
+      from an older tracking file has no CAConfig. In -Mode Retrieve the script stamps such a row
+      with the -CAConfig of the run when it retrieves the row.
+    - The script allocates the certificate file names before it submits anything. Each name must
+      be unique within the batch and against the destinations already recorded for other request
+      files. For example, prod.req, prod.csr and prod.req.txt never share a .cer file. An
+      unresolvable clash stops the run before any submission.
+    - Exit code. A run ends with a terminating error when any request failed or needs attention.
+      That means a row with Status Error, Denied, Undelivered or Unknown, or a Retrieve row that
+      the script skipped as invalid. The error comes after the summary and the final checkpoint.
+      Automation that uses the exit code to decide then does not treat a partial batch as a
+      success. Pending is not a failure.
+    - An -InputPath that does not exist, or that is not a folder, is also an error. An existing
+      empty folder is an empty batch.
+    - Output folders. An untrusted user must not be able to replace an output folder. The script
+      runs a chain check: it checks every folder from the destination up to the root of the volume
+      or share. The script refuses to deliver when any folder in that chain meets one of these
+      conditions:
+      - The folder is a reparse point, that is a junction, a symbolic link or a mount point.
+      - An untrusted principal owns the folder.
+      - An untrusted principal can delete, rename or write to the folder.
+      - The script cannot read the security descriptor of the folder.
+    - Delete or rename rights let an untrusted user replace a folder with a junction between the
+      path check and the privileged delivery. FSCTL_SET_REPARSE_POINT needs only write-data or
+      write-attributes access on a handle to the folder. So "create files" rights let such a user
+      turn an empty folder into a junction in place, for example a newly created output folder.
+    - The trusted principals are SYSTEM, BUILTIN\Administrators, TrustedInstaller, the running
+      account, its Domain Admins and Enterprise Admins groups, and every principal named in
+      -TrustedOutputPrincipal. The switch -AllowUnprotectedOutputFolder downgrades these refusals
+      to warnings.
+    - The script allows only two grants to an untrusted principal on a folder in the chain. The
+      first is the create-subfolder right by itself, which the C:\ root grants the Users group on
+      itself. The second is an inherit-only access control entry (ACE). The file-inheritable
+      entries of the delivery folder itself are the exception; see -AllowUnprotectedOutputFolder.
+      Neither grant can set a reparse point on the folder. The reparse-point checks refuse a
+      junction that existed before the check, and the owner check refuses a subfolder that an
+      attacker created.
+    - A folder or a junction created under the exact destination name between the check and the
+      delivery receives no file. Every delivery is a no-overwrite rename with File.Move. That
+      rename fails when anything occupies the name, instead of moving the file into it. The .rsp
+      companion file that the script writes with -KeepRspFile follows the same rule. The
+      replacement of the tracking file follows the same rule.
+    - When -OutputFolder does not exist, the script first checks its anchor. The anchor is the
+      deepest existing folder above -OutputFolder, and the script checks it as the parent of a
+      folder it will create. That check also refuses an inheritable entry that gives an untrusted
+      principal delete, write or re-permission rights on subfolders. The script then creates each
+      missing component, one at a time, with a create that fails when the name is in use. If
+      something occupies a missing component after that check, for example a junction, the create
+      fails and the script does not create through it.
+    - The script refuses an -OutputFolder path component that ends in a space or a period.
+      Windows resolves such a name differently as a leaf and as a parent, so one name would denote
+      two folders. The chain check applies the same rule to the tracking folder and to every
+      destination.
 #>
 
 # NOTE: '#Requires' deliberately sits AFTER the help comment - placed before it, Get-Help
