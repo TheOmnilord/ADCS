@@ -8,6 +8,22 @@ Each script also carries its own version in the `PSScriptInfo` header at the top
 Test-ScriptFileInfo .\Submit-CertificateRequests.ps1 | Select-Object Name, Version
 ```
 
+## [1.0.11] — 2026-09-07
+
+### Changed - help text
+
+- **Submit-CertificateRequests.ps1 → 1.0.12.** Help text only; no code changed. The `.NOTES` now document the per-request checkpoint that v1.0.11 restored.
+  - The script writes the tracking file after every request, not only at the end of the run. A crash in the middle of a batch therefore keeps the RequestID of every request the CA has already accepted.
+  - A later run reads that file and resumes, and it does not resubmit a request that already has a RequestID. Each write replaces the file in one step, so an interrupted write cannot leave it corrupt.
+
+| Script | Version |
+|---|---|
+| Set-ADCSTemplateValidity.ps1 | 1.0.5 |
+| Submit-CertificateRequests.ps1 | **1.0.12** |
+| Sync-ADCSTemplate.ps1 | 1.0.7 |
+| Add-CertificateEnrollmentPolicyServerOffline.ps1 | 1.0.7 |
+| Add-CertificateEnrollmentPolicyServerToGpo.ps1 | 1.0.7 |
+
 ## [1.0.10] — 2026-09-07
 
 A live Lab-tier run of every script on an Enterprise Certificate Authority found and fixed a tracking-file checkpoint bug in Submit-CertificateRequests.ps1.
@@ -295,6 +311,7 @@ Initial release.
 | Add-CertificateEnrollmentPolicyServerOffline.ps1 | 1.0.0 |
 | Add-CertificateEnrollmentPolicyServerToGpo.ps1 | 1.0.0 |
 
+[1.0.11]: https://github.com/TheOmnilord/ADCS/compare/v1.0.10...v1.0.11
 [1.0.10]: https://github.com/TheOmnilord/ADCS/compare/v1.0.9...v1.0.10
 [1.0.9]: https://github.com/TheOmnilord/ADCS/compare/v1.0.8...v1.0.9
 [1.0.8]: https://github.com/TheOmnilord/ADCS/compare/v1.0.7...v1.0.8
