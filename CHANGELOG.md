@@ -8,6 +8,12 @@ Each script also carries its own version in the `PSScriptInfo` header at the top
 Test-ScriptFileInfo .\Submit-CertificateRequests.ps1 | Select-Object Name, Version
 ```
 
+## [Unreleased]
+
+### Fixed - tests
+
+- The PowerShell-7-only long-path test in `Tests\Submit-CertificateRequests.Tests.ps1` is now discovered only on PowerShell 7 instead of skipped on Windows PowerShell 5.1. The CI gate rejects a skipped test, because a skip hides missing coverage. The v1.0.8 and v1.0.9 runs therefore failed on that leg, although every test passed.
+
 ## [1.0.9] — 2026-09-07
 
 Help text and documentation only; no code changed. The operator-facing text of this repository now follows a writing style derived from ASD-STE100 Simplified Technical English.
@@ -269,6 +275,7 @@ Initial release.
 | Add-CertificateEnrollmentPolicyServerOffline.ps1 | 1.0.0 |
 | Add-CertificateEnrollmentPolicyServerToGpo.ps1 | 1.0.0 |
 
+[Unreleased]: https://github.com/TheOmnilord/ADCS/compare/v1.0.9...HEAD
 [1.0.9]: https://github.com/TheOmnilord/ADCS/compare/v1.0.8...v1.0.9
 [1.0.8]: https://github.com/TheOmnilord/ADCS/compare/v1.0.7...v1.0.8
 [1.0.7]: https://github.com/TheOmnilord/ADCS/compare/v1.0.6...v1.0.7
