@@ -415,6 +415,29 @@ Describe 'Submit-CertificateRequests' {
             ($rows | Where-Object RequestID -eq '1').Note | Should -Be 'kept'
         }
 
+        It 'Export-TrackingData replaces an EXISTING tracking file (the second and later checkpoint), not only creating a new one' {
+            # Regression: the atomic swap uses File.Move when the target is absent but File.Replace
+            # when it already exists. File.Replace's backup argument was passed as a bare $null, which
+            # PowerShell marshals to an empty string; File.Replace then threw ("path is not of a legal
+            # form" on 5.1, "path is empty" on 7), so every checkpoint after the first aborted the run
+            # - a real multi-file batch, and every Retrieve/resume run against an existing tracking file.
+            $p = Join-Path $TestDrive 'existing.csv'
+            $r1 = @([pscustomobject]@{ RequestFile = 'C:\r\a.req'; RequestID = '1'; SubmitTime = ''; Status = 'Issued';  OutputCertFile = 'C:\r\a.cer'; LastCheckTime = ''; ErrorMessage = ''; CAConfig = 'ca\CA' })
+            $r2 = @($r1[0], [pscustomobject]@{ RequestFile = 'C:\r\b.req'; RequestID = '2'; SubmitTime = ''; Status = 'Pending'; OutputCertFile = 'C:\r\b.cer'; LastCheckTime = ''; ErrorMessage = ''; CAConfig = 'ca\CA' })
+            $script:SuppressLogFile = $true
+            try {
+                Export-TrackingData -Data $r1 -Path $p 3>$null           # 1st checkpoint: target absent -> File.Move
+                Test-Path -LiteralPath $p | Should -BeTrue
+                { Export-TrackingData -Data $r2 -Path $p 3>$null } | Should -Not -Throw -Because 'the second checkpoint replaces an existing file via File.Replace, which must not fail on the null backup argument'
+            }
+            finally { $script:SuppressLogFile = $false }
+            $rows = @(Import-Csv -LiteralPath $p)
+            $rows.Count | Should -Be 2 -Because 'the replaced file must hold the full, newer row set'
+            ($rows.RequestID | Sort-Object) | Should -Be @('1', '2')
+            @(Get-ChildItem -LiteralPath $TestDrive -Filter 'existing.csv*.tmp').Count | Should -Be 0 -Because 'the temp file is cleaned up'
+            Test-Path -LiteralPath ($p + '.bak') | Should -BeFalse -Because 'File.Replace with a null backup leaves no backup file'
+        }
+
         It 'Write-BatchLog folds CR/LF and control characters so a tracking field cannot forge extra log lines' {
             $log = Join-Path $TestDrive 'forge.log'
             $saved = $script:LogFile; $script:LogFile = $log; $script:SuppressLogFile = $false
@@ -1095,6 +1118,10 @@ RequestType = PKCS10
                 $call = @{ CAConfig = $script:Ca; TrackingFile = $script:Tracking; OutputFolder = $script:CertDir; Confirm = $false
                            TrustedOutputPrincipal = $script:EnvTrusted }   # this machine's TEMP-chain grants (see the outer BeforeAll)
                 foreach ($k in $Params.Keys) { $call[$k] = $Params[$k] }   # a test may override a default (e.g. OutputFolder)
+                # NoOutputFolder sentinel: drop -OutputFolder entirely so the script delivers to the
+                # row's own recorded OutputCertFile (the "only -CAConfig and the tracking file" path).
+                # Consumed here; never passed to the script.
+                if ($call.ContainsKey('NoOutputFolder')) { $call.Remove('NoOutputFolder'); $call.Remove('OutputFolder') }
                 # A run with failed/attention rows ends with a terminating error (non-zero exit for
                 # automation). Collect the streamed output first, then the error, so the tests can
                 # still judge both the rows and what was logged.
@@ -1201,12 +1228,21 @@ RequestType = PKCS10
 
         It 'Retrieve mode re-resolves a row parked as Unknown (only -CAConfig and the tracking file needed)' {
             $rows = @(Import-Csv $script:Tracking)
-            $rows[0].Status = 'Unknown'
-            Remove-Item -LiteralPath $rows[0].OutputCertFile -Force
+            # Park the row that currently OWNS its destination - the NEWEST request for its file
+            # (highest RequestID on this CA). The earlier -Force test resubmitted every file, so an
+            # OLDER row's destination is now held by a newer request, and re-retrieving the older one
+            # would be correctly refused by the destination-owner-conflict guard (see 1.0.6). Retrieve
+            # writes to the row's recorded OutputCertFile here (no -OutputFolder), so the row must be
+            # the uncontested owner of that path.
+            $target = $rows | Sort-Object { [int]$_.RequestID } | Select-Object -Last 1
+            $target.Status = 'Unknown'
+            Remove-Item -LiteralPath $target.OutputCertFile -Force
             $rows | Export-Csv $script:Tracking -NoTypeInformation -Encoding utf8
 
-            $r = script:Invoke-Submit @{ Mode = 'Retrieve' }
-            $updated = $r.Rows | Where-Object { $_.RequestID -eq $rows[0].RequestID } | Select-Object -First 1
+            # No -OutputFolder: Retrieve delivers to the row's own recorded OutputCertFile, so this
+            # exercises the "only -CAConfig and the tracking file" path the test name claims.
+            $r = script:Invoke-Submit @{ Mode = 'Retrieve'; NoOutputFolder = $true }
+            $updated = $r.Rows | Where-Object { $_.RequestID -eq $target.RequestID } | Select-Object -First 1
             $updated.Status | Should -BeExactly 'Issued'
             Test-Path $updated.OutputCertFile | Should -BeTrue
         }

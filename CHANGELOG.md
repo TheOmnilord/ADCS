@@ -8,11 +8,31 @@ Each script also carries its own version in the `PSScriptInfo` header at the top
 Test-ScriptFileInfo .\Submit-CertificateRequests.ps1 | Select-Object Name, Version
 ```
 
-## [Unreleased]
+## [1.0.10] — 2026-09-07
+
+A live Lab-tier run of every script on an Enterprise Certificate Authority found and fixed a tracking-file checkpoint bug in Submit-CertificateRequests.ps1.
+
+### Fixed - live Lab testing
+
+- **Submit-CertificateRequests.ps1 → 1.0.11.** The tracking-file checkpoint could throw and abort a run.
+  - `Export-TrackingData` writes a temp file, then moves it onto the tracking file. It uses `File.Move` when the file is absent, and `File.Replace` when the file already exists.
+  - `File.Replace`'s optional backup-file argument was a bare `$null`. PowerShell converts a bare `$null` for a `[string]` parameter into an *empty string*. `File.Replace` refuses an empty backup path. The error is "The path is not of a legal form." on Windows PowerShell 5.1, and "The path is empty." on PowerShell 7.
+  - So every checkpoint after the first ran the `File.Replace` branch and threw. This aborted any batch on its second request. It also aborted every Retrieve or resume run against an existing tracking file. The throw came *after* the CA had issued, so a just-issued RequestID could fail to reach the tracking file. That is the duplicate resubmission the tracking file exists to prevent.
+  - A first single-file run ran the `File.Move` branch and worked, which hid the bug. The backup argument is now `[NullString]::Value`, which PowerShell passes as a real .NET null. The bug was present since v1.0.2. A live run of the Submit Lab tier on an Enterprise CA found it.
+- Test: `Export-TrackingData` now runs against an *existing* tracking file (the `File.Replace` branch), which had no coverage.
+- Test: the Submit Lab tier's "re-resolve an Unknown row" case now parks the row that *owns* its destination. That row is the newest request for its file, not the oldest. The earlier `-Force` case makes a newer request own that destination, so re-retrieving an older row is correctly refused by the destination-owner-conflict guard. The `File.Replace` bug had aborted the tier before this case ever ran, so the flaw was latent. With both fixed, the Submit Lab tier passes 7/7 on Windows PowerShell 5.1 and PowerShell 7 against a live Enterprise CA.
 
 ### Fixed - tests
 
 - The PowerShell-7-only long-path test in `Tests\Submit-CertificateRequests.Tests.ps1` is now discovered only on PowerShell 7 instead of skipped on Windows PowerShell 5.1. The CI gate rejects a skipped test, because a skip hides missing coverage. The v1.0.8 and v1.0.9 runs therefore failed on that leg, although every test passed.
+
+| Script | Version |
+|---|---|
+| Set-ADCSTemplateValidity.ps1 | 1.0.5 |
+| Submit-CertificateRequests.ps1 | **1.0.11** |
+| Sync-ADCSTemplate.ps1 | 1.0.7 |
+| Add-CertificateEnrollmentPolicyServerOffline.ps1 | 1.0.7 |
+| Add-CertificateEnrollmentPolicyServerToGpo.ps1 | 1.0.7 |
 
 ## [1.0.9] — 2026-09-07
 
@@ -275,7 +295,7 @@ Initial release.
 | Add-CertificateEnrollmentPolicyServerOffline.ps1 | 1.0.0 |
 | Add-CertificateEnrollmentPolicyServerToGpo.ps1 | 1.0.0 |
 
-[Unreleased]: https://github.com/TheOmnilord/ADCS/compare/v1.0.9...HEAD
+[1.0.10]: https://github.com/TheOmnilord/ADCS/compare/v1.0.9...v1.0.10
 [1.0.9]: https://github.com/TheOmnilord/ADCS/compare/v1.0.8...v1.0.9
 [1.0.8]: https://github.com/TheOmnilord/ADCS/compare/v1.0.7...v1.0.8
 [1.0.7]: https://github.com/TheOmnilord/ADCS/compare/v1.0.6...v1.0.7
