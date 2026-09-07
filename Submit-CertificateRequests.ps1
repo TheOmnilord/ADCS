@@ -1,11 +1,12 @@
 <#PSScriptInfo
-.VERSION 1.0.8
+.VERSION 1.0.9
 .GUID 6f98f16e-0c56-4a72-ba31-443938175c06
 .AUTHOR Sveinung Svea
 .PROJECTURI https://github.com/TheOmnilord/ADCS
 .LICENSEURI https://github.com/TheOmnilord/ADCS/blob/main/LICENSE
 .TAGS ADCS PKI CertificateServices
 .RELEASENOTES
+1.0.9 - The run lock and the per-run log are created only AFTER the tracking folder has passed the same chain check every delivery gets, the exact lock and log names are refused if a reparse point (even a dangling link, seen via File.GetAttributes which does not follow links) already occupies them, and both are opened with CreateNew: previously the lock was opened FIRST with OpenOrCreate + DeleteOnClose, so a link planted at <TrackingFile>.lock by a user who could write to the tracking folder was opened through and its TARGET deleted when the folder check then refused the folder and the finally disposed the handle (arbitrary file delete as the elevated account); the log moves from the unvalidated working directory to beside the tracking file (name made unique per run with a random suffix, so runs sharing a folder cannot collide on CreateNew) and is written with -LiteralPath; -OutputFolder's deepest existing ancestor - and every component created beneath it - is judged as the PARENT of a folder about to be created (reparse point, owner, swap rights, and what a folder created inside would INHERIT: an inheritable delete/write/re-permission grant, inherit-only or not, would make the new folder its holder's to swap for a junction or to keep a handle to across any later ACL check, so it is refused BEFORE creation; what files would inherit is not judged there, since none are written there and the final folder is judged in full once it exists) and the missing components are then created one at a time with the native CreateDirectoryW, which fails on any existing name - a junction planted after the check via a tolerated create-subfolder right is refused instead of being created through (New-Item -Force and Directory.CreateDirectory create through an existing name); each created component is judged structurally before anything is created beneath it (an inherit-only grant that confers nothing on the anchor is fully effective on a folder created in it, and would let its holder swap that folder for a junction); -OutputFolder components ending in a space or a period are refused (Win32 trims them from a leaf but keeps them in a parent, so one name would denote two directories); the native create uses the extended \\?\ form (no MAX_PATH limit, no normalization); the ambiguous-component guard runs inside the chain check itself, so the tracking folder (parent of the lock and the log) and every per-row destination are covered as well as -OutputFolder; every path is first reduced to one canonical DOS form (\\?\ and \\.\ prefixes stripped, / normalized) so an extended path cannot carry / or .. past the checks into the literal native create, and \\.\C:\ is no longer mistaken for a UNC server named "."; certreq's stdout/stderr capture files are created beside the log in the validated tracking folder (reparse point at the name refused, CreateNew, unique per call) instead of via Path.GetTempFileName() under %TEMP% - which for a SYSTEM or service run is C:\Windows\Temp, where any local user can create files and a dangling symbolic link at the next tmpXXXX.tmp name would have had certreq's output written through it, as the elevated account, into a file of the planter's choosing (pre-existing since 1.0.0)
 1.0.8 - Get-DestinationOwnerConflict skips only the SAME row by reference identity, not every row sharing the RequestID number (RequestIDs are per CA, so a different CA's request with the same number is a different request that can share the destination and must still be considered); SubmitTime is parsed and compared as DateTimeOffset (instants) instead of local DateTime, which reversed ordering across the DST fall-back hour
 1.0.7 - Get-RequestFiles reads the drop folder with -LiteralPath and an EXACT-extension filter (a folder named e.g. CSR[prod] was globbed as a character class and matched nothing, exiting 0 with work undone; -Filter '*.req' also matched longer extensions like .reqbak/.request, submitting stray backups); Export-TrackingData writes the checkpoint and Remove-RspFile removes the .rsp with -LiteralPath (a tracking path or request name with [ ] lost the RequestID or left the .rsp behind); certreq stdout/stderr are read with -Encoding Oem (default was ANSI on 5.1 but UTF-8 on 7, so the persisted ErrorMessage differed and was lossy on 7); Get-DestinationOwnerConflict is directional on SubmitTime (a -Force renewal that goes Pending can be retrieved) and guards its System.IO.Path calls (an invalid path char threw on 5.1 and aborted the batch); -Mode Retrieve computes the redirected destination and stamps a legacy row's CAConfig only inside the approved ShouldProcess branch, so a declined row stays byte-identical
 1.0.6 - -Mode Retrieve refuses to deliver a request whose destination already holds the certificate of a DIFFERENT request (Issued/Undelivered) for the same request file - the older of two requests for one CSR (a -Force resubmission after a pending first request) previously replaced the newer, already delivered certificate while that row kept saying Issued; the row is skipped, counted as needing attention and reported; -Force resubmission of an unresolved request warns about it
@@ -113,7 +114,14 @@
       this or any other machine, via any alias of the path - holds it. The tracking file's name is
       canonicalized first (an 8.3 short name resolves to the long name, so both spellings share
       one lock) and a hard-linked or symlinked tracking file is refused (a second name elsewhere
-      could not share the lock). A -WhatIf run takes no lock (it never writes the CSV).
+      could not share the lock). The lock, and the per-run log (CertBatch_<stamp>_<id>.log, unique
+      per run, written BESIDE the tracking file rather than in the working directory), are created only after the
+      tracking folder has passed the same chain check every delivery gets; a reparse point already
+      sitting at either name - even a dangling link - is refused, and both are opened with
+      CreateNew, so an existing occupant fails instead of being written (or deleted) through.
+      certreq's console output is captured in files created the same way beside the log - never
+      under %TEMP%, which a SYSTEM or service run shares with every local user. A -WhatIf run
+      takes no lock and writes no log (it never writes the CSV).
     - certreq always writes into a private temp file; the destination is touched only after a
       successful write (a pending, denied or failed request never disturbs it). A row's
       OutputCertFile is an identifier inside an operator-chosen boundary, not an authority: it
@@ -198,12 +206,20 @@ $ErrorActionPreference = 'Stop'
 #region Functions
 
 function Resolve-FullPath {
+    # One canonical DOS form for every path the script validates, creates or delivers to. A device
+    # or extended prefix is stripped (\\?\C:\x and \\.\C:\x -> C:\x ; \\?\UNC\srv\share\x ->
+    # \\srv\share\x) and '/' becomes '\' BEFORE GetFullPath: GetFullPath leaves a \\?\ path
+    # untouched, so '/' and '.'/'..' would otherwise survive into the component checks and into the
+    # literal (\\?\) native create, and '\\.\' would read as a UNC server named '.'. The \\?\ form
+    # is re-applied only where a native call needs it (ConvertTo-ExtendedPath).
     param([Parameter(Mandatory)][string]$Path)
-
-    if ([System.IO.Path]::IsPathRooted($Path)) {
-        return [System.IO.Path]::GetFullPath($Path)
+    $p = $Path -replace '/', '\'
+    if ($p -match '^\\\\[?.]\\UNC\\')        { $p = '\\' + $p.Substring(8) }
+    elseif ($p -match '^\\\\[?.]\\[A-Za-z]:') { $p = $p.Substring(4) }
+    if ([System.IO.Path]::IsPathRooted($p)) {
+        return [System.IO.Path]::GetFullPath($p)
     }
-    return [System.IO.Path]::GetFullPath((Join-Path (Get-Location).ProviderPath $Path))
+    return [System.IO.Path]::GetFullPath((Join-Path (Get-Location).ProviderPath $p))
 }
 
 function Resolve-TrackingFilePath {
@@ -221,6 +237,116 @@ function Resolve-TrackingFilePath {
         throw "-TrackingFile '$full' is a $($item.LinkType): the same tracking data would be reachable under another name that a concurrent run could lock separately. Point -TrackingFile at a regular file."
     }
     $item.FullName
+}
+
+function Assert-NoReparsePointAt {
+    # Refuses a symbolic link, junction or other reparse point sitting at the exact name this run
+    # is about to CREATE (the run lock, the per-run log). File.GetAttributes wraps
+    # GetFileAttributesEx, which reports the attributes of the link object ITSELF rather than
+    # following it, so a link is seen whether or not its target exists. The DANGLING case (target
+    # absent) is the dangerous one: a check that follows the link finds nothing, and an open that
+    # follows it with CreateNew would then create the target. Nothing at the name is fine.
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Name)
+    $attrs = $null
+    try { $attrs = [System.IO.File]::GetAttributes($Path) }
+    catch [System.IO.FileNotFoundException] { return }
+    catch [System.IO.DirectoryNotFoundException] { return }
+    if ($attrs -band [System.IO.FileAttributes]::ReparsePoint) {
+        throw "Refusing to create the $Name '$Path': a reparse point (symbolic link / junction) already occupies that name. Writing through it would carry this run's privileged write to whatever it points at. Remove the link (and find out who planted it) before rerunning."
+    }
+}
+
+function New-CertreqCaptureFile {
+    # A file to capture certreq's stdout or stderr - created BESIDE the per-run log, inside the
+    # tracking folder that has already passed the full chain check (no untrusted swap or write
+    # rights, no untrusted file-inheritable grant), never under %TEMP%. For an interactive
+    # administrator %TEMP% is private, but a SYSTEM or service run uses C:\Windows\Temp, where any
+    # local user can create files; Path.GetTempFileName() forms its tmpXXXX.tmp name and creates it
+    # with CREATE_NEW, which skips an existing occupant but FOLLOWS a dangling symbolic link and
+    # creates its target - so a user able to create symlinks (Developer Mode, or the privilege)
+    # could have certreq's output written, as the elevated account, into a file of their choosing.
+    # Validating %TEMP% instead would refuse every SYSTEM run (that folder grants Users
+    # create-files), so the files live here: the exact name is refused if a reparse point sits at
+    # it, then created with CreateNew; the random suffix keeps concurrent calls apart.
+    param([Parameter(Mandatory)][ValidateSet('stdout', 'stderr')][string]$Stream)
+    $dir  = [System.IO.Path]::GetDirectoryName($script:LogFile)
+    $path = Join-Path $dir ("certreq_{0}_{1}.{2}" -f (Get-Date -Format 'yyyyMMdd_HHmmss'), [guid]::NewGuid().ToString('N').Substring(0, 8), $Stream)
+    Assert-NoReparsePointAt -Path $path -Name "certreq $Stream capture file"
+    $fs = New-Object System.IO.FileStream($path, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::Read)
+    $fs.Dispose()
+    $path
+}
+if (-not ('SubmitFsNative' -as [type])) {
+    Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class SubmitFsNative {
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern bool CreateDirectoryW(string lpPathName, IntPtr lpSecurityAttributes);
+}
+"@
+}
+function Assert-UnambiguousPathComponents {
+    # Refuses a path with a component that ends in a space or a period. Win32 trims those from the
+    # FINAL component of a path but preserves them in an INTERMEDIATE one, so one spelling names
+    # two different directories: created as a leaf, "New " becomes "New"; used as a parent,
+    # "New \x" lands under a distinct "New " - which an attacker can create with an extended
+    # (\\?\) path and have a later step descend into. Such names are refused before any
+    # validation or creation uses them.
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Name)
+    $rel = $Path -replace '^\\\\\?\\(UNC\\)?', ''
+    foreach ($c in ($rel -split '[\\/]')) {
+        if ($c.Length -and $c -match '[ .]$') {
+            throw "$Name '$Path' has a component ('$c') that ends in a space or a period. Windows resolves such a name differently as a leaf and as a parent, so it cannot be validated or created unambiguously. Rename it, or choose a different folder."
+        }
+    }
+}
+function ConvertTo-ExtendedPath {
+    # The \\?\ form for a native call: no MAX_PATH limit (what .NET's own wrapper supplies on
+    # PowerShell 7) and NO Win32 normalization - the path is taken literally, which is safe because
+    # ambiguous (trailing space / period) components are refused up front.
+    param([Parameter(Mandatory)][string]$Path)
+    if ($Path.StartsWith('\\?\')) { return $Path }
+    if ($Path.StartsWith('\\'))   { return '\\?\UNC\' + $Path.Substring(2) }
+    return '\\?\' + $Path
+}
+function New-ProtectedDirectory {
+    # Creates every missing component of $Path beneath the already-validated $Anchor, one at a
+    # time, with the native CreateDirectoryW - which FAILS (ERROR_ALREADY_EXISTS) when anything
+    # already occupies the name: a file, a folder, a junction or a symbolic link. New-Item -Force
+    # and Directory.CreateDirectory treat an existing name as success and create the rest THROUGH
+    # it. The chain check deliberately tolerates the bare create-subfolder right on an ancestor
+    # (what C:\ grants Users), so an untrusted user can plant a missing intermediate component as a
+    # junction between the ancestor check and the creation - the -Confirm prompt is a deterministic
+    # window. Atomic fail-on-existing creation refuses such a component instead of descending into
+    # it; a component this run did create is owned by the running account and inherits the
+    # validated ancestor's ACL.
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Anchor)
+    $Path = $Path.TrimEnd([char]'\'); $anchorKey = $Anchor.TrimEnd([char]'\')
+    $missing = New-Object System.Collections.Generic.List[string]
+    $p = $Path
+    while ($p -and ($p.TrimEnd([char]'\') -ne $anchorKey)) {
+        $missing.Insert(0, $p)
+        $p = [System.IO.Path]::GetDirectoryName($p)
+    }
+    if (-not $p) { throw "-OutputFolder '$Path' does not lie beneath the validated folder '$Anchor'." }
+    $parent = $Anchor
+    foreach ($component in $missing) {
+        # Judge the PARENT before creating anything in it: reparse point, owner, swap rights, and
+        # what a folder created inside would inherit. A folder that inherits an untrusted delete /
+        # write / re-permission grant is the holder's from the instant it exists - to swap for a
+        # junction, or to open a handle to and keep across any later ACL check (a DACL change does
+        # not revoke handles already open, and FSCTL_SET_REPARSE_POINT checks the handle's access)
+        # - so the refusal must come BEFORE creation; checking the new folder afterwards cannot
+        # close that window. Each created component is then judged the same way before the next
+        # one is created beneath it; the final folder is judged in full once it exists.
+        Assert-ProtectedDirectoryChain -Name 'Output location' -Directory $parent -Path $Path -ForFolderCreation
+        if (-not [SubmitFsNative]::CreateDirectoryW((ConvertTo-ExtendedPath -Path $component), [IntPtr]::Zero)) {
+            $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+            throw "Refusing to create output folder component '$component': the name is already occupied, or it cannot be created (Win32 error $err). Something was placed there after the folder chain was validated - remove it (and find out who planted it) before rerunning."
+        }
+        $parent = $component
+    }
 }
 
 function Assert-SafeNativeArgument {
@@ -315,8 +441,22 @@ function Assert-ProtectedDirectoryChain {
     param(
         [Parameter(Mandatory)][string]$Name,
         [Parameter(Mandatory)][string]$Directory,
-        [Parameter(Mandatory)][string]$Path
+        [Parameter(Mandatory)][string]$Path,
+        # Judge this folder as the PARENT of a folder about to be created in it (the anchor, and
+        # each component created on the way): reparse point, owner, swap rights - and what a folder
+        # created inside it would INHERIT (Subfolder kind). An inheritable delete / write /
+        # re-permission grant, inherit-only or not, would make the new folder the holder's to swap
+        # for a junction, or to keep a handle to across any later ACL check - so it must be refused
+        # BEFORE the folder exists; a check after creation cannot close that window. What FILES
+        # would inherit is not judged here (none are written into these folders; the folder
+        # delivered into gets the full check, file inheritance included, once it exists).
+        [switch]$ForFolderCreation
     )
+    # Every directory judged here is also used as a PARENT afterwards (of the lock, the log, a
+    # delivered certificate, a created component), so a component whose leaf and parent spellings
+    # differ (trailing space or period) is refused before the first lookup: the lookup would probe
+    # the trimmed leaf, and the write would then traverse the untrimmed parent.
+    Assert-UnambiguousPathComponents -Path $Directory -Name $Name
     $probe = $Directory
     while ($probe) {
         $item = Get-Item -LiteralPath $probe -Force
@@ -325,14 +465,17 @@ function Assert-ProtectedDirectoryChain {
             if ($script:AllowUnprotectedOutput) { Write-BatchLog "$msg (-AllowUnprotectedOutputFolder: proceeding anyway)" -Level Warning }
             else { throw "$msg Use a real folder, or pass -AllowUnprotectedOutputFolder to accept the risk." }
         }
-        $swappers = $null; $badOwner = $null; $fileWriters = @()
+        $swappers = $null; $badOwner = $null; $fileWriters = @(); $subfolderWriters = @()
         try {
             $swappers = @(Get-UntrustedGrant -Path $probe -Kind Swap)
             $badOwner = Get-UntrustedOwner -Path $probe
             # The delivery folder itself is also judged on what its ACL hands to the FILES created
             # inside it: the staging file and the delivered certificate inherit those entries
             # (inherit-only or not), which the folder-swap check above rightly ignores.
-            if ($probe -eq $Directory) { $fileWriters = @(Get-UntrustedGrant -Path $probe -Kind File) }
+            if ($probe -eq $Directory) {
+                if ($ForFolderCreation) { $subfolderWriters = @(Get-UntrustedGrant -Path $probe -Kind Subfolder) }
+                else                    { $fileWriters      = @(Get-UntrustedGrant -Path $probe -Kind File) }
+            }
         }
         catch {
             $msg = "$Name lies under '$probe', whose security descriptor could not be read ($($_.Exception.Message)), so it cannot be established that untrusted users are unable to swap it during a delivery."
@@ -351,6 +494,11 @@ function Assert-ProtectedDirectoryChain {
         }
         if ($fileWriters -and $fileWriters.Count) {
             $msg = "$Name would be written in '$probe', whose ACL grants untrusted principal(s) $($fileWriters -join ', ') write, append, delete, write-attributes or re-permission rights on the FILES created inside it (an inheritable 'files' entry) - the staging file certreq writes and the delivered certificate inherit that grant, so such a user could alter the certificate's bytes, or turn the delivered file into a reparse point, before or after delivery."
+            if ($script:AllowUnprotectedOutput) { Write-BatchLog "$msg (-AllowUnprotectedOutputFolder: proceeding anyway)" -Level Warning }
+            else { throw "$msg Remove that entry from the folder's ACL (or name the principal with -TrustedOutputPrincipal), or pass -AllowUnprotectedOutputFolder to accept the risk." }
+        }
+        if ($subfolderWriters -and $subfolderWriters.Count) {
+            $msg = "$Name would create a folder inside '$probe', whose ACL hands untrusted principal(s) $($subfolderWriters -join ', ') delete, write-data, write-attributes or re-permission rights on the SUBFOLDERS created in it (a container-inheritable entry, inherit-only or not) - a folder created here would be theirs from the instant it exists: to swap for a junction, or to open a handle to and keep across any later check, before the next component is created beneath it."
             if ($script:AllowUnprotectedOutput) { Write-BatchLog "$msg (-AllowUnprotectedOutputFolder: proceeding anyway)" -Level Warning }
             else { throw "$msg Remove that entry from the folder's ACL (or name the principal with -TrustedOutputPrincipal), or pass -AllowUnprotectedOutputFolder to accept the risk." }
         }
@@ -444,6 +592,15 @@ function Get-UntrustedGrant {
     #           Control entry); CREATOR GROUP (S-1-3-1) becomes the running account's primary
     #           group, which can be as broad as Domain Users, so it stays untrusted unless named
     #           in -TrustedOutputPrincipal.
+    #   Subfolder what the folder's ACL hands to a FOLDER created inside it - judged on a folder that
+    #           is about to become the PARENT of one this run creates. Every ACE carrying
+    #           ContainerInherit is considered, inherit-only or not (an inherit-only entry confers
+    #           nothing on this folder, which is why the Swap check ignores it - but it is fully
+    #           effective on a subfolder the moment that subfolder exists), against the Swap mask.
+    #           A new folder that inherits such an entry is the holder's from the instant it is
+    #           created: to swap for a junction, or to open a handle to and keep across any later
+    #           ACL check (a DACL change does not revoke an open handle, and FSCTL_SET_REPARSE_POINT
+    #           checks the handle's granted access). So the refusal must come BEFORE creation.
     # Generic access bits are included because generic ACEs carry them. For Swap and Create,
     # inherit-only ACEs (the "subfolders and files only" entries the C:\ root carries) do not apply
     # to the folder itself and are skipped - the folders they propagate to are judged on their own
@@ -451,9 +608,9 @@ function Get-UntrustedGrant {
     # error: the caller must treat "unknown" as unprotected.
     param(
         [Parameter(Mandatory)][string]$Path,
-        [Parameter(Mandatory)][ValidateSet('Swap', 'Create', 'File')][string]$Kind
+        [Parameter(Mandatory)][ValidateSet('Swap', 'Create', 'File', 'Subfolder')][string]$Kind
     )
-    $mask = if ($Kind -eq 'Swap') {
+    $mask = if ($Kind -eq 'Swap' -or $Kind -eq 'Subfolder') {
         ([int64][System.Security.AccessControl.FileSystemRights]'Delete, DeleteSubdirectoriesAndFiles, ChangePermissions, TakeOwnership, CreateFiles, WriteAttributes') -bor 0x10000000 -bor 0x40000000   # + GENERIC_ALL, GENERIC_WRITE
     } elseif ($Kind -eq 'File') {
         # CreateFiles = FILE_WRITE_DATA and CreateDirectories = FILE_APPEND_DATA on a file
@@ -473,6 +630,11 @@ function Get-UntrustedGrant {
             # Only entries that propagate to files matter; a folders-only (ContainerInherit) entry
             # is never inherited by the staging file or the delivered certificate.
             if (-not ($rule.InheritanceFlags -band [System.Security.AccessControl.InheritanceFlags]::ObjectInherit)) { continue }
+        }
+        elseif ($Kind -eq 'Subfolder') {
+            # Only entries that propagate to SUBFOLDERS matter - inherit-only or not, they become
+            # effective on a folder created inside this one the moment it exists.
+            if (-not ($rule.InheritanceFlags -band [System.Security.AccessControl.InheritanceFlags]::ContainerInherit)) { continue }
         }
         elseif ($rule.PropagationFlags -band [System.Security.AccessControl.PropagationFlags]::InheritOnly) { continue }
         $sid = $rule.IdentityReference.Value
@@ -635,7 +797,7 @@ function Write-BatchLog {
         # Remove-Item / New-Item would each raise their OWN prompt. Declining one of those after
         # certreq has submitted would lose the checkpoint (RequestID) of a request the CA already
         # has - the one thing that must never be optional.
-        $entry | Out-File -FilePath $script:LogFile -Append -Encoding utf8 -Confirm:$false
+        $entry | Out-File -LiteralPath $script:LogFile -Append -Encoding utf8 -Confirm:$false
     }
 }
 
@@ -945,8 +1107,11 @@ function Submit-SingleRequest {
 
     Write-BatchLog "Submitting: $($RequestFile.Name)"
 
-    $stdoutFile = [System.IO.Path]::GetTempFileName()
-    $stderrFile = [System.IO.Path]::GetTempFileName()
+    # Beside the log in the validated tracking folder - never Path.GetTempFileName() under %TEMP%
+    # (see New-CertreqCaptureFile). Start-Process reopens them to truncate; they are this run's own
+    # files in a folder no untrusted principal can write to or swap, so that reopen cannot be redirected.
+    $stdoutFile = New-CertreqCaptureFile -Stream stdout
+    $stderrFile = New-CertreqCaptureFile -Stream stderr
 
     $tmpCer = New-TempCertificatePath -Destination $CerPath
     $keepTemp = $false
@@ -1064,7 +1229,7 @@ function Submit-SingleRequest {
         }
     }
     finally {
-        Remove-Item -Path $stdoutFile, $stderrFile -Force -Confirm:$false -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $stdoutFile, $stderrFile -Force -Confirm:$false -ErrorAction SilentlyContinue   # -LiteralPath: the tracking folder's name may contain [ ]
         # Whatever certreq left beside the destination (the .rsp of a pending or denied request) is this
         # invocation's own and is cleaned up here - except an issued certificate that could not be
         # delivered, which stays for recovery (its path is in the row's ErrorMessage).
@@ -1085,8 +1250,11 @@ function Get-IssuedCertificate {
 
     Write-BatchLog "Retrieving certificate for RequestID: $($Record.RequestID)"
 
-    $stdoutFile = [System.IO.Path]::GetTempFileName()
-    $stderrFile = [System.IO.Path]::GetTempFileName()
+    # Beside the log in the validated tracking folder - never Path.GetTempFileName() under %TEMP%
+    # (see New-CertreqCaptureFile). Start-Process reopens them to truncate; they are this run's own
+    # files in a folder no untrusted principal can write to or swap, so that reopen cannot be redirected.
+    $stdoutFile = New-CertreqCaptureFile -Stream stdout
+    $stderrFile = New-CertreqCaptureFile -Stream stderr
 
     $tmpCer = New-TempCertificatePath -Destination $Record.OutputCertFile
     $keepTemp = $false
@@ -1167,7 +1335,7 @@ function Get-IssuedCertificate {
         }
     }
     finally {
-        Remove-Item -Path $stdoutFile, $stderrFile -Force -Confirm:$false -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $stdoutFile, $stderrFile -Force -Confirm:$false -ErrorAction SilentlyContinue   # -LiteralPath: the tracking folder's name may contain [ ]
         if (-not $keepTemp) {
             Remove-Item -LiteralPath $tmpCer -Force -Confirm:$false -ErrorAction SilentlyContinue
             Remove-RspFile -CerPath $tmpCer
@@ -1215,8 +1383,16 @@ function Write-Summary {
 # Resolve to absolute paths so tracking records stay valid when later runs
 # use a different working directory
 $TrackingFile = Resolve-TrackingFilePath -Path $TrackingFile   # canonical long name; hard links / symlinks refused (lock identity)
+$trackingDir  = [System.IO.Path]::GetDirectoryName($TrackingFile)
 $OutputFolder = Resolve-FullPath -Path $OutputFolder
-$script:LogFile = Resolve-FullPath -Path (".\CertBatch_{0:yyyyMMdd_HHmmss}.log" -f (Get-Date))
+Assert-UnambiguousPathComponents -Path $OutputFolder -Name '-OutputFolder'   # a component ending in a space or period names two different directories (leaf vs parent)
+# The per-run log is written BESIDE the tracking file - inside the folder that must pass the chain
+# check before this run writes anything - not in the working directory, which is never validated:
+# an operator launching from a shared drop folder would otherwise have the elevated run append
+# through any link planted there under a name that is predictable to the second. The name carries
+# a random suffix because it is created with CreateNew in a folder that may be shared by several
+# tracking files: two runs started in the same second (or a quick rerun) must not collide.
+$script:LogFile = Join-Path $trackingDir ("CertBatch_{0:yyyyMMdd_HHmmss}_{1}.log" -f (Get-Date), [guid]::NewGuid().ToString('N').Substring(0, 8))
 $script:SuppressLogFile = [bool]$WhatIfPreference
 
 # Validation
@@ -1242,27 +1418,78 @@ if ($CertificateTemplate) { Assert-SafeNativeArgument -Name '-CertificateTemplat
 # lock file's own name is unique per CSV. DeleteOnClose removes the file when the handle closes (the finally at the
 # end of the run, or the OS if the process dies). A -WhatIf run never writes the CSV, so it takes
 # no lock (and leaves no transient file behind).
+#
+# ORDER MATTERS. DeleteOnClose deletes whatever the handle RESOLVED to, and OpenOrCreate follows a
+# symbolic link - so the lock must not be opened until the tracking folder has passed the same
+# chain check every delivery gets (no reparse point, trusted owner, no untrusted swap/write
+# rights). Before that check, a low-privileged user who can write to the tracking folder could
+# plant '<TrackingFile>.lock' as a link to a file the elevated account may delete; the folder check
+# would then correctly refuse the folder and throw - and the finally would dispose the handle and
+# delete the TARGET. So: the folder check runs first; the exact lock and log names are refused if
+# a reparse point (even a dangling one) already sits there; and both files are opened with
+# CreateNew, so an existing occupant fails instead of being opened through.
+# Rows that failed or need attention in THIS run. Automation gates on the exit code, so a run
+# with any of them ends with a terminating error after the summary (Pending is not a failure).
+$script:FailureCount = 0
+$script:AllowUnprotectedOutput = [bool]$AllowUnprotectedOutputFolder
+$script:TrustedSids = Get-TrustedPrincipalSet -Extra $TrustedOutputPrincipal
+if (-not (Test-Path -LiteralPath $trackingDir -PathType Container)) {
+    throw "The folder for -TrackingFile does not exist: '$trackingDir'. Create it first."
+}
+# Log-file writes are suppressed during this first check: the log does not exist yet and must not
+# be brought into being by an Out-File -Append that could follow a planted link. Warnings still
+# reach the console, and the same check is repeated - and logged - in the root loop below once
+# the log is open.
+$suppressBefore = $script:SuppressLogFile
+$script:SuppressLogFile = $true
+try { Assert-ProtectedDirectoryChain -Name 'Tracking location' -Directory $trackingDir -Path $TrackingFile }
+finally { $script:SuppressLogFile = $suppressBefore }
+
 $script:RunLock = $null
 if (-not $WhatIfPreference) {
-    $trackingDir = [System.IO.Path]::GetDirectoryName($TrackingFile)
-    if (-not (Test-Path -LiteralPath $trackingDir -PathType Container)) {
-        throw "The folder for -TrackingFile does not exist: '$trackingDir'. Create it first."
-    }
     $lockPath = "$TrackingFile.lock"
+    Assert-NoReparsePointAt -Path $lockPath -Name 'run lock'
+    Assert-NoReparsePointAt -Path $script:LogFile -Name 'log file'
     try {
-        $script:RunLock = New-Object System.IO.FileStream($lockPath, [System.IO.FileMode]::OpenOrCreate,
+        $script:RunLock = New-Object System.IO.FileStream($lockPath, [System.IO.FileMode]::CreateNew,
             [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None, 4096, [System.IO.FileOptions]::DeleteOnClose)
     }
     catch [System.IO.IOException] {
         throw "Another Submit-CertificateRequests run is using tracking file '$TrackingFile' (its lock file '$lockPath' is held). Wait for it to finish, or use a different -TrackingFile. ($($_.Exception.Message))"
     }
+    # The log is created here, with CreateNew, in the folder that has just passed the chain check.
+    # Any failure releases the lock first, so a refused log never leaves the lock held until the
+    # process exits and blocks the next run.
+    try {
+        $logInit = New-Object System.IO.FileStream($script:LogFile, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::Read)
+        $logInit.Dispose()
+    }
+    catch {
+        $script:RunLock.Dispose(); $script:RunLock = $null
+        throw "Cannot create the log file '$($script:LogFile)': something already occupies that name, or the folder refused the write. ($($_.Exception.Message))"
+    }
 }
 
 try {   # the lock is released in the finally at the end of the run, on every exit path
 
-    if (-not (Test-Path $OutputFolder)) {
+    if (-not (Test-Path -LiteralPath $OutputFolder)) {
+        # Validate the deepest EXISTING ancestor before anything is created beneath it: New-Item
+        # -Force would create the folder through a junction planted in that chain, and the root
+        # loop below checks only folders that already exist - so it would refuse the junction only
+        # after the directory had been created through it.
+        $anchor = [System.IO.Path]::GetDirectoryName($OutputFolder)
+        while ($anchor -and -not (Test-Path -LiteralPath $anchor -PathType Container)) { $anchor = [System.IO.Path]::GetDirectoryName($anchor) }
+        if (-not $anchor) { throw "No existing parent folder was found for -OutputFolder '$OutputFolder'." }
+        # The ancestor is judged as the parent of a folder about to be created (reparse point,
+        # owner, swap rights, and what the new folder would inherit) - before the prompt, so a
+        # refusal never waits on the operator. The folder created below gets the full check, file
+        # inheritance included, in the root loop that follows.
+        Assert-ProtectedDirectoryChain -Name 'Output location' -Directory $anchor -Path $OutputFolder -ForFolderCreation
         if ($PSCmdlet.ShouldProcess($OutputFolder, 'Create output folder')) {
-            New-Item -Path $OutputFolder -ItemType Directory -Force -Confirm:$false | Out-Null
+            # Atomic, per-component, fail-on-existing creation: a component planted after the
+            # ancestor check (a junction, via a tolerated create-subfolder right) is refused,
+            # never created through.
+            New-ProtectedDirectory -Path $OutputFolder -Anchor $anchor
             Write-BatchLog "Created output folder: $OutputFolder"
         }
     }
@@ -1272,13 +1499,10 @@ try {   # the lock is released in the finally at the end of the run, on every ex
     # delete or rename - and so swap for a junction during a delivery - is refused up front, the
     # same rule Assert-CertificateOutputPath applies per destination (fail closed; the operator
     # can accept the risk explicitly with -AllowUnprotectedOutputFolder). Only the create-subfolder
-    # right on its own is reported for awareness rather than refused.
-    # Rows that failed or need attention in THIS run. Automation gates on the exit code, so a run
-    # with any of them ends with a terminating error after the summary (Pending is not a failure).
-    $script:FailureCount = 0
-    $script:AllowUnprotectedOutput = [bool]$AllowUnprotectedOutputFolder
-    $script:TrustedSids = Get-TrustedPrincipalSet -Extra $TrustedOutputPrincipal
-    $retrieveRoots = @([System.IO.Path]::GetDirectoryName($TrackingFile), $OutputFolder)
+    # right on its own is reported for awareness rather than refused. (The tracking folder was
+    # already validated before the lock and the log were created; it is re-checked here so the
+    # result - including any -AllowUnprotectedOutputFolder warning - reaches the log.)
+    $retrieveRoots = @($trackingDir, $OutputFolder)
     foreach ($root in ($retrieveRoots | Sort-Object -Unique)) {
         if (-not (Test-Path -LiteralPath $root -PathType Container)) { continue }
         # The same chain check every delivery repeats: reparse points, untrusted owners, swappable

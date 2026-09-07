@@ -8,6 +8,37 @@ Each script also carries its own version in the `PSScriptInfo` header at the top
 Test-ScriptFileInfo .\Submit-CertificateRequests.ps1 | Select-Object Name, Version
 ```
 
+## [1.0.8] — 2026-09-07
+
+A whole-tree `/security-review` of all five scripts, with independent false-positive filtering, ran after v1.0.7. It found one confirmed finding, fixed here. An iterative Codex/Astra (gpt-6-astra, high effort) adversarial review then examined the fix. Three rounds found further defects in the fix itself; each was verified and fixed. Round 4 returned an explicit *approve*.
+
+### Fixed - whole-tree security review
+
+- **Submit-CertificateRequests.ps1 -> 1.0.9**
+  - **(Medium) The finding:** the script opened the run lock with `OpenOrCreate` + `DeleteOnClose` *before* it validated the tracking folder. It never checked the `.lock` name for a reparse point. A low-privileged user with write access to the tracking folder could create `<TrackingFile>.lock` as a link to a file that the elevated account can delete. The default `.\CertTracking.csv` in a shared drop folder, or a pre-created junction, gives that access. The open followed the link; the folder check then refused the folder and threw. The `finally` disposed the handle and deleted the **target** file: an arbitrary file delete as admin or SYSTEM.
+  - **The fix:** the tracking folder now passes the delivery chain check *first*. The script refuses the exact lock and log names when a reparse point occupies them, even a dangling one. `File.GetAttributes` reports the link itself and does not follow it. It opens both files with `CreateNew`, so an existing occupant fails instead of being opened through. A refused log releases the lock before the error, so it cannot block the next run.
+  - The per-run log moves from the unvalidated working directory to a place **beside the tracking file**, a folder that has just passed the chain check. The script writes it with `-LiteralPath`. A name that is already occupied fails at creation instead of being appended through.
+  - The script now creates a missing `-OutputFolder` safely. It judges the deepest *existing* ancestor, and every component it creates, as the **parent of a folder about to be created**. That judgement covers the reparse point, the owner, the rights to replace the folder, and *what a folder created inside would inherit*. It does not cover what files would inherit: no file is written there, and the script judges the final folder in full once it exists.
+  - Why the inheritance check: an inheritable delete, write, or re-permission grant is effective on the new folder the moment it exists. That is true even when the grant is inherit-only and gives nothing on the parent. Its holder could then replace the new folder with a junction. Its holder could also open a handle to the folder and keep it across any later ACL check. A check after creation cannot close that. So the script refuses such a parent *before* it creates anything.
+  - The script then creates the missing components one at a time with the native `CreateDirectoryW` in extended `\\?\` form. That call fails on *any* existing name. Previously `New-Item -Force` created the whole path through whatever occupied it. The chain check permits the bare create-subfolder right on an ancestor by design. A junction created as a missing intermediate component after the check was therefore created through, and refused only afterwards. The `-Confirm` prompt gave a predictable time to do that.
+  - The script refuses a component that ends in a space or a period. Win32 trims those characters from a leaf but keeps them in a parent, so one spelling would name two different directories. This guard runs inside the chain check itself. It therefore covers the tracking folder (the parent of the lock and the log) and every per-row destination, not only `-OutputFolder`.
+  - The script first reduces every path to one canonical DOS form: it strips the `\\?\` and `\\.\` prefixes and normalizes `/`. An extended path can therefore not pass `/` or `..` through the checks into the literal native create. The script no longer reads `\\.\C:\...` as a UNC server named `.`.
+  - **Behaviour change:** the script now refuses a not-yet-existing `-OutputFolder` *before* creation when its parent would give an untrusted principal rights on the new folder. Previously it created the folder and then refused it. The `C:\` root is such a parent: it gives Users an inheritable `CreateFiles` grant. Pre-create a new folder directly under `C:\` with a protected ACL, or pass `-AllowUnprotectedOutputFolder`.
+  - The per-run log name has a random suffix (`CertBatch_<stamp>_<id>.log`). The script creates it with `CreateNew` in a folder that several tracking files can share. Two runs started in the same second, or a quick rerun, no longer collide.
+  - The script creates certreq's stdout and stderr capture files **beside the log**, in the validated tracking folder. Each gets the reparse-point refusal, `CreateNew`, and a unique name per call. Previously it used `Path.GetTempFileName()` under `%TEMP%`. For an interactive administrator `%TEMP%` is private. A SYSTEM or service run uses `C:\Windows\Temp`, where any local user can create files.
+  - `GetTempFileName` skips an existing occupant but *follows a dangling symbolic link and creates its target*. A user who can create symbolic links (Developer Mode, or the privilege) could therefore direct certreq's output through the link. The elevated account would write it into a file of that user's choosing. That output embeds the request file's name, which the person who dropped the file chose. A check of `%TEMP%` instead would have refused every SYSTEM run, because `C:\Windows\Temp` grants Users the create-files right. The Astra review flagged this as the one write whose parent was never validated; it existed since 1.0.0.
+- Tests, folder creation: `Assert-NoReparsePointAt` against a live and a dangling symbolic link. `New-ProtectedDirectory` creates nested missing components. It refuses a pre-created junction and an occupied leaf. It refuses to create even the first component inside a parent that would give an untrusted principal rights on it (an inherit-only container grant). It creates a path longer than `MAX_PATH` on PowerShell 7. A folder judged `-ForFolderCreation` accepts an inherit-only *file* grant but refuses an inheritable *container* grant.
+- Tests, paths and guards: the chain check refuses an ambiguous (trailing-space) component wherever it is used. `Resolve-FullPath` reduces `\\?\`, `\\.\` and `/` forms to one canonical path. `New-CertreqCaptureFile` creates zero-byte, uniquely named capture files beside the log.
+- Static guards: `GetTempFileName` is gone from both certreq sites. The lock is opened with `CreateNew`. The tracking-folder chain check precedes the lock open. The log is derived from the tracking folder. The anchor check precedes the atomic create.
+
+| Script | Version |
+|---|---|
+| Set-ADCSTemplateValidity.ps1 | 1.0.4 |
+| Submit-CertificateRequests.ps1 | **1.0.9** |
+| Sync-ADCSTemplate.ps1 | 1.0.6 |
+| Add-CertificateEnrollmentPolicyServerOffline.ps1 | 1.0.6 |
+| Add-CertificateEnrollmentPolicyServerToGpo.ps1 | 1.0.6 |
+
 ## [1.0.7] — 2026-09-06
 
 An iterative Codex/Astra (gpt-6-astra, high effort) adversarial review of the v1.0.6 fixes — capped at seven rounds and run until a round confirmed convergence (an explicit *approve* with no remaining reachable defect). Each round re-scanned the whole working-tree diff; every finding was verified against the code, and reproduced on both PowerShell 5.1 and 7 where applicable, before fixing.
@@ -219,6 +250,7 @@ Initial release.
 | Add-CertificateEnrollmentPolicyServerOffline.ps1 | 1.0.0 |
 | Add-CertificateEnrollmentPolicyServerToGpo.ps1 | 1.0.0 |
 
+[1.0.8]: https://github.com/TheOmnilord/ADCS/compare/v1.0.7...v1.0.8
 [1.0.7]: https://github.com/TheOmnilord/ADCS/compare/v1.0.6...v1.0.7
 [1.0.6]: https://github.com/TheOmnilord/ADCS/compare/v1.0.5...v1.0.6
 [1.0.5]: https://github.com/TheOmnilord/ADCS/compare/v1.0.4...v1.0.5

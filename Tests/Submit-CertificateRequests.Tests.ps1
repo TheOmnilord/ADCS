@@ -67,7 +67,12 @@ Describe 'Submit-CertificateRequests' {
         # (The script has a mandatory -CAConfig and pings the CA on load, so it cannot be
         # dot-sourced wholesale; extracting the function bodies runs them with no side effects.)
         $ast = [System.Management.Automation.Language.Parser]::ParseFile($script:Submit, [ref]$null, [ref]$null)
-        foreach ($name in 'Resolve-FullPath', 'Resolve-TrackingFilePath', 'Assert-SafeNativeArgument', 'Assert-CertificateOutputPath', 'Assert-ProtectedDirectoryChain', 'Move-StaleCertificateAside', 'Remove-AsideIfIdentical', 'Move-RetrievedCertificate', 'New-TempCertificatePath',
+        # The native CreateDirectoryW shim New-ProtectedDirectory needs is an if-statement (Add-Type
+        # guarded by a type check), not a function - dot-source it before the helpers.
+        $shim = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.IfStatementAst] -and $n.Extent.Text -match 'SubmitFsNative' }, $true)
+        $shim | Should -Not -BeNullOrEmpty
+        . ([scriptblock]::Create($shim[0].Extent.Text))
+        foreach ($name in 'Resolve-FullPath', 'Resolve-TrackingFilePath', 'Assert-NoReparsePointAt', 'New-CertreqCaptureFile', 'Assert-UnambiguousPathComponents', 'ConvertTo-ExtendedPath', 'New-ProtectedDirectory', 'Assert-SafeNativeArgument', 'Assert-CertificateOutputPath', 'Assert-ProtectedDirectoryChain', 'Move-StaleCertificateAside', 'Remove-AsideIfIdentical', 'Move-RetrievedCertificate', 'New-TempCertificatePath',
                           'Get-TrustedPrincipalSet', 'ConvertTo-PrincipalLabel', 'Get-UntrustedGrant', 'Get-UntrustedOwner',
                           'Write-BatchLog', 'Get-RequestIdFromOutput', 'Get-DispositionFromOutput',
                           'Get-FriendlyErrorHint', 'Import-TrackingData', 'Export-TrackingData', 'Remove-RspFile', 'Resolve-CertificateOutputNames', 'Get-DestinationOwnerConflict', 'Get-RequestFiles') {
@@ -106,6 +111,159 @@ Describe 'Submit-CertificateRequests' {
         It 'Resolve-FullPath anchors a relative path at the current directory' {
             $r = Resolve-FullPath -Path '.\x\y.csv'
             $r | Should -BeExactly ([System.IO.Path]::GetFullPath((Join-Path (Get-Location).ProviderPath '.\x\y.csv')))
+        }
+
+        It 'Resolve-FullPath canonicalizes device/extended prefixes and forward slashes to one DOS form' {
+            # GetFullPath leaves a \\?\ path untouched, so a '/' or '..' inside one would survive into
+            # the component checks and into the literal native create; and '\\.\C:\' would otherwise
+            # read as a UNC server named '.' (and its '.' be refused as a trailing-period component).
+            Resolve-FullPath -Path '\\?\C:\Anchor\New/Certificates' | Should -BeExactly 'C:\Anchor\New\Certificates'
+            Resolve-FullPath -Path '\\.\C:\PKI\Certificates'        | Should -BeExactly 'C:\PKI\Certificates'
+            Resolve-FullPath -Path '\\?\UNC\srv\share\out'          | Should -BeExactly '\\srv\share\out'
+            Resolve-FullPath -Path 'C:/PKI/out/../certs'            | Should -BeExactly 'C:\PKI\certs'
+        }
+
+        It 'Assert-ProtectedDirectoryChain itself refuses an ambiguous (trailing-space) component, so the tracking folder and row destinations are covered too' {
+            { Assert-ProtectedDirectoryChain -Name 'T' -Directory (Join-Path $TestDrive 'Safe \sub') -Path 'x' } | Should -Throw -ExpectedMessage '*ends in a space or a period*'
+        }
+
+        It 'Assert-NoReparsePointAt refuses a live AND a dangling symbolic link at the name; a plain file or nothing passes' {
+            # The run lock and the per-run log are CREATED at a name the script computes. A link
+            # planted there would be opened - or, with DeleteOnClose, deleted - through. The probe
+            # uses File.GetAttributes (GetFileAttributesEx), which reports the link object itself,
+            # so a DANGLING link (target absent) is refused too: a check that followed the link
+            # would find nothing, and CreateNew would then create the target.
+            $dir = Join-Path $TestDrive 'nrp'; [System.IO.Directory]::CreateDirectory($dir) | Out-Null
+            $plain    = Join-Path $dir 'plain.lock'; [System.IO.File]::WriteAllText($plain, 'x')
+            $absent   = Join-Path $dir 'absent.lock'
+            $liveLink = Join-Path $dir 'live.lock'
+            $dangling = Join-Path $dir 'dangling.lock'
+            try { New-Item -ItemType SymbolicLink -Path $liveLink -Target $plain -ErrorAction Stop | Out-Null }
+            catch { Set-ItResult -Skipped -Because "symbolic links cannot be created in this session ($($_.Exception.Message))" }
+            try {
+                # Windows PowerShell 5.1 refuses a SymbolicLink whose -Target does not exist (7 allows
+                # it), so the dangling link is made portably: link to a real file, then delete the file.
+                $gone = Join-Path $dir 'gone.txt'; [System.IO.File]::WriteAllText($gone, 'x')
+                New-Item -ItemType SymbolicLink -Path $dangling -Target $gone -ErrorAction Stop | Out-Null
+                [System.IO.File]::Delete($gone)
+                { Assert-NoReparsePointAt -Path $plain    -Name 'test' } | Should -Not -Throw
+                { Assert-NoReparsePointAt -Path $absent   -Name 'test' } | Should -Not -Throw
+                { Assert-NoReparsePointAt -Path $liveLink -Name 'test' } | Should -Throw -ExpectedMessage '*reparse point*'
+                { Assert-NoReparsePointAt -Path $dangling -Name 'test' } | Should -Throw -ExpectedMessage '*reparse point*'
+            }
+            finally {
+                # Delete the LINKS themselves (File.Delete removes the link, never its target).
+                foreach ($l in $liveLink, $dangling) { try { [System.IO.File]::Delete($l) } catch { } }
+            }
+        }
+
+        It 'New-CertreqCaptureFile creates a zero-byte, uniquely named capture file BESIDE the log - never Path.GetTempFileName() under %TEMP%' {
+            # For a SYSTEM or service run %TEMP% is C:\Windows\Temp, where any local user can create
+            # files, and GetTempFileName follows a dangling symbolic link at its next tmpXXXX.tmp name.
+            $dir = Join-Path $TestDrive 'cap'; [System.IO.Directory]::CreateDirectory($dir) | Out-Null
+            $saved = $script:LogFile; $script:LogFile = Join-Path $dir 'CertBatch_test.log'
+            try {
+                $a = New-CertreqCaptureFile -Stream stdout
+                $b = New-CertreqCaptureFile -Stream stdout
+                $e = New-CertreqCaptureFile -Stream stderr
+                foreach ($p in $a, $b, $e) {
+                    [System.IO.Path]::GetDirectoryName($p) | Should -BeExactly $dir -Because 'the capture file lives beside the log, in the validated tracking folder'
+                    (Get-Item -LiteralPath $p).Length | Should -Be 0 -Because 'CreateNew made a fresh empty file of our own'
+                }
+                $a | Should -Not -Be $b -Because 'a random suffix keeps concurrent calls apart'
+                $a | Should -BeLike '*.stdout'
+                $e | Should -BeLike '*.stderr'
+            }
+            finally { $script:LogFile = $saved }
+        }
+
+        It 'New-ProtectedDirectory creates nested missing components, but refuses a junction planted as a missing component and an occupied leaf' {
+            # The chain check tolerates the bare create-subfolder right on an ancestor, so a missing
+            # intermediate component can be planted as a junction AFTER the ancestor check (the
+            # -Confirm prompt is a deterministic window). New-Item -Force / Directory.CreateDirectory
+            # create the rest THROUGH such a junction; CreateDirectoryW fails on any existing name.
+            $anchor = Join-Path $TestDrive 'npd'; [System.IO.Directory]::CreateDirectory($anchor) | Out-Null
+            $trap   = Join-Path $TestDrive 'npd-trap'; [System.IO.Directory]::CreateDirectory($trap) | Out-Null
+            # happy path: every missing component beneath the anchor is created
+            $deep = Join-Path $anchor 'a\b\c'
+            { New-ProtectedDirectory -Path $deep -Anchor $anchor } | Should -Not -Throw
+            Test-Path -LiteralPath $deep -PathType Container | Should -BeTrue
+            # planted intermediate component: 'New' is a junction to $trap (junctions need no privilege)
+            $mid = Join-Path $anchor 'New'
+            New-Item -ItemType Junction -Path $mid -Target $trap -ErrorAction Stop | Out-Null
+            try {
+                { New-ProtectedDirectory -Path (Join-Path $mid 'Certificates') -Anchor $anchor } | Should -Throw -ExpectedMessage '*already occupied*'
+                Test-Path -LiteralPath (Join-Path $trap 'Certificates') | Should -BeFalse -Because 'nothing may be created THROUGH the planted junction'
+            }
+            finally { [System.IO.Directory]::Delete($mid) }   # removes the junction itself, never the target's contents
+            # occupied leaf: a FILE already sits at the folder's name
+            $occupied = Join-Path $anchor 'x'; [System.IO.File]::WriteAllText($occupied, 'x')
+            { New-ProtectedDirectory -Path $occupied -Anchor $anchor } | Should -Throw -ExpectedMessage '*already occupied*'
+            # a path that does not lie beneath the anchor is refused rather than walked to the root
+            { New-ProtectedDirectory -Path (Join-Path $TestDrive 'elsewhere\y') -Anchor $anchor } | Should -Throw -ExpectedMessage '*does not lie beneath*'
+        }
+
+        It 'New-ProtectedDirectory refuses to create ANYTHING inside a parent that would hand an untrusted principal rights on the new folder (inherit-only container grant)' {
+            # An inherit-only ContainerInherit Modify confers nothing on the anchor itself, but is
+            # fully effective on a subfolder from the instant it exists: the holder could swap it for
+            # a junction, or open a handle to it and keep that handle across any later ACL check (a
+            # DACL change revokes nothing already open; a reparse point is set through the handle).
+            # So the refusal has to come BEFORE the folder exists - judging it afterwards is too late.
+            $anchor = Join-Path $TestDrive 'npd-inh'; [System.IO.Directory]::CreateDirectory($anchor) | Out-Null
+            $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+            $acl = Get-Acl -LiteralPath $anchor
+            $acl.SetAccessRuleProtection($true, $false)
+            $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($me, 'FullControl', 'ContainerInherit, ObjectInherit', 'None', 'Allow')))
+            $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+                (New-Object System.Security.Principal.SecurityIdentifier('S-1-5-11')), 'Modify', 'ContainerInherit', 'InheritOnly', 'Allow')))
+            Set-Acl -LiteralPath $anchor -AclObject $acl
+            @(Get-UntrustedGrant -Path $anchor -Kind Swap).Count      | Should -Be 0 -Because 'inherit-only: the grant confers nothing on the anchor itself'
+            @(Get-UntrustedGrant -Path $anchor -Kind Subfolder) -join ' ' | Should -Match 'Authenticated Users' -Because 'it is fully effective on every subfolder created in the anchor'
+            { Assert-ProtectedDirectoryChain -Name 'T' -Directory $anchor -Path $anchor } | Should -Not -Throw -Because 'as a delivery target the folder is fine: nothing on itself, nothing for files'
+            { Assert-ProtectedDirectoryChain -Name 'T' -Directory $anchor -Path $anchor -ForFolderCreation } | Should -Throw -ExpectedMessage '*SUBFOLDERS created in it*'
+            $leaf = Join-Path $anchor 'New\Certificates'
+            { New-ProtectedDirectory -Path $leaf -Anchor $anchor } | Should -Throw -ExpectedMessage '*SUBFOLDERS created in it*'
+            Test-Path -LiteralPath (Join-Path $anchor 'New') | Should -BeFalse -Because 'not even the first component may be created inside a parent that would give an untrusted principal rights on it'
+        }
+
+        It 'Assert-UnambiguousPathComponents refuses a component ending in a space or a period (leaf and parent would name different directories)' {
+            { Assert-UnambiguousPathComponents -Path 'C:\Anchor\New \Certificates' -Name 'T' } | Should -Throw -ExpectedMessage '*ends in a space or a period*'
+            { Assert-UnambiguousPathComponents -Path 'C:\Anchor\New..\Certificates' -Name 'T' } | Should -Throw -ExpectedMessage '*ends in a space or a period*'
+            { Assert-UnambiguousPathComponents -Path 'C:\Anchor\Certs.' -Name 'T' }             | Should -Throw -ExpectedMessage '*ends in a space or a period*'
+            { Assert-UnambiguousPathComponents -Path 'C:\Anchor\New.v2\Certificates' -Name 'T' } | Should -Not -Throw
+            { Assert-UnambiguousPathComponents -Path '\\server\share\out\x' -Name 'T' }         | Should -Not -Throw
+            { Assert-UnambiguousPathComponents -Path '\\?\C:\Anchor\Certs' -Name 'T' }          | Should -Not -Throw
+            ConvertTo-ExtendedPath -Path 'C:\a\b'            | Should -BeExactly '\\?\C:\a\b'
+            ConvertTo-ExtendedPath -Path '\\srv\share\a'     | Should -BeExactly '\\?\UNC\srv\share\a'
+            ConvertTo-ExtendedPath -Path '\\?\C:\a'          | Should -BeExactly '\\?\C:\a'
+        }
+
+        It 'New-ProtectedDirectory creates a path longer than MAX_PATH (extended \\?\ form; PowerShell 7)' -Skip:($PSVersionTable.PSVersion.Major -lt 6) {
+            $anchor = Join-Path $TestDrive 'lp'; [System.IO.Directory]::CreateDirectory($anchor) | Out-Null
+            $seg = 'a' * 60
+            $leaf = $anchor
+            1..5 | ForEach-Object { $leaf = Join-Path $leaf $seg }
+            $leaf.Length | Should -BeGreaterThan 260
+            { New-ProtectedDirectory -Path $leaf -Anchor $anchor } | Should -Not -Throw
+            Test-Path -LiteralPath $leaf -PathType Container | Should -BeTrue
+        }
+
+        It 'Assert-ProtectedDirectoryChain -ForFolderCreation judges a folder as a PARENT for creation: an inherit-only FILE grant is refused without the switch and accepted with it' {
+            # An ObjectInherit + InheritOnly grant reaches files placed in this folder (and, unless
+            # NoPropagateInherit is set, files in its subfolders too). It rightly refuses the folder
+            # as a DELIVERY target; as an ANCESTOR of a folder about to be created it must not,
+            # because the created folder is judged in full - inherited entries included - once it exists.
+            $d = Join-Path $TestDrive 'skipfi'; [System.IO.Directory]::CreateDirectory($d) | Out-Null
+            $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+            $acl = Get-Acl -LiteralPath $d
+            $acl.SetAccessRuleProtection($true, $false)
+            $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($me, 'FullControl', 'ContainerInherit, ObjectInherit', 'None', 'Allow')))
+            $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+                (New-Object System.Security.Principal.SecurityIdentifier('S-1-5-11')), 'Modify', 'ObjectInherit', 'InheritOnly', 'Allow')))
+            Set-Acl -LiteralPath $d -AclObject $acl
+            @(Get-UntrustedGrant -Path $d -Kind File) -join ' ' | Should -Match 'Authenticated Users' -Because 'the grant does reach files created directly in this folder'
+            { Assert-ProtectedDirectoryChain -Name 'T' -Directory $d -Path $d } | Should -Throw -ExpectedMessage '*FILES created inside it*'
+            { Assert-ProtectedDirectoryChain -Name 'T' -Directory $d -Path $d -ForFolderCreation } | Should -Not -Throw -Because 'an ObjectInherit-only entry reaches a subfolder only as an inherit-only entry that confers no access on the subfolder itself, so nothing lets its holder swap or re-permission a folder created here'
         }
 
         It 'Resolve-FullPath returns a rooted path unchanged (normalized)' {
@@ -790,6 +948,43 @@ Describe 'Submit-CertificateRequests' {
             $ex | Should -Match '-Mode Submit'
             $ex | Should -Match '-Mode Retrieve'
         }
+
+        It 'opens the run lock with CreateNew (never OpenOrCreate), and only AFTER the tracking folder passed the chain check' {
+            # Regression guard for the security-review finding: a DeleteOnClose handle opened before
+            # the folder check deletes whatever a link planted at <TrackingFile>.lock resolved to.
+            $src = Get-Content -LiteralPath $script:Submit
+            $lockLine  = ($src | Select-String -Pattern 'New-Object System\.IO\.FileStream\(\$lockPath' | Select-Object -First 1).LineNumber
+            $chainLine = ($src | Select-String -Pattern 'Assert-ProtectedDirectoryChain -Name ''Tracking location''' | Select-Object -First 1).LineNumber
+            $lockLine  | Should -Not -BeNullOrEmpty
+            $chainLine | Should -Not -BeNullOrEmpty
+            $chainLine | Should -BeLessThan $lockLine -Because 'the tracking folder must be validated before a DeleteOnClose handle is opened at a name inside it'
+            $src[$lockLine - 1] | Should -Match 'FileMode\]::CreateNew'
+            ($src -join "`n") | Should -Not -Match 'FileStream\(\$lockPath, \[System\.IO\.FileMode\]::OpenOrCreate'
+        }
+
+        It 'captures certreq output beside the log at both sites - never via Path.GetTempFileName() under %TEMP%' {
+            $src = Get-Content -LiteralPath $script:Submit -Raw
+            # The CALL form only: the name legitimately survives in the comments and release note that explain its removal.
+            $src | Should -Not -Match '\[System\.IO\.Path\]::GetTempFileName\(\)' -Because 'in a shared %TEMP% (C:\Windows\Temp for SYSTEM) GetTempFileName follows a dangling symlink and certreq output would be written through it'
+            ([regex]::Matches($src, 'New-CertreqCaptureFile -Stream stdout')).Count | Should -Be 2 -Because 'both certreq sites, Submit and Retrieve'
+            ([regex]::Matches($src, 'New-CertreqCaptureFile -Stream stderr')).Count | Should -Be 2
+            $src | Should -Not -Match 'Remove-Item -Path \$stdoutFile' -Because 'the capture files live in the tracking folder, whose name may contain wildcard characters'
+        }
+
+        It 'derives the per-run log from the tracking folder (not the working directory) and validates -OutputFolder''s existing ancestor before creating it' {
+            $src = Get-Content -LiteralPath $script:Submit
+            $logLine = $src | Select-String -Pattern '^\$script:LogFile = ' | Select-Object -First 1
+            $logLine | Should -Not -BeNullOrEmpty
+            $logLine.Line | Should -Match 'Join-Path \$trackingDir'
+            $logLine.Line | Should -Not -Match 'Resolve-FullPath'
+            $anchorCheck = ($src | Select-String -Pattern 'Assert-ProtectedDirectoryChain -Name ''Output location'' -Directory \$anchor' | Select-Object -First 1).LineNumber
+            $create      = ($src | Select-String -Pattern 'New-ProtectedDirectory -Path \$OutputFolder' | Select-Object -First 1).LineNumber
+            $anchorCheck | Should -Not -BeNullOrEmpty
+            $create      | Should -Not -BeNullOrEmpty
+            $anchorCheck | Should -BeLessThan $create -Because 'the ancestor must be validated before anything is created beneath it'
+            ($src -join "`n") | Should -Not -Match 'New-Item -Path \$OutputFolder -ItemType Directory' -Because 'New-Item -Force creates the whole path through whatever already occupies a component; creation must be the atomic per-component New-ProtectedDirectory'
+            $src[$anchorCheck - 1] | Should -Match '-ForFolderCreation' -Because 'a parent is judged for folder creation: on what the new folder would inherit, not on what files would inherit (none are written there)'
+        }
     }
 
     Context 'Guard: validation before any CA contact' -Tag 'Guard' {
@@ -853,8 +1048,9 @@ Describe 'Submit-CertificateRequests' {
             # drives the exact-CommonName CA backstop query in teardown.
             $script:KeyContainers = New-Object System.Collections.Generic.List[string]
 
-            # Everything this tier writes locally lives in TestDrive - including the script's
-            # per-run CertBatch_*.log files, which land in the CURRENT directory.
+            # Everything this tier writes locally lives in TestDrive: the script's per-run
+            # CertBatch_*.log files land BESIDE the tracking file (in TestDrive), and the working
+            # directory is pushed there too so nothing else can stray.
             $script:PrevDir = (Get-Location).ProviderPath
             Set-Location $TestDrive
 
