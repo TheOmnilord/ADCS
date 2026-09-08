@@ -1,11 +1,12 @@
 <#PSScriptInfo
-.VERSION 1.0.7
+.VERSION 1.0.8
 .GUID 61adf5d1-6eb5-4f41-8670-e9da72134570
 .AUTHOR Sveinung Svea
 .PROJECTURI https://github.com/TheOmnilord/ADCS
 .LICENSEURI https://github.com/TheOmnilord/ADCS/blob/main/LICENSE
 .TAGS ADCS PKI CertificateServices
 .RELEASENOTES
+1.0.8 - The root Flags of a GP location are converted by a new helper (ConvertTo-RootFlagsValue) instead of a bare [int] cast. A DWORD is used as it is, and a non-empty REG_SZ is converted with the same [int] cast as before (a decimal, a 0x hex number, a sign, leading zeros), so every numeric string the script accepted is still repaired to a DWORD. A value that cannot be converted (text such as 'abc', an empty string, REG_BINARY, REG_MULTI_SZ) is refused BEFORE the AD Enrollment Policy row and the CEP entry are written, with a message that names the hive, the kind and the value; previously the cast ran after both writes and killed the run with a raw conversion error and no summary. A value that turns unusable while the run is in progress is skipped with a note instead of an error. The RootFlags field of the summary shows '(unusable: ...)' for such a value instead of throwing. A code comment at the RegQueryValueExW call explains why $null is a real null for its byte[] parameter and why ERROR_MORE_DATA cannot occur with a null buffer. The Add summary gains an EntryAction field (Created, Updated, Declined or None) that states what happened to the CEP entry key, because EntryApplied is true for a new key AND for a rewrite of a key that already existed; a caller that cleans up only keys the run created (the Lab tests) needs the distinction. The Add summary also gains a BaseKeyCreated field that is true only when this run itself created the PolicyServers key of the location (the base key is created by one helper, New-BaseKey, so a key that another writer created between the existence check and the write is never reported as created); the same caller needs this evidence because a base key that was absent before the run may have been created by another writer since; both EntryAction and BaseKeyCreated take their evidence from the disposition (REG_CREATED_NEW_KEY or REG_OPENED_EXISTING_KEY) that RegCreateKeyExW returns for the one call that creates or opens the key - the base key, the CEP entry and the AD row are all created that way now, never with New-Item - because Test-Path followed by New-Item is two operations and the provider's own CreateSubKey opens an existing key, so neither proved creation when another writer created the key in between. The native create requests KEY_READ (0x20019), not KEY_READ | KEY_WRITE: opening an existing key needs no write right, and creating a missing key needs KEY_CREATE_SUB_KEY on its parent (which New-Item needed too), so an update of an existing entry under a base key that the caller can read but not write succeeds as it did before 1.0.8. The native helper type is named CepRegNative2, so a session that already loaded the released CepRegNative (which has no RegCreateKeyExW) still loads the expanded type instead of failing on a missing method. After the native creates and BEFORE any value write, Write-CepEntry runs Assert-ProtectedRegistryPath on the entry path again (every component exists now, so the link, owner and ACL of the base key and the entry are all checked), and New-BaseKey runs it on the base key whenever the disposition says the key already existed; a base key that another writer created after the preflight, or an entry name that an untrusted principal created as a symbolic link beneath it, is therefore refused before the values are written through it.
 1.0.7 - Help text only: the comment-based help is rewritten to the repository writing style (STYLE.md, derived from ASD-STE100 Simplified Technical English) - short sentences, active voice, no figurative language, acronyms defined, a CAUTION line on -ReplaceExisting and -Remove; every fact, condition and default is kept; no code change
 1.0.6 - Write-CepEntry validates the specific key it writes (Assert-ProtectedRegistryPath), so the AD Enrollment Policy row - a sibling leaf of the CEP entry - is no longer written to a delegated or symlinked key that escaped the up-front preflight of the CEP entry alone; the root-Flags gate recognises any pre-existing USABLE policy-server entry (a complete row, not an incomplete fragment) in the location, not only the requested entry and the AD row; the -ReplaceExisting sibling cleanup validates each sibling's registry path before reading or removing it, so a sibling that is a symbolic link cannot make the recursive delete destroy a key in another location; -Remove and -ReplaceExisting refuse to recursively delete a CEP entry that has subkeys (a CEP entry is a leaf by design), closing a path where a recursive delete could follow a registry symbolic link planted beneath a delegated descendant; Assert-ProtectedRegistryPath decides each component's existence with a native REG_OPTION_OPEN_LINK probe instead of Test-Path, so a DANGLING symbolic link (target absent, which Test-Path reports as not-found) can no longer let the walk break before the link check and leave the link to be retargeted at a protected key before the write
 1.0.5 - Root Flags are no longer written when no usable policy-server entry exists in a GP location (the CEP entry declined AND no AD Enrollment Policy row): writing PolicyServers root values there activated GP CEP configuration with no server, so clients lost the AD enrollment policy
@@ -80,6 +81,32 @@
     values. The summary object reports the ACTUAL registry state in RootFlags and DefaultMarker.
     The outcome fields EntryApplied, ADPolicyRow and DefaultChanged show what each confirmation
     gate did. The script supports -WhatIf and -Confirm.
+
+    Before the first write, the script checks every existing key from the hive root down to the
+    target key. A registry symbolic link, an untrusted owner, or write-class rights for an
+    untrusted principal make the script refuse the run. After the script creates the
+    PolicyServers key and the entry key, and before it writes a value, the script checks the
+    entry path again. The script refuses a link or a delegated key that another writer created
+    after the first check, before a write goes through it. The script also checks the
+    PolicyServers key again when its create call reports that the key already existed.
+
+    The summary field EntryAction states what the script did to the key of the CEP entry. It
+    has one of four values:
+      * Created: the script created the key and wrote its values.
+      * Updated: the key existed when the script wrote it, and the script rewrote its values.
+      * Declined: the confirmation gate or -WhatIf declined the write.
+      * None: the run stopped before the entry step.
+
+    The summary field BaseKeyCreated is $true only when this run created the PolicyServers key
+    of the location. In every other case it is $false. A caller that removes only the keys it
+    created can use this field together with EntryAction.
+
+    The evidence for both fields is the disposition that the Windows function RegCreateKeyExW
+    returns. The script creates each key with one such call. The call reports whether it created
+    the key (REG_CREATED_NEW_KEY) or opened a key that already existed (REG_OPENED_EXISTING_KEY).
+    The script does not use an existence check followed by a create as evidence. Another writer
+    can create the key between those two operations, and the script would then report a foreign
+    key as created.
 
 .PARAMETER Url
     The full CEP URI (for example https://pki.example.net/ejbca/msae/CEPService?alias). The
@@ -316,19 +343,49 @@ $target = "$hive\$key"
 # CREATOR OWNER / OWNER RIGHTS placeholders (they resolve to the running account for keys this
 # script creates). The default ACLs of HKLM\SOFTWARE\Microsoft\Cryptography, HKLM\SOFTWARE\Policies
 # and the user's own HKCU pass; a misdelegated parent is refused - fail closed, no override.
-if (-not ('CepRegNative' -as [type])) {
+# The type is named CepRegNative2: a session that ran the released script already holds a type
+# named CepRegNative without RegCreateKeyExW and RegDeleteKeyW, and a type cannot be redefined in
+# a running process. The guard on the new name loads this definition next to the old one.
+if (-not ('CepRegNative2' -as [type])) {
     Add-Type -TypeDefinition @"
 using System;
 using System.Runtime.InteropServices;
-public static class CepRegNative {
+public static class CepRegNative2 {
     [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     public static extern int RegOpenKeyExW(IntPtr hKey, string lpSubKey, uint ulOptions, uint samDesired, out IntPtr phkResult);
     [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     public static extern int RegQueryValueExW(IntPtr hKey, string lpValueName, IntPtr lpReserved, out uint lpType, byte[] lpData, ref uint lpcbData);
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern int RegCreateKeyExW(IntPtr hKey, string lpSubKey, int Reserved, string lpClass, uint dwOptions, uint samDesired, IntPtr lpSecurityAttributes, out IntPtr phkResult, out uint lpdwDisposition);
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern int RegDeleteKeyW(IntPtr hKey, string lpSubKey);
     [DllImport("advapi32.dll")]
     public static extern int RegCloseKey(IntPtr hKey);
 }
 "@
+}
+function New-RegistryKeyNative {
+    # Creates the key at $Path (HKCU:\... or HKLM:\...) with RegCreateKeyExW and returns $true
+    # only when THIS call created it. The API creates the missing ancestors and reports in its
+    # disposition whether it created the key (1, REG_CREATED_NEW_KEY) or opened one that already
+    # existed (2, REG_OPENED_EXISTING_KEY). That disposition is the creation evidence the script
+    # reports: Test-Path followed by New-Item is two operations, and the provider itself checks
+    # existence and then calls CreateSubKey, which opens an existing key. Another writer can create
+    # the key between those two steps, and neither form can tell. dwOptions 0 = a non-volatile key;
+    # samDesired 0x20019 = KEY_READ, never a write right: the handle is closed at once and the
+    # provider cmdlets write the values. Opening an existing key with KEY_READ needs no write right
+    # on it, so an update of an entry under a base key the caller can read but not write succeeds
+    # (as it did with New-Item). Creating a missing key needs KEY_CREATE_SUB_KEY on its parent,
+    # which New-Item needed too. A non-zero return code throws with the Win32 code.
+    param([string]$Path)
+    $isCU = $Path -like 'HKCU:*'
+    $hiveHandle = if ($isCU) { [IntPtr]::new(-2147483647) } else { [IntPtr]::new(-2147483646) }   # HKEY_CURRENT_USER / HKEY_LOCAL_MACHINE
+    $rel = ($Path -replace '^HK(CU|LM):\\?', '').TrimEnd('\')
+    $h = [IntPtr]::Zero; $disp = [uint32]0
+    $rc = [CepRegNative2]::RegCreateKeyExW($hiveHandle, $rel, 0, $null, 0, 0x20019, [IntPtr]::Zero, [ref]$h, [ref]$disp)
+    if ($rc -ne 0) { throw "Registry key '$Path' could not be created or opened (Win32 error $rc)." }
+    [void][CepRegNative2]::RegCloseKey($h)
+    return ($disp -eq 1)
 }
 function Test-RegistryKeyIsLink {
     # $true when the key at hive-relative $SubKey is a registry symbolic link. Opened with
@@ -336,14 +393,17 @@ function Test-RegistryKeyIsLink {
     # value 'SymbolicLinkValue'; a real key opened the same way has no such value.
     param([IntPtr]$HiveHandle, [string]$SubKey)
     $h = [IntPtr]::Zero
-    $rc = [CepRegNative]::RegOpenKeyExW($HiveHandle, $SubKey, 0x8, 0x1, [ref]$h)   # KEY_QUERY_VALUE
+    $rc = [CepRegNative2]::RegOpenKeyExW($HiveHandle, $SubKey, 0x8, 0x1, [ref]$h)   # KEY_QUERY_VALUE
     if ($rc -ne 0) { throw "Registry key '$SubKey' could not be opened for the link check (Win32 error $rc)." }
     try {
         $type = [uint32]0; $cb = [uint32]0
-        $q = [CepRegNative]::RegQueryValueExW($h, 'SymbolicLinkValue', [IntPtr]::Zero, [ref]$type, $null, [ref]$cb)
+        # $null for the byte[] lpData parameter is a real null on both engines (a [string]
+        # parameter would get "" instead). With a null buffer the API only reports the size, so
+        # ERROR_MORE_DATA (234) cannot occur here. The check stays for a caller that passes a buffer.
+        $q = [CepRegNative2]::RegQueryValueExW($h, 'SymbolicLinkValue', [IntPtr]::Zero, [ref]$type, $null, [ref]$cb)
         return ($q -eq 0 -or $q -eq 234)   # ERROR_SUCCESS / ERROR_MORE_DATA: the value exists -> a link
     }
-    finally { [void][CepRegNative]::RegCloseKey($h) }
+    finally { [void][CepRegNative2]::RegCloseKey($h) }
 }
 function Test-RegistryComponentExists {
     # $true when a key OR a symbolic link exists at hive-relative $SubKey. Opened with
@@ -353,8 +413,8 @@ function Test-RegistryComponentExists {
     # ERROR_FILE_NOT_FOUND so an unreadable component is never mistaken for an absent one.
     param([IntPtr]$HiveHandle, [string]$SubKey)
     $h = [IntPtr]::Zero
-    $rc = [CepRegNative]::RegOpenKeyExW($HiveHandle, $SubKey, 0x8, 0x1, [ref]$h)   # REG_OPTION_OPEN_LINK | KEY_QUERY_VALUE
-    if ($rc -eq 0) { [void][CepRegNative]::RegCloseKey($h); return $true }
+    $rc = [CepRegNative2]::RegOpenKeyExW($HiveHandle, $SubKey, 0x8, 0x1, [ref]$h)   # REG_OPTION_OPEN_LINK | KEY_QUERY_VALUE
+    if ($rc -eq 0) { [void][CepRegNative2]::RegCloseKey($h); return $true }
     if ($rc -eq 2) { return $false }   # ERROR_FILE_NOT_FOUND: truly absent
     throw "Registry key '$SubKey' could not be probed for existence (Win32 error $rc)."
 }
@@ -424,13 +484,65 @@ function Remove-DefaultMarker {
     $k = $root.OpenSubKey($rel, $true)
     if ($k) { try { $k.DeleteValue('', $false) } finally { $k.Close() } }
 }
+function ConvertTo-RootFlagsValue {
+    # Converts the raw root Flags value of a PolicyServers key to the [int] the script works with.
+    # Returns an object with Value and Reason. Value is the [int], or $null when the raw value is
+    # unusable; Reason then names the kind and the value. A missing value (Raw $null) gives Value
+    # $null and Reason $null. A DWORD is taken as it is. A non-empty REG_SZ is converted with the
+    # same [int] cast the script always used (a decimal, a 0x hex number, a sign, leading zeros),
+    # so the 1.0.4 repair of a numeric REG_SZ to a DWORD still runs for every string it accepted.
+    # Text, an empty string, REG_BINARY and REG_MULTI_SZ are unusable. [int]'abc' throws on both
+    # engines, and a raw cast after the entry writes killed the run with no summary. This helper
+    # never throws.
+    param($Raw, $Kind)
+    if ($null -eq $Raw) { return [pscustomobject]@{ Value = $null; Reason = $null } }
+    $kindName = if ($null -ne $Kind) { "$Kind" } else { $Raw.GetType().Name }
+    $value = $null
+    if ($Raw -is [string]) {
+        $s = $Raw.Trim()
+        if ($s.Length -gt 0) { try { $value = [int]$s } catch { $value = $null } }
+    }
+    elseif ($Raw -is [System.ValueType]) { try { $value = [int]$Raw } catch { $value = $null } }
+    if ($null -ne $value) { return [pscustomobject]@{ Value = $value; Reason = $null } }
+    $display = if ($Raw -is [Array]) { @($Raw | ForEach-Object { "$_" }) -join ',' } else { "$Raw" }
+    if ($display.Length -gt 64) { $display = $display.Substring(0, 64) + '...' }
+    [pscustomobject]@{ Value = $null; Reason = "the value is kind $kindName ('$display'), not a number that the script can convert to a DWORD" }
+}
+function Get-RootFlagsValue {
+    # Reads the raw root Flags value and its kind from the PolicyServers key of this location and
+    # returns the ConvertTo-RootFlagsValue result with the raw value added. Never throws on a bad value.
+    $raw = $null; $kind = $null
+    if (Test-Path -LiteralPath $hive) {
+        $k = Get-Item -LiteralPath $hive
+        $raw = $k.GetValue('Flags')
+        if ($null -ne $raw) { try { $kind = $k.GetValueKind('Flags') } catch { $kind = $null } }
+    }
+    $conv = ConvertTo-RootFlagsValue -Raw $raw -Kind $kind
+    [pscustomobject]@{ Raw = $raw; Kind = $kind; Value = $conv.Value; Reason = $conv.Reason }
+}
 function Get-RootFlagsDisplay {
     if (-not $isGP) { return 'n/a (local location)' }
-    if (Test-Path -LiteralPath $hive) {
-        $v = (Get-Item -LiteralPath $hive).GetValue('Flags')
-        if ($null -ne $v) { return '0x{0:X}' -f [int]$v }
-    }
+    $rf = Get-RootFlagsValue
+    if ($null -ne $rf.Value) { return '0x{0:X}' -f $rf.Value }
+    if ($null -ne $rf.Raw) { return "(unusable: $($rf.Reason))" }
     return '(absent)'
+}
+# $true only when THIS run created the PolicyServers key of the location (New-BaseKey). It is
+# reported as BaseKeyCreated in the Add summary. A caller that removes only the keys it created
+# (the Lab tests) needs the script's own evidence: a base key that was absent before the run may
+# have been created by another writer since, and such a key is not the caller's to remove.
+$baseKeyCreated = $false
+function New-BaseKey {
+    # Creates the PolicyServers key of this location (and its missing ancestors) with
+    # RegCreateKeyExW and records the creation. The evidence is the disposition of that one call:
+    # only REG_CREATED_NEW_KEY sets the flag. A key that another writer created first is opened,
+    # not created, and the flag stays $false. The flag is never reset: a later call in the same run
+    # opens the key this run created. A key that already existed is checked again right here:
+    # the preflight stopped at the deepest existing component, so a base key that another writer
+    # created since (with a delegated DACL, or as a symbolic link) was never checked. The check
+    # throws, so nothing is written to such a key. A key this run created earlier passes again.
+    if (New-RegistryKeyNative -Path $hive) { $script:baseKeyCreated = $true }
+    else { Assert-ProtectedRegistryPath -Path $hive }
 }
 function Write-CepEntry {
     param([string]$EntryPath, [hashtable]$Strings, [hashtable]$Dwords)
@@ -440,11 +552,21 @@ function Write-CepEntry {
     # unchecked. Assert-ProtectedRegistryPath walks from the hive root to the deepest existing
     # component of $EntryPath, so it covers both the entry and the AD row.
     Assert-ProtectedRegistryPath -Path $EntryPath
-    if (-not (Test-Path -LiteralPath $EntryPath)) {
-        $parent = Split-Path -Path $EntryPath -Parent
-        if (-not (Test-Path -LiteralPath $parent)) { New-Item -Path $parent -Force -Confirm:$false | Out-Null }  # -Force only creates missing parents here (guarded)
-        New-Item -Path $EntryPath -Confirm:$false | Out-Null   # leaf WITHOUT -Force: never recreate/wipe an existing key
-    }
+    # Both callers write a direct child of $hive (the CEP entry and the AD row). New-BaseKey
+    # creates the base key first, so the run records whether the base key is its own; the entry
+    # key is then created (or opened, when it exists) by one RegCreateKeyExW call. The function
+    # returns $true only when that call CREATED the entry key (REG_CREATED_NEW_KEY): the caller
+    # reports it as EntryAction. Neither call ever recreates or wipes an existing key.
+    New-BaseKey
+    $created = New-RegistryKeyNative -Path $EntryPath
+    # Check the path AGAIN, after the creates and before any value write. The check above stopped
+    # at the deepest existing component. When the base key was absent then, a concurrent writer
+    # can have created it with a delegated DACL, and an untrusted principal can then have created
+    # the entry name as a symbolic link; the create above opens such a link (dwOptions 0 follows
+    # it) and the value writes below would go through it. Every component exists now, so this
+    # second check covers the link status, the owner and the ACL of the base key and the entry.
+    # It throws on a failure, so no value is written.
+    Assert-ProtectedRegistryPath -Path $EntryPath
     # -Type String, always: Set-ItemProperty without -Type KEEPS an existing value's kind when the
     # conversion succeeds, so a PolicyID some earlier tool left as REG_DWORD would stay a DWORD while
     # the string compare below read it back as equal. -Confirm:$false on every cmdlet: inside an
@@ -463,6 +585,7 @@ function Write-CepEntry {
         if ($null -eq $got -or [int]$got -ne [int]$Dwords[$n] -or $chk.GetValueKind($n) -ne [Microsoft.Win32.RegistryValueKind]::DWord) { $bad += "$n (value or kind)" }
     }
     if ($bad) { throw "Post-write verification failed for value(s): $($bad -join ', ') under $EntryPath" }
+    return $created
 }
 
 # ============================ REMOVE MODE ===================================================
@@ -533,6 +656,22 @@ if (-not $NoClientId)      { $flags = $flags -bor 0x4  }  # PsfUseClientId (GPO-
 if ($AllowUntrustedIssuer) { $flags = $flags -bor 0x20 }  # PsfAllowUnTrustedCA
 
 $entryApplied = $false; $adRow = 'n/a'; $defaultChanged = $false; $dupRemoved = @()
+# What happened to the entry key: None (the run stopped before step 2), Declined (the gate or
+# -WhatIf said no), Created (the key was absent) or Updated (the key existed and was rewritten).
+# EntryApplied alone cannot tell Created from Updated, and a caller that removes only the keys
+# it created needs that difference.
+$entryAction = 'None'
+
+# ---- 0a. the existing root Flags must be usable (GP locations) - checked BEFORE any write
+# Step 3 rewrites the root Flags from the existing value. A value that another tool left as text
+# (REG_SZ 'abc', REG_BINARY, an empty string) cannot be converted. Refuse it here, before the AD
+# row and the CEP entry are written, so the operator sees one clear message and nothing changes.
+if ($isGP) {
+    $rf0 = Get-RootFlagsValue
+    if ($null -ne $rf0.Raw -and $null -eq $rf0.Value) {
+        throw "Refusing to write: the root Flags value under $hive cannot be used ($($rf0.Reason)). Fix or delete that value before rerunning. Nothing was written."
+    }
+}
 
 # ---- 0. prerequisite for the AD enrollment policy row (GP locations) - resolved BEFORE any write
 # Once GP-based CEP configuration exists, the client stops synthesizing the AD enrollment policy;
@@ -603,7 +742,7 @@ if ($isGP) {
         $adTarget = "$hive\$AD_KEY"
         if ($PSCmdlet.ShouldProcess($adTarget, "Ensure AD Enrollment Policy row (URL=LDAP:, PolicyID=$adPid, Flags=0x14, Cost=0xFFFFFFFF)")) {
             try {
-                Write-CepEntry -EntryPath $adTarget `
+                $null = Write-CepEntry -EntryPath $adTarget `
                     -Strings @{ URL = 'LDAP:'; PolicyID = $adPid; FriendlyName = 'Active Directory Enrollment Policy' } `
                     -Dwords  @{ Flags = 0x14; AuthFlags = 2; Cost = (ConvertTo-DwordInt 4294967295) }
             } catch { throw "AD policy row write to $adTarget failed: $_ (the CEP entry was NOT written)" }
@@ -625,6 +764,8 @@ function New-AddSummary([string[]]$Removed) {
         Authentication = '{0} (0x{1:X})' -f $Authentication, $authFlags
         Cost           = '0x{0:X}' -f $Cost
         EntryApplied   = $entryApplied
+        EntryAction    = $entryAction
+        BaseKeyCreated = $baseKeyCreated
         ADPolicyRow    = $adRow
         RootFlags      = Get-RootFlagsDisplay
         DefaultMarker  = "$(Get-DefaultMarker)"
@@ -651,12 +792,20 @@ $verb = if ($entryPreexisting) { 'Update' } else { 'Create' }
 $action = "$verb CEP entry '{0}' (URL={1}, PolicyID={2}, Flags=0x{3:X}, AuthFlags=0x{4:X} {5}, Cost=0x{6:X})" -f `
           $PolicyName, $Url, $PolicyId, $flags, $authFlags, $Authentication, $Cost
 if ($PSCmdlet.ShouldProcess($target, $action)) {
+    # EntryAction is derived from the disposition of the RegCreateKeyExW call inside Write-CepEntry
+    # (the one call that creates or opens the entry key), not from the existence check that named
+    # the prompt: a key that another writer created while the prompt waited is opened and updated,
+    # and the summary must say so, or a caller that cleans up only created keys would adopt it.
+    $createdAtWrite = $false
     try {
-        Write-CepEntry -EntryPath $target `
+        $createdAtWrite = Write-CepEntry -EntryPath $target `
             -Strings @{ URL = $Url; PolicyID = $PolicyId; FriendlyName = $PolicyName } `
             -Dwords  @{ Flags = $flags; AuthFlags = $authFlags; Cost = (ConvertTo-DwordInt $Cost) }
     } catch { throw "CEP entry write to $target failed (the key may be partially written - inspect it): $_" }
     $entryApplied = $true
+    $entryAction = if ($createdAtWrite) { 'Created' } else { 'Updated' }
+} else {
+    $entryAction = 'Declined'
 }
 # The (Default) marker and the removal of stale siblings point AT the entry, so they run only
 # when an entry for THIS URL serving THIS PolicyID exists (written now, or already present from
@@ -689,24 +838,31 @@ $policyServerPresent = $entryExists -or ($adRow -eq 'applied') -or $anyUsableSer
 
 # ---- 3. root Flags (GP locations; DISABLE bits, preserved across runs) ---------------------
 if ($isGP) {
-    $existing = if (Test-Path -LiteralPath $hive) { (Get-Item -LiteralPath $hive).GetValue('Flags') } else { $null }
+    # Read the value again: steps 1 and 2 do not touch it, but another writer may have. Step 0a
+    # refused an unusable value before any write; one that turned unusable since is skipped with
+    # a note, never a raw conversion error after the entry writes.
+    $rf = Get-RootFlagsValue
+    $existing = $rf.Value
     # The kind matters as much as the number: a Flags left as REG_SZ by some other tool is not a
     # value the client reads, so it is rewritten as a DWORD even when its number is already right.
-    $existingKind = if ($null -ne $existing) { try { (Get-Item -LiteralPath $hive).GetValueKind('Flags') } catch { $null } } else { $null }
-    $newFlags = if ($null -ne $existing) { [int]$existing } else { 0 }
+    $existingKind = $rf.Kind
+    $newFlags = if ($null -ne $existing) { $existing } else { 0 }
     if ($newFlags -band 0x2) {
         Write-Warning 'Existing root Flags had bit 0x2 set (clients IGNORE the GP-provided policy list). Clearing it.'
         $newFlags = $newFlags -band (-bnot 0x2)
     }
     if ($DisableUserConfigured) { $newFlags = $newFlags -bor 0x4 }
     if ($EnableUserConfigured)  { $newFlags = $newFlags -band (-bnot 0x4) }
-    if (-not $policyServerPresent -and -not $WhatIfPreference) {
+    if ($null -ne $rf.Raw -and $null -eq $existing) {
+        $notes.Add("Root Flags NOT written: the existing value under $hive became unusable while this run was in progress ($($rf.Reason)). Fix or delete that value and rerun.")
+    }
+    elseif (-not $policyServerPresent -and -not $WhatIfPreference) {
         $notes.Add("Root Flags NOT written: no usable policy-server entry exists (the CEP entry was declined and there is no AD Enrollment Policy row). Writing PolicyServers root values would activate GP CEP configuration with no server, and clients would lose the AD enrollment policy.")
     }
-    elseif (($null -eq $existing) -or ([int]$existing -ne $newFlags) -or ($existingKind -ne [Microsoft.Win32.RegistryValueKind]::DWord)) {
-        $from = if ($null -ne $existing) { '0x{0:X}' -f [int]$existing } else { '(absent)' }
+    elseif (($null -eq $existing) -or ($existing -ne $newFlags) -or ($existingKind -ne [Microsoft.Win32.RegistryValueKind]::DWord)) {
+        $from = if ($null -ne $existing) { '0x{0:X}' -f $existing } else { '(absent)' }
         if ($PSCmdlet.ShouldProcess($hive, ('Set root Flags {0} -> 0x{1:X} (disable bits: 0x2 ignore GP list, 0x4 ignore user-configured)' -f $from, $newFlags))) {
-            if (-not (Test-Path -LiteralPath $hive)) { New-Item -Path $hive -Force -Confirm:$false | Out-Null }
+            New-BaseKey
             New-ItemProperty -LiteralPath $hive -Name Flags -Value $newFlags -PropertyType DWord -Force -Confirm:$false | Out-Null
             if ((Get-Item -LiteralPath $hive).GetValueKind('Flags') -ne [Microsoft.Win32.RegistryValueKind]::DWord) { throw "Root Flags under $hive did not end up as a DWORD." }
         }
@@ -719,7 +875,7 @@ if ($SetAsDefault) {
         $notes.Add("(Default) marker NOT set: the CEP entry was declined and does not exist under $hive, so the marker would point at nothing.")
     }
     elseif ($PSCmdlet.ShouldProcess($hive, "Set (Default) marker = $PolicyId (default enrollment policy = '$PolicyName')")) {
-        if (-not (Test-Path -LiteralPath $hive)) { New-Item -Path $hive -Force -Confirm:$false | Out-Null }
+        New-BaseKey
         Set-ItemProperty -LiteralPath $hive -Name '(default)' -Value ([string]$PolicyId) -Type String -Confirm:$false
         if ((Get-Item -LiteralPath $hive).GetValueKind('') -ne [Microsoft.Win32.RegistryValueKind]::String) { throw "The (Default) marker under $hive did not end up as a REG_SZ." }
         $defaultChanged = $true

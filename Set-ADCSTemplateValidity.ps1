@@ -1,11 +1,12 @@
 ﻿<#PSScriptInfo
-.VERSION 1.0.5
+.VERSION 1.0.6
 .GUID 48b937ae-18bd-4710-9de9-5ae76f7c9a72
 .AUTHOR Sveinung Svea
 .PROJECTURI https://github.com/TheOmnilord/ADCS
 .LICENSEURI https://github.com/TheOmnilord/ADCS/blob/main/LICENSE
 .TAGS ADCS PKI CertificateServices
 .RELEASENOTES
+1.0.6 - An unreachable or wrong -Server is now refused with an error that names the server. Before, the RootDSE read of a dead host returned an empty configurationNamingContext without an error, so the run failed later with a misleading "Could not bind to LDAP://.../CN=Services," message. The script now stops right after the RootDSE read when configurationNamingContext is empty or when the read throws, and the error names the server or "the default domain controller". The run still fails closed. New .NOTES help: a caller with $ErrorActionPreference = 'Stop' or -ErrorAction Stop turns the per-template Write-Error reports into terminating errors; the run then stops at the first failure, emits no Error row and does not reach its own exit 1 (a powershell.exe -File call still exits with code 1 for the unhandled error). Help text only for that item; the behaviour is unchanged
 1.0.5 - Help text only: the comment-based help is rewritten to the repository writing style (STYLE.md, derived from ASD-STE100 Simplified Technical English) - short sentences, active voice, no figurative language, acronyms defined; every fact, condition and default is kept; no code change
 1.0.4 - The script is now a flat body instead of begin/process/end: under Windows PowerShell 5.1, `powershell.exe -File` with a non-console stdin (a scheduler, CI, WinRM/psexec, or the `< NUL` idiom) never ran the process{} block, so the run searched nothing, changed nothing, printed nothing and exited 0. A confirmation failure (non-interactive host, ConfirmImpact High, no -Confirm:$false) is now caught, counted and emitted as an Error row instead of escaping the loop uncounted. The run-level failure is raised with a non-terminating error plus `exit 1` rather than `throw`, so the structured report is preserved for a caller that captures or pipes it while automation still sees a non-zero exit code
 1.0.3 - Help text only: -OverlapPeriod documents the retained-overlap refusal; no code change
@@ -84,6 +85,17 @@
     .\Set-ADCSTemplateValidity.ps1 -TemplateName "ExactTemplate" -ValidityPeriod 365 -ValidityPeriodUnit Days -Server dc01.domain.com -Confirm:$false
     Sets the validity period through the domain controller dc01.domain.com. With -Confirm:$false,
     the script does not ask for confirmation before it changes each certificate template.
+
+.NOTES
+    The script reports a failed search or a failed certificate template update with a
+    non-terminating error. The run continues with the next certificate template. The script
+    emits an Error row for the failed certificate template and ends with exit code 1.
+
+    A caller with $ErrorActionPreference = 'Stop', or a call with -ErrorAction Stop, changes
+    this. Each of these errors then becomes a terminating error. The run stops at the first
+    failure. The script then emits no Error row, and it does not reach its own "exit 1". A call
+    from a session sees the terminating error. A "powershell.exe -File" call still exits with
+    code 1, because the host reports the unhandled error with that code.
 #>
 
 # NOTE: '#Requires' deliberately sits AFTER the help comment - placed before it, Get-Help
@@ -210,7 +222,23 @@ if ($setOverlap) {
 # Connect to AD and resolve the Certificate Templates container
 try {
     $rootDSE = if ($Server) { [ADSI]"LDAP://$Server/RootDSE" } else { [ADSI]'LDAP://RootDSE' }
-    $configNC = $rootDSE.configurationNamingContext.Value
+
+    # The RootDSE bind of an unreachable host does not throw. The property read then returns
+    # an empty value, and the base DN would end in "CN=Services," - the later bind failure
+    # would blame the templates container instead of the server. Refuse here and name the DC.
+    # A read that throws is refused with the same message plus the exception text.
+    $configNC = ''
+    $rootDseError = ''
+    try {
+        $configNC = [string]$rootDSE.configurationNamingContext.Value
+    }
+    catch {
+        $rootDseError = " ($($_.Exception.Message))"
+    }
+    if ([string]::IsNullOrWhiteSpace($configNC)) {
+        $dcName = if ($Server) { "the server '$Server'" } else { 'the default domain controller' }
+        throw "RootDSE on $dcName returned no configurationNamingContext$rootDseError. Check that the name is a reachable domain controller."
+    }
     $templateBaseDN = "CN=Certificate Templates,CN=Public Key Services,CN=Services,$configNC"
     $ldapPath = if ($Server) { "LDAP://$Server/$templateBaseDN" } else { "LDAP://$templateBaseDN" }
     $baseEntry = [ADSI]$ldapPath

@@ -1,11 +1,12 @@
 <#PSScriptInfo
-.VERSION 1.0.7
+.VERSION 1.0.8
 .GUID 689db74d-e668-410a-9a62-0b208179a369
 .AUTHOR Sveinung Svea
 .PROJECTURI https://github.com/TheOmnilord/ADCS
 .LICENSEURI https://github.com/TheOmnilord/ADCS/blob/main/LICENSE
 .TAGS ADCS PKI CertificateServices
 .RELEASENOTES
+1.0.8 - -OidHandling GenerateFromRoot without -OidRoot is now refused by the up-front parameter guards, before any domain controller is contacted and before any grant is resolved (the late check inside Resolve-TemplateOid is kept as a second line); the schema-typed conversion of a PKI attribute the static lists do not know is moved out of an inline switch in Import-Template into the new pure helper ConvertTo-SchemaTypedValue with the same rules (Int and String need exactly one element, MultiString and Bytes are cast, an unknown type or a failed cast drops the attribute with the existing warning) so that every arm can be unit-tested; the "Created template:" line now ends with " (objectGUID <guid>)" taken from the object New-ADObject -PassThru returned, and the companion OID display object is created with -PassThru and reported the same way on a new "Created OID object: <DN> (objectGUID <guid>)" line, so that a caller can identify exactly the objects this run created without a later lookup by name or OID; no other behaviour change
 1.0.7 - Help text only: the comment-based help is rewritten to the repository writing style (STYLE.md, derived from ASD-STE100 Simplified Technical English) - short sentences, active voice, no figurative language, acronyms defined, a CAUTION line on -SkipAcl and -AllowLinkedIssuancePolicy; every fact, condition and default is kept; no code change
 1.0.6 - ConvertTo-ImportAttributeValue checks integrality and range in the value's OWN numeric type before any [decimal] cast: a tiny double (1e-30) cast to decimal underflowed to 0 and was silently coerced to 0 (integer and byte-element branches both); Convert-ToLatestCompatibility computes and validates every replacement value - including the minor-revision increment, which now throws on Int32.MaxValue overflow - BEFORE mutating $Attributes, so a failure no longer leaves a template half-upgraded (v4 schema/flags with an un-bumped revision) while still reporting Upgraded; the Authentication Mechanism Assurance import guard scans only msPKI-Certificate-Policy (the issuance policies stamped into the ISSUED certificate), no longer msPKI-RA-Policies (which constrains the enrollment-agent SIGNING certificate and is not stamped into the issued cert, so an AMA link on it never grants the enrollee) - it was falsely refusing templates that merely require a signing-cert application policy
 1.0.5 - The DOMAIN\user@domain principal form now takes the UPN-only resolution and sAMAccountName shadow check (matching on the raw key let a prefixed key skip to the sAMAccountName lookup, so a planted sAMAccountName could still capture the grant); the dotted-OID validation regexes are anchored with \z instead of $ (a trailing newline in a tampered msPKI-Cert-Template-OID passed validation and bypassed the template-OID uniqueness search); -UpgradeCompatibility refuses a schema-2 source carrying msPKI-RA-Application-Policies (its encoding differs at v3/v4, so upgrading in place would silently drop the RA-signature application-policy requirement)
@@ -54,6 +55,11 @@
               Active Directory assign objectClass and objectCategory automatically.
             * lets you rename the template (internal cn and display name) with -NewTemplateName and
               -NewDisplayName.
+            * prints one line for each object it creates. The line for the display object is
+              "Created OID object: <DN> (objectGUID <guid>)". The line for the template is
+              "Created template: <DN> (objectGUID <guid>)". The DN and the objectGUID come from
+              the object that Active Directory returned at creation. A cleanup tool can identify
+              the created object by that objectGUID, without a later lookup by name or OID.
             * sets the template permissions, unless you pass -SkipAcl. The base comes from -AclBase;
               -EnrollPrincipals adds optional grants on top. The default, -AclBase Standard, writes the
               standard Kerberos Authentication ACL. It replaces the schema default, so admins are not
@@ -197,7 +203,8 @@
     script generates the template OID, for example
     "1.3.6.1.4.1.311.21.8.100000001.100000002.100000003.100000004.100000005". The script rejects
     -OidRoot with any other -OidHandling value before it does anything else, because it would
-    otherwise ignore the value without a message.
+    otherwise ignore the value without a message. The script also refuses -OidHandling
+    GenerateFromRoot without -OidRoot at that point, before it contacts a domain controller.
 
 .PARAMETER Server
     The optional domain controller (DC) to target for Configuration partition operations. On Sync
@@ -414,7 +421,8 @@
       case and warns; a lagging read-back fails the run rather than leave the template mis-secured.
     - The script rejects a parameter that the mode does not consume before it does anything else,
       rather than ignore it without a message. Examples: -StripOid with -Mode Import, -OidRoot
-      without -OidHandling GenerateFromRoot, and -AclBase with -SkipAcl.
+      without -OidHandling GenerateFromRoot, and -AclBase with -SkipAcl. The script also refuses
+      -OidHandling GenerateFromRoot without -OidRoot at that point.
     - The script types a PKI attribute that its built-in type lists do not know from the schema of
       the TARGET forest automatically. Such an attribute is a genuine schema extension linked to
       the pKICertificateTemplate class. The script drops the attribute with a warning when the
@@ -1005,6 +1013,33 @@ function Get-SchemaAttributeType {
     $type
 }
 
+function ConvertTo-SchemaTypedValue {
+    # Converts the value of a PKI attribute the static lists do not know into the .NET value
+    # New-ADObject must receive, from the type Get-SchemaAttributeType read in the TARGET schema.
+    # Returns $null when the value cannot be copied: an unknown type, a single-valued type (Int,
+    # String) given zero or several elements, or a failed cast (a schema-divergent shape, e.g. a
+    # string where the target expects octets). The caller then drops the attribute with a warning,
+    # never silently. Int and String take exactly ONE element: a multi-element value would be
+    # corrupted (space-joined) or crash the cast, and an EMPTY array would fabricate a value
+    # ([int]$null -> 0). @(...)[0] also unwraps a one-element array, which [System.Int32] alone
+    # would not. MultiString comes back as an object[] of strings and the caller casts it to the AD
+    # collection type, so this function needs no AD module and can be unit-tested.
+    param([string]$SchemaType, [AllowNull()]$Value)
+    $arr = @($Value)
+    try {
+        switch ($SchemaType) {
+            'Int'         { if ($arr.Count -eq 1) { return [System.Int32]$arr[0] }; return $null }
+            'String'      { if ($arr.Count -eq 1) { return [string]$arr[0] }; return $null }
+            'MultiString' { return , [object[]]@($arr | ForEach-Object { [string]$_ }) }
+            'Bytes'       { return , [System.Byte[]]$Value }
+            default       { return $null }
+        }
+    }
+    catch {
+        return $null
+    }
+}
+
 function ConvertTo-ImportAttributeValue {
     # Converts ONE known template attribute from the import view (JSON export or live AD read) to
     # the exact value New-ADObject must receive, and REFUSES anything malformed with a terminating
@@ -1209,30 +1244,29 @@ function Import-Template {
         }
         elseif ($name -match '^(msPKI-|pKI)') {
             # A PKI attribute the static lists don't know (a schema extension linked to the template
-            # class): type it from the TARGET forest's schema instead of dropping it. Returns $null
-            # when the attribute is not permitted on the template class or has a type this script
-            # cannot round-trip - then it is dropped (surfaced below), never silently.
-            # The Int/String branches are SINGLE-valued in the target schema: exactly one element is
-            # required - a multi-element value would be corrupted (space-joined) or crash the cast,
-            # and an EMPTY array would fabricate a value ([int]$null -> 0), so both shapes drop to
-            # $unconsumed. @(...)[0] also unwraps a one-element array, which [System.Int32] alone
-            # would not. The try/catch turns any remaining cast failure (schema-divergent shapes,
-            # e.g. a string where the target expects octets) into the same drop-with-warning instead
-            # of a raw terminating cast error.
+            # class): type it from the TARGET forest's schema instead of dropping it. Get-SchemaAttributeType
+            # returns $null when the attribute is not permitted on the template class or has a type
+            # this script cannot round-trip; ConvertTo-SchemaTypedValue returns $null for that, for a
+            # single-valued type given zero or several elements, and for a failed cast - then the
+            # attribute is dropped (surfaced below), never silently. MultiString arrives as an
+            # object[] of strings; the try/catch turns a failure of the collection cast into the
+            # same drop-with-warning instead of a raw terminating cast error.
             $schemaType = Get-SchemaAttributeType -AttributeName $name -ConfigNC $configNC -ADParams $ADParams
-            $oneValue = @($import.$name).Count -eq 1
-            try {
-                switch ($schemaType) {
-                    'Int'         { if ($oneValue) { $oa[$name] = [System.Int32]@($import.$name)[0] } else { $unconsumed += $name } }
-                    'String'      { if ($oneValue) { $oa[$name] = [string]@($import.$name)[0] } else { $unconsumed += $name } }
-                    'MultiString' { $oa[$name] = [Microsoft.ActiveDirectory.Management.ADPropertyValueCollection]$import.$name }
-                    'Bytes'       { $oa[$name] = [System.Byte[]]$import.$name }
-                    default       { $unconsumed += $name }
-                }
-            }
-            catch {
-                $oa.Remove($name)
+            $typed = ConvertTo-SchemaTypedValue -SchemaType $schemaType -Value $import.$name
+            if ($null -eq $typed) {
                 $unconsumed += $name
+            }
+            else {
+                # Direct assignments: an `if` used as an expression would enumerate a byte[] (or the
+                # AD collection) into an object[] on its way into the hashtable.
+                try {
+                    if ($schemaType -eq 'MultiString') { $oa[$name] = [Microsoft.ActiveDirectory.Management.ADPropertyValueCollection]$typed }
+                    else { $oa[$name] = $typed }
+                }
+                catch {
+                    $oa.Remove($name)
+                    $unconsumed += $name
+                }
             }
         }
     }
@@ -1321,9 +1355,15 @@ function Import-Template {
         # -ErrorAction Stop: without it a failure here (e.g. write access to CN=Certificate Templates
         # but not CN=OID) is only statement-terminating - the import would carry on, create the
         # template anyway, and report green success for an action that half-happened.
-        New-ADObject @ADParams -Path $oidPlan.CompanionContainerDN -Name $oidPlan.CompanionCn `
-            -Type 'msPKI-Enterprise-Oid' -OtherAttributes $oidObjectAttrs -Confirm:$false -ErrorAction Stop
+        # -PassThru: the returned object carries the DN AD assigned and the objectGUID. The line
+        # printed below reports both, so a caller can identify the very object this run created
+        # without a later lookup by name or OID (a later lookup could find a replacement).
+        $companionObj = New-ADObject @ADParams -Path $oidPlan.CompanionContainerDN -Name $oidPlan.CompanionCn `
+            -Type 'msPKI-Enterprise-Oid' -OtherAttributes $oidObjectAttrs -Confirm:$false -PassThru -ErrorAction Stop
         $companionDN = "CN=$($oidPlan.CompanionCn),$($oidPlan.CompanionContainerDN)"
+        if ($companionObj -and $companionObj.DistinguishedName) { $companionDN = $companionObj.DistinguishedName }
+        $companionGuidText = if ($companionObj -and $companionObj.ObjectGUID) { " (objectGUID $($companionObj.ObjectGUID))" } else { '' }
+        Write-Host "Created OID object: $companionDN$companionGuidText" -ForegroundColor Green
     }
 
     # Create the template object itself, referencing the resolved OID. -PassThru captures the DN that
@@ -1393,7 +1433,8 @@ function Import-Template {
         throw $failure
     }
 
-    Write-Host "Created template: $newTemplateDN" -ForegroundColor Green
+    # The objectGUID comes from the object New-ADObject -PassThru returned, never from a re-read.
+    Write-Host "Created template: $newTemplateDN (objectGUID $($createdObj.ObjectGUID))" -ForegroundColor Green
     Write-Host " - Internal name (cn): $cn"
     Write-Host " - Display name:       $displayName"
     Write-Host " - Template OID:       $($oidPlan.Oid) ($oidLabel)"
@@ -2053,6 +2094,11 @@ if ($SkipAcl -and $PSBoundParameters.ContainsKey('AclBase')) {
 }
 if ($OidRoot -and $OidHandling -ne 'GenerateFromRoot') {
     throw "-OidRoot is only consumed by -OidHandling GenerateFromRoot; with '$OidHandling' it would be silently ignored. Add -OidHandling GenerateFromRoot, or drop -OidRoot."
+}
+# The mirror case, refused here as well so it fails before a DC is contacted or a grant resolved.
+# Resolve-TemplateOid keeps its own check as a second line for the internal callers.
+if ($OidHandling -eq 'GenerateFromRoot' -and -not $OidRoot) {
+    throw "OidHandling 'GenerateFromRoot' requires -OidRoot (the base OID to generate under, e.g. 1.3.6.1.4.1.311.21.8.<5 arcs>)."
 }
 
 $adParams = @{}

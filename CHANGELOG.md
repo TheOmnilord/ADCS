@@ -8,6 +8,76 @@ Each script also carries its own version in the `PSScriptInfo` header at the top
 Test-ScriptFileInfo .\Submit-CertificateRequests.ps1 | Select-Object Name, Version
 ```
 
+## [Unreleased]
+
+A coverage audit of the four scripts other than Submit-CertificateRequests.ps1 measured which lines the Unit, Guard and Lab tiers execute. It found three defects in code that no tier had ever run, and it listed the branches that the Lab tier does not reach. This release fixes the defects and adds tests for those branches.
+
+### Fixed - coverage audit
+
+- **Set-ADCSTemplateValidity.ps1 → 1.0.6.** The script now refuses an unreachable or wrong `-Server` with an error that names the server.
+  - The RootDSE read of a dead host does not throw. It returns an empty configurationNamingContext. The base distinguished name (DN) then ended in `CN=Services,`, and the later bind failure blamed the templates container instead of the server.
+  - The script now stops right after the RootDSE read when the value is empty or the read throws. The error names the server, or "the default domain controller" when the caller gives no `-Server`. The run still fails closed.
+  - New `.NOTES` help: a caller with `$ErrorActionPreference = 'Stop'`, or a call with `-ErrorAction Stop`, turns the per-template error reports into terminating errors. The run then stops at the first failure, emits no Error row, and does not reach its own `exit 1`. A `powershell.exe -File` call still exits with code 1, because the host reports the unhandled error with that code. The behaviour is unchanged.
+- **Add-CertificateEnrollmentPolicyServerOffline.ps1 → 1.0.8.** The script no longer fails after its writes when the root `Flags` value of a Group Policy (GP) location is not a number.
+  - Step 3 cast the existing root `Flags` with `[int]` and no type check. Another tool can leave a REG_SZ value such as `abc` there. That value made the cast throw after the script had written the Active Directory (AD) Enrollment Policy row and the Certificate Enrollment Policy (CEP) entry. The run ended with a raw conversion error and no summary.
+  - A new helper converts the value and never throws. The helper uses a DWORD as it is. The helper converts a non-empty REG_SZ with the same `[int]` cast as before. The script therefore still repairs every numeric string it accepted to a DWORD. The helper treats text, an empty string, REG_BINARY and REG_MULTI_SZ as unusable.
+  - The script now checks the value before step 1. The script refuses an unusable value with a message that names the hive, the kind and the value, and writes nothing. The script skips a value that turns unusable while the run is in progress, and adds a note. The summary shows `(unusable: ...)` for such a value instead of throwing.
+  - Behaviour change: the script now refuses an empty REG_SZ `Flags`. Before, the script wrote DWORD 0 for it without a message.
+  - The Add-mode summary gains an `EntryAction` field with the value `Created`, `Updated`, `Declined` or `None`. A caller can now tell a new entry from an updated one. The summary also gains a `BaseKeyCreated` field that is true only when this run created the PolicyServers key of the location. The script creates both keys with the native registry application programming interface (API), whose result states whether the call created or opened the key. Both fields come from that result. Every existing field is unchanged.
+  - After the create and before any value write, the script runs the registry path check again. The script refuses a symbolic link or a delegated key that appeared after the first check, before a write goes through it. The native helper type has a new name, so a session that loaded an older version of the script can load this one.
+  - A code comment at the `RegQueryValueExW` call records that `$null` is a real null for its `byte[]` parameter, unlike a `[string]` parameter.
+- **Add-CertificateEnrollmentPolicyServerToGpo.ps1 → 1.0.8.** Three fixes.
+  - The registry.pol reader checks every framing character of a record. It refuses a missing `;` separator, a missing closing `]`, and one leftover byte after the last record. The 1.0.1 check caught two or more leftover bytes only. The reader now reports a file cut at the end of a record's data as corrupt instead of intact.
+  - A new helper converts the existing root `Flags` value before the first write in Add mode. Another tool can leave a REG_SZ `abc` there. Such a value is not a DWORD or a numeric string, and the script refuses it with a clear message before it writes anything. Before, a raw cast error ended the run late. The AD Enrollment Policy row and the CEP entry were already in the Group Policy Object (GPO) by then.
+  - The same helper drives the RootFlags display and the Auto-Enrollment old-value comparison. The summary shows `unusable: ...` for such a value instead of a crash.
+  - The reader stores no value for a root `Flags` record of another type, such as REG_BINARY, REG_QWORD or REG_MULTI_SZ. The same applies to a REG_DWORD whose data is not exactly 4 bytes. Before, the reader decoded a longer payload from its first 4 bytes. Step 3 treated a shorter one as absent and overwrote it with DWORD 0 after the writes. The script now judges the raw record that establishes the value and refuses it the same way before the first write. The display shows `unusable: ...` for it instead of `(absent)`.
+  - The script finds that record by the same replay the client performs. The last literal write wins. A `**soft.Flags` write applies only when no value exists at that point, and never into a key that a `**DeleteKeys` record removed. A later deletion record removes the value.
+  - The reader now refuses a file shorter than the 8-byte header as corrupt. An empty file still counts as no records.
+  - `-ReplaceExisting` verifies each sibling removal from registry.pol before it reports the sibling in DuplicatesRemoved, as `-Remove` already did. The run fails when the records are still there.
+
+### Changed - coverage audit
+
+- **Sync-ADCSTemplate.ps1 → 1.0.8.** Three changes, no other behaviour change.
+  - The `Created template:` line now ends with the objectGUID, the globally unique identifier (GUID), of the object that Active Directory returned at creation. The script reports the companion object identifier (OID) object the same way on a new `Created OID object:` line. A caller can now identify exactly the objects a run created without a later lookup by name.
+  - The up-front parameter guards now refuse `-OidHandling GenerateFromRoot` without `-OidRoot`, before the script contacts a domain controller or resolves a grant. Before, the check ran after both. The script keeps the late check inside `Resolve-TemplateOid`. The help states the early refusal.
+  - The built-in type lists do not know every public key infrastructure (PKI) attribute. The conversion of such an attribute moves out of an inline switch in `Import-Template` into the new pure helper `ConvertTo-SchemaTypedValue`. A unit test can now reach every arm.
+  - The rules of that helper are the same as before. Int and String take exactly one element. The helper casts MultiString and Bytes. An unknown type or a failed cast drops the attribute with the existing warning.
+- Test suite hygiene: one live Lab run of the coverage audit printed a safety-net warning for an untracked template the suite had created. Every Lab suite now deletes only what it proved it created, and the evidence differs by object type.
+  - The Sync and Validity suites record the objectGUID that Active Directory returned at creation. Cleanup removes a tracked object only when the GUID at its DN still matches, and warns with the DN otherwise.
+  - The ToGpo suite removes only the GPO by the GUID that `New-GPO` returned. The Offline suite tracks a registry key by its exact path only when the create call reported a new key. It drops the path across every call that can delete the key. It removes only a key without subkeys.
+  - The prefix sweep at the end of a run names an object the suite never tracked and does not delete it. A tracked object still goes through the GUID check above.
+
+### Added - tests
+
+- Set-ADCSTemplateValidity.
+  - Guard: an unreachable `-Server`. Unit: the NUL escape.
+  - Lab: a confirmation that throws on a non-interactive host (both engines). A template update that fails on a Deny access control entry (ACE). An idempotent rerun without `-OverlapPeriod`. A template with no display name, overlap or revision. One modification through `-Server`.
+- Add-CertificateEnrollmentPolicyServerOffline.
+  - Unit: the new helper, the GP root-Flags block under `-WhatIf`, the negative PolicyID hash and Remove mode under `-WhatIf`. Guard: control characters and a non-absolute URL.
+  - Lab: the access control list (ACL) refusal of the registry path check. The sibling subkey guard. A second `-Remove`. A kept and a cleared default marker. The usable-row checks. A `-Location GPUser -WhatIf` run on a domain-joined machine.
+- Add-CertificateEnrollmentPolicyServerToGpo.
+  - Unit: the framing cases of the reader. A missing `]`. A wrong closing character. One leftover byte. Each `;` corrupted on its own. Size 0, a short DWORD, REG_BINARY and a 5-byte file.
+  - Unit: `**DeleteValues`. The deletion-order note. The new helpers and the RootFlags display, with records of another type. The PolicyID hash against two published Java values. `Invoke-GPWrite` retries and `Test-GpoEntry` mismatches with mocked cmdlets.
+  - Guard, with a mocked `Get-GPO`: the four GPO-by-ID branches and the input checks after the GPO lookup. Guard, with a mocked reader: the refusal of a REG_BINARY, a REG_QWORD and a short DWORD root Flags record before any write.
+  - Lab: the root-Flags switches and the 0x2 warning. A REG_SZ `abc` root Flags refused before any write. `-Server` and `-Domain`. A kept default marker.
+  - Lab: the verified `-ReplaceExisting` removal. `-Remove -ClearDefault`. A second `-Remove`. The "no entries remain" note.
+  - Lab: `-Authentication Certificate`, `-NoAutoEnroll`, `-NoClientId`, `-AllowUntrustedIssuer` and `-AEExpirationPercent`, each read back through the Group Policy cmdlets and the registry.pol replay.
+- Sync-ADCSTemplate.
+  - Unit: the `[decimal]` branch of the integer check through `ConvertFrom-Json`, so each engine tests its own number type. A `[datetime]` value. A double and a `$null` byte element. The NUL escape. The schema v2 source with `msPKI-RA-Application-Policies`.
+  - Unit: the new helper, all five arms, and the same arms in place in `Import-Template` with stubbed cmdlets. The import rollback. `Get-WellKnownTokenSid`. `Export-Template` with `-StripOid` and `-StripIdentity`.
+  - Unit: `Resolve-PrincipalSid` with a stubbed `Get-ADObject`. Cases: a raw security identifier (SID), a foreign domain prefix, a user principal name (UPN), and a UPN with a shadow sAMAccountName. Also an ambiguous name, a token collision and an unknown name.
+  - Guard: the early `GenerateFromRoot` refusal for Import and Sync.
+  - Lab: `-AclBase SchemaPlusStandard`. Import with `-WhatIf`. The domain-name `-Server` warning. Import of a stripped export without new names, and of a stripped OID with Preserve. The Authentication Mechanism Assurance refusal and `-AllowLinkedIssuancePolicy`. Preserve of a new OID into the cross-forest target.
+  - Lab: Validate with `-KeepArtifacts`, where the suite removes the kept objects by the objectGUIDs the run printed.
+
+| Script | Version |
+|---|---|
+| Set-ADCSTemplateValidity.ps1 | **1.0.6** |
+| Submit-CertificateRequests.ps1 | 1.0.12 |
+| Sync-ADCSTemplate.ps1 | **1.0.8** |
+| Add-CertificateEnrollmentPolicyServerOffline.ps1 | **1.0.8** |
+| Add-CertificateEnrollmentPolicyServerToGpo.ps1 | **1.0.8** |
+
 ## [1.0.11] — 2026-09-07
 
 ### Changed - help text

@@ -1,11 +1,12 @@
 <#PSScriptInfo
-.VERSION 1.0.7
+.VERSION 1.0.8
 .GUID 54763db6-2359-401f-8960-ef0de5911aaf
 .AUTHOR Sveinung Svea
 .PROJECTURI https://github.com/TheOmnilord/ADCS
 .LICENSEURI https://github.com/TheOmnilord/ADCS/blob/main/LICENSE
 .TAGS ADCS PKI CertificateServices
 .RELEASENOTES
+1.0.8 - The registry.pol reader checks every framing character of a record: it refuses a missing ';' separator, a missing closing ']' and one leftover byte after the last record (the 1.0.1 check caught two or more bytes only), so a file cut at the end of a record's data is reported as corrupt instead of intact; the existing root Flags value is converted by a new helper (ConvertTo-PolDwordValue) BEFORE the first write in Add mode, and a value that is not a DWORD or a numeric string (a REG_SZ 'abc' another tool left) is refused with a clear message while nothing has been written (previously a raw cast error after the AD row and the CEP entry were already in the GPO); the same helper drives the RootFlags display (an unusable value shows as 'unusable: ...' instead of a crash) and the Auto-Enrollment old-value comparison; a root Flags record of another type (a REG_BINARY, a REG_QWORD, a REG_MULTI_SZ) or a REG_DWORD whose data is not exactly 4 bytes, which the parser reads as no value, is refused the same way (the record judged is the one that establishes the value in the same replay the effective view performs: the last literal write wins, a **soft.Flags write applies only when no value exists at that point, a later deletion record removes the value, and a soft write never recreates a key that a **DeleteKeys record removed; a value that a soft write restores after a deletion is no longer reported as lost by the deletion-order scan); the reader refuses a file shorter than the 8-byte header as corrupt instead of reading it as empty (a zero-byte file still counts as no records) before the first write (new helpers Get-PolRawRecord and Get-PolDwordRecordReason judge the newest raw record, and fail closed even when a later deletion record would remove it) instead of passing for an absent value that step 3 overwrote with DWORD 0 after the AD row and the CEP entry were written, and the RootFlags display shows such a record as 'unusable: ...' instead of '(absent)'; -ReplaceExisting verifies each sibling removal from registry.pol before it reports the sibling in DuplicatesRemoved, as -Remove already did, and fails the run when the records are still there
 1.0.7 - Help text only: the comment-based help is rewritten to the repository writing style (STYLE.md, derived from ASD-STE100 Simplified Technical English) - short sentences, active voice, no figurative language, acronyms defined, a CAUTION line on -ReplaceExisting and -Remove; every fact, condition and default is kept; no code change
 1.0.6 - The root-Flags gate recognises any pre-existing USABLE policy-server entry (a complete row - URL, PolicyID, FriendlyName and numeric Flags/AuthFlags/Cost - not an incomplete fragment) in the scope, not only the requested CEP entry and the AD row: a declined requested entry no longer wrongly blocks a legitimate root-Flags change when another working server exists, while an incomplete fragment cannot make clearing 0x2 activate a zero-server list
 1.0.5 - Root Flags are no longer written when no usable policy-server entry exists in scope (the CEP entry declined AND no AD Enrollment Policy row): writing PolicyServers root values there activated GP CEP configuration with zero servers, so clients lost the AD enrollment policy fleet-wide; the Auto-Enrollment write is now verified (Test-GpoEntry) and its key is included in the deletion-order damage scan (a **delvals. ordered after the AE values previously defeated autoenrollment silently while the run reported applied=True)
@@ -384,14 +385,19 @@ function Read-PolRecords {
             Start-Sleep -Milliseconds (400 * $try)
         }
     }
-    if ($b.Length -lt 8) { return $recs }
+    # An empty file holds no records (a GPO that never had a registry.pol written). Anything
+    # shorter than the 8-byte header is a truncated file, not an empty one.
+    if ($b.Length -eq 0) { return $recs }
     # [MS-GPREG] header: the 'PReg' signature followed by version 1. Anything else is not a
     # Registry.pol (or a damaged one) and is refused rather than parsed on a best-effort basis.
-    if ($b[0] -ne 0x50 -or $b[1] -ne 0x52 -or $b[2] -ne 0x65 -or $b[3] -ne 0x67 -or [BitConverter]::ToUInt32($b, 4) -ne 1) {
+    if ($b.Length -lt 8 -or $b[0] -ne 0x50 -or $b[1] -ne 0x52 -or $b[2] -ne 0x65 -or $b[3] -ne 0x67 -or [BitConverter]::ToUInt32($b, 4) -ne 1) {
         throw "registry.pol at $Path does not carry the PReg/version-1 header - not a Registry.pol file, or corrupt. Repair or re-author the GPO before using this script."
     }
     $pos = 8
     $corrupt = { throw "registry.pol at $Path appears truncated or corrupt (offset $pos). Repair or re-author the GPO before using this script." }
+    # A record is "[key;value;type;size;data]" in UTF-16LE: '[' 0x5B, ';' 0x3B, ']' 0x5D. Every
+    # framing character is checked, not skipped: a record whose separators or closing bracket
+    # are missing is not a record this script can trust.
     while ($pos -le $b.Length - 2) {
         if ([BitConverter]::ToUInt16($b, $pos) -ne 0x5B) { & $corrupt }   # every record opens with '['; trailing junk is corruption, not padding
         $pos += 2
@@ -402,7 +408,9 @@ function Read-PolRecords {
             if ($c -eq 0) { break }
             [void]$sb.Append([char]$c); $pos += 2
         }
-        $pos += 4    # NUL + ';'
+        $pos += 2    # NUL
+        if ($pos + 2 -gt $b.Length -or [BitConverter]::ToUInt16($b, $pos) -ne 0x3B) { & $corrupt }   # ';'
+        $pos += 2
         $keyName = $sb.ToString()
         $sb = New-Object System.Text.StringBuilder
         while ($true) {
@@ -411,15 +419,23 @@ function Read-PolRecords {
             if ($c -eq 0) { break }
             [void]$sb.Append([char]$c); $pos += 2
         }
-        $pos += 4
+        $pos += 2    # NUL
+        if ($pos + 2 -gt $b.Length -or [BitConverter]::ToUInt16($b, $pos) -ne 0x3B) { & $corrupt }   # ';'
+        $pos += 2
         $valName = $sb.ToString()
         if ($pos + 12 -gt $b.Length) { & $corrupt }
-        $type = [BitConverter]::ToUInt32($b, $pos); $pos += 6
-        $size = [BitConverter]::ToUInt32($b, $pos); $pos += 6
+        $type = [BitConverter]::ToUInt32($b, $pos); $pos += 4
+        if ([BitConverter]::ToUInt16($b, $pos) -ne 0x3B) { & $corrupt }   # ';'
+        $pos += 2
+        $size = [BitConverter]::ToUInt32($b, $pos); $pos += 4
+        if ([BitConverter]::ToUInt16($b, $pos) -ne 0x3B) { & $corrupt }   # ';'
+        $pos += 2
         if ($size -gt ($b.Length - $pos)) { & $corrupt }
         $data = New-Object byte[] $size
         if ($size -gt 0) { [Array]::Copy($b, $pos, $data, 0, $size) }
-        $pos += $size + 2   # data + ']'
+        $pos += $size
+        if ($pos + 2 -gt $b.Length -or [BitConverter]::ToUInt16($b, $pos) -ne 0x5D) { & $corrupt }   # ']' closes the record
+        $pos += 2
         $val = if ($valName.StartsWith('**') -and $valName -notmatch '^(?i)\*\*soft\.') {
             # A **-prefixed value name is a Group Policy INSTRUCTION (**del., **delvals., **DeleteKeys,
             # **DeleteValues, ...), not a registry value: the engine reads its data as a string
@@ -434,12 +450,14 @@ function Read-PolRecords {
         else {
             switch ($type) {
                 1 { [System.Text.Encoding]::Unicode.GetString($data).TrimEnd([char]0) }
-                4 { if ($size -ge 4) { [BitConverter]::ToUInt32($data, 0) } else { $null } }
+                4 { if ($size -eq 4) { [BitConverter]::ToUInt32($data, 0) } else { $null } }   # [MS-GPREG]: a DWORD is exactly 32 bits; a longer or shorter payload is not a DWORD
                 default { $null }
             }
         }
-        $recs.Add([pscustomobject]@{ Key = $keyName; ValueName = $valName; Type = $type; Data = $val; Index = $recs.Count })
+        $recs.Add([pscustomobject]@{ Key = $keyName; ValueName = $valName; Type = $type; Data = $val; Size = $size; Index = $recs.Count })
     }
+    # The loop stops when fewer than two bytes remain. One leftover byte is corruption too.
+    if ($pos -ne $b.Length) { & $corrupt }
     return $recs
 }
 $relBase = 'Software\Policies\Microsoft\Cryptography\PolicyServers'
@@ -463,7 +481,14 @@ function Get-PolEffectiveValues([object[]]$Recs, [string]$RelKey) {
     # guessing would let a deleted endpoint look present to the prerequisite and replacement guards.
     # Value names compare case-insensitively (registry semantics). Only the first/older record
     # would be seen by a naive first-match read - and that can be the obsolete one.
-    $values = @{}; $deleted = @{}
+    # Records = name -> the raw record that ESTABLISHED the surviving value (type field included):
+    # the literal record that wrote it last, or the **soft. record that wrote it when no value
+    # existed. A deletion removes the entry. Get-PolRawRecord reads this map, so the raw-type
+    # judgement follows exactly the replay the client performs.
+    # $keyDeleted: a **DeleteKeys that hit this key removed the KEY itself. A later literal write
+    # recreates it; a **soft. write does not (the engine soft-writes only into an existing key -
+    # LGPO author's corrections), so a soft write after the deletion leaves the value absent.
+    $values = @{}; $deleted = @{}; $records = @{}; $keyDeleted = $false
     $relLower = $RelKey.ToLowerInvariant().Trim('\')
     foreach ($r in $Recs) {
         $vn = "$($r.ValueName)"
@@ -472,17 +497,28 @@ function Get-PolEffectiveValues([object[]]$Recs, [string]$RelKey) {
             # key or an ancestor of it (then this key goes with it).
             foreach ($item in @("$($r.Data)" -split ';' | ForEach-Object { $_.Trim().Trim('\') } | Where-Object { $_ })) {
                 $i = $item.ToLowerInvariant()
-                if ($relLower -eq $i -or $relLower.StartsWith($i + '\')) { foreach ($k in @($values.Keys)) { $deleted[$k] = $true }; $values.Clear(); break }
+                if ($relLower -eq $i -or $relLower.StartsWith($i + '\')) { foreach ($k in @($values.Keys)) { $deleted[$k] = $true }; $values.Clear(); $records.Clear(); $keyDeleted = $true; break }
             }
             continue
         }
-        if ($r.Key -notmatch ('^(?i)' + [regex]::Escape($RelKey) + '$')) { continue }
+        if ($r.Key -notmatch ('^(?i)' + [regex]::Escape($RelKey) + '$')) {
+            # A plain write under a DESCENDANT key recreates this key as a missing ancestor
+            # (RegCreateKeyEx creates the whole path), so a later **soft. write into this key
+            # applies again. Instructions under the descendant do not create anything.
+            if ($keyDeleted -and -not $vn.StartsWith('**') -and "$($r.Key)".ToLowerInvariant().Trim('\').StartsWith($relLower + '\')) { $keyDeleted = $false }
+            continue
+        }
         if ($vn.StartsWith('**')) {
             # Anchored checks, NOT -like '**del*': in -like the asterisks are wildcards, so that
             # pattern also matches an ordinary value whose name merely contains "del".
             if ($vn -match '^(?i)\*\*(comment:|securekey)') { continue }
             if ($vn -match '^(?i)\*\*soft\.(.+)$') {
-                if (-not $values.ContainsKey($Matches[1])) { $values[$Matches[1]] = $r.Data }
+                # Applies only into an EXISTING key and only when the value is absent. A value it
+                # writes survives, so it is no longer "deleted" for the ordering scan.
+                if (-not $keyDeleted -and -not $values.ContainsKey($Matches[1])) {
+                    $values[$Matches[1]] = $r.Data; $records[$Matches[1]] = $r
+                    if ($deleted.ContainsKey($Matches[1])) { $deleted.Remove($Matches[1]) }
+                }
                 continue
             }
             $targets = @()
@@ -491,14 +527,16 @@ function Get-PolEffectiveValues([object[]]$Recs, [string]$RelKey) {
             elseif ($vn -match '^(?i)\*\*deletevalues$')   { $targets = @("$($r.Data)" -split ';' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
             else { throw "registry.pol carries a policy instruction this script does not understand ('$vn' under '$($r.Key)'); refusing to reason about the GPO's effective state. Inspect the GPO in GPME before using this script." }
             foreach ($t in $targets) {
-                if ($values.ContainsKey($t)) { $values.Remove($t); $deleted[$t] = $true }
+                if ($values.ContainsKey($t)) { $values.Remove($t); $records.Remove($t); $deleted[$t] = $true }
             }
             continue
         }
         $values[$vn] = $r.Data
+        $records[$vn] = $r
+        $keyDeleted = $false   # a literal write recreates the key
         if ($deleted.ContainsKey($vn)) { $deleted.Remove($vn) }   # re-written after a deletion: it survives
     }
-    @{ Values = $values; Deleted = $deleted }
+    @{ Values = $values; Deleted = $deleted; Records = $records }
 }
 function Get-PolEntries([object[]]$Recs) {
     # One entry per 40-hex subkey, built from the EFFECTIVE values (last record wins, deletions
@@ -554,6 +592,16 @@ function Get-PolValue([object[]]$Recs, [string]$RelKey, [string]$ValueName) {
     if ($eff.ContainsKey($ValueName)) { return $eff[$ValueName] }
     return $null
 }
+function Get-PolRawRecord([object[]]$Recs, [string]$RelKey, [string]$ValueName) {
+    # The raw record that ESTABLISHES the effective value of one name under one key, or $null when
+    # a client ends up with no such value. Unlike Get-PolValue this returns the record itself,
+    # type field included: a record the parser cannot decode (Data = $null for a REG_BINARY, a
+    # REG_QWORD or a REG_DWORD whose data is not exactly 4 bytes) must not pass for an absent value.
+    # The record comes from the same replay Get-PolEffectiveValues performs ([MS-GPREG] processing
+    # rules): the last literal write wins, a **soft.<name> write applies only when no value exists
+    # at that point, and a later deletion record removes the value as it does on the client.
+    (Get-PolEffectiveValues $Recs $RelKey).Records[$ValueName]
+}
 function Test-PolDeletionOrder([object[]]$Recs, [string]$RelKey, [string]$Label) {
     # A **del./**delVals. record ORDERED AFTER a value's last record makes the client CSE write
     # the value and then delete it - it is absent on every client. Judged per value, in file
@@ -600,9 +648,52 @@ function Invoke-GPWrite {
         }
     }
 }
+function ConvertTo-PolDwordValue([object]$Value) {
+    # Converts a value read from registry.pol (root Flags, AEPolicy, ...) to the DWORD it must
+    # hold. Returns @{ Value = [int64] in 0..4294967295; Reason = '' } when usable, @{ Value =
+    # $null; Reason = '' } when $Value is $null (absent), and @{ Value = $null; Reason = why }
+    # when unusable. A REG_DWORD arrives as UInt32 from the parser or as a signed Int32 from
+    # Get-GPRegistryValue (0xFFFFFFFF reads as -1); both keep their bit pattern. A REG_SZ that
+    # spells a number converts as before. Anything else - text, an empty string, an out-of-range
+    # number - is unusable and must be refused BEFORE a write, never cast after one.
+    if ($null -eq $Value) { return @{ Value = $null; Reason = '' } }
+    if ($Value -is [int]) { return @{ Value = [int64][BitConverter]::ToUInt32([BitConverter]::GetBytes([int]$Value), 0); Reason = '' } }
+    $n = $null
+    if ($Value -is [uint32] -or $Value -is [uint16] -or $Value -is [byte] -or $Value -is [int16] -or $Value -is [sbyte] -or $Value -is [int64] -or $Value -is [uint64]) {
+        try { $n = [int64]$Value } catch { return @{ Value = $null; Reason = "the value $Value does not fit a 64-bit integer" } }
+    }
+    elseif ($Value -is [string]) {
+        if ("$Value".Trim() -eq '') { return @{ Value = $null; Reason = 'the value is an empty string, not a number' } }
+        try { $n = [int64]$Value } catch { return @{ Value = $null; Reason = "the value '$Value' is text, not a number" } }
+    }
+    else { return @{ Value = $null; Reason = "the value is of type $($Value.GetType().Name), not a number" } }
+    if ($n -lt 0 -or $n -gt 4294967295) { return @{ Value = $null; Reason = "the value $n is outside the DWORD range 0..4294967295" } }
+    @{ Value = $n; Reason = '' }
+}
+function Get-PolDwordRecordReason([object]$Rec) {
+    # '' when $Rec is $null or a record whose data ConvertTo-PolDwordValue can judge (a REG_SZ, or a
+    # REG_DWORD with its 4 data bytes); otherwise why the record cannot hold the DWORD: a type the
+    # parser does not decode (Data = $null), or a REG_DWORD whose data is not exactly 4 bytes. The parser
+    # reads both as no value, so the type field is judged here, not the decoded data.
+    if ($null -eq $Rec) { return '' }
+    $t = [int64]$Rec.Type
+    if ($t -eq 1) { return '' }
+    if ($t -eq 4) {
+        if ($null -ne $Rec.Data) { return '' }
+        $n = if ($null -ne $Rec.PSObject.Properties['Size']) { "$($Rec.Size)" } else { 'a wrong number of' }
+        return "the record is a REG_DWORD with $n data byte(s), not exactly 4"
+    }
+    $names = @{ '2' = 'REG_EXPAND_SZ'; '3' = 'REG_BINARY'; '7' = 'REG_MULTI_SZ'; '11' = 'REG_QWORD' }
+    $label = if ($names.ContainsKey("$t")) { "type $t ($($names["$t"]))" } else { "type $t" }
+    "the record is of $label, not REG_DWORD"
+}
 function Get-RootFlagsDisplay([object[]]$Recs) {
+    $reason = Get-PolDwordRecordReason (Get-PolRawRecord $Recs $relBase 'Flags')
+    if ($reason) { return "unusable: $reason" }
     $v = Get-PolValue $Recs $relBase 'Flags'
-    if ($null -ne $v) { '0x{0:X}' -f [int64]$v } else { '(absent)' }
+    if ($null -eq $v) { return '(absent)' }
+    $conv = ConvertTo-PolDwordValue $v
+    if ($conv.Reason) { "unusable: $($conv.Reason)" } else { '0x{0:X}' -f $conv.Value }
 }
 
 $preRecs = Read-PolRecords -Path $polPath
@@ -687,6 +778,23 @@ if (-not $NoClientId)      { $flags = $flags -bor 0x4  }  # PsfUseClientId (GPME
 if ($AllowUntrustedIssuer) { $flags = $flags -bor 0x20 }  # PsfAllowUnTrustedCA
 
 $entryApplied = $false; $adRow = 'pending'; $defaultChanged = $false; $aeApplied = $false; $dupRemoved = @()
+
+# ---- 0a. the existing root Flags must be a usable DWORD - checked BEFORE any write ----------
+# Step 3 preserves the existing bits of the root Flags, so it needs the value as a number. A
+# value another tool left there as text (a REG_SZ 'abc') cannot be preserved, and the failure must
+# not surface as a raw cast error after steps 1 and 2 have already written to the GPO. The parser
+# reads a record of another type (a REG_BINARY, a REG_QWORD) or a REG_DWORD with fewer than 4
+# data bytes as no value, so the effective value alone would pass such a record for an absent one
+# that step 3 then overwrites. The raw record that establishes the value on the client (same
+# replay as the effective view: last literal write, soft write only into an absent value, a
+# later deletion removes it) is judged first.
+$existingRootReason = Get-PolDwordRecordReason (Get-PolRawRecord $preRecs $relBase 'Flags')
+$existingRoot = Get-PolValue $preRecs $relBase 'Flags'
+$existingRootConv = ConvertTo-PolDwordValue $existingRoot
+if (-not $existingRootReason) { $existingRootReason = $existingRootConv.Reason }
+if ($existingRootReason) {
+    throw "The existing root Flags value on $baseKey in $gpoLabel is not a usable DWORD ($existingRootReason). Nothing was written. Repair the value in GPME, or delete it with Remove-GPRegistryValue, then run the script again."
+}
 
 # ---- 0. prerequisite for the AD enrollment policy row - resolved BEFORE any write ----------
 # A GPO that delivers a CEP entry but no LDAP: row takes the AD enrollment policy away from every
@@ -854,8 +962,8 @@ foreach ($e in @(Get-PolEntries $preRecs)) {
 $policyServerPresent = $entryExists -or ($adRow -eq 'applied') -or $anyUsableServer
 
 # ---- 3. root Flags (DISABLE bits; existing bits preserved; bit-safe for high-bit values) ---
-$existingRoot = Get-PolValue $preRecs $relBase 'Flags'
-$newRoot = if ($null -ne $existingRoot) { [int64]$existingRoot } else { [int64]0 }
+# $existingRoot was read and validated in step 0a, before the first write.
+$newRoot = if ($null -ne $existingRoot) { [int64]$existingRootConv.Value } else { [int64]0 }
 if ($newRoot -band 0x2) {
     Write-Warning 'Existing root Flags had bit 0x2 set (clients IGNORE the GP-provided policy list). Clearing it.'
     $newRoot = $newRoot -band (-bnot [int64]0x2)
@@ -866,8 +974,8 @@ $rootApplied = 'unchanged'
 if (-not $policyServerPresent -and -not $WhatIfPreference) {
     $notes.Add("Root Flags NOT written: no usable policy-server entry exists in this GPO scope (the CEP entry was declined and there is no AD Enrollment Policy row). Writing PolicyServers root values would activate GP CEP configuration with no server, and clients in scope would lose the AD enrollment policy.")
 }
-elseif (($null -eq $existingRoot) -or ([int64]$existingRoot -ne $newRoot)) {
-    $from = if ($null -ne $existingRoot) { '0x{0:X}' -f [int64]$existingRoot } else { '(absent)' }
+elseif (($null -eq $existingRoot) -or ($existingRootConv.Value -ne $newRoot)) {
+    $from = if ($null -ne $existingRoot) { '0x{0:X}' -f $existingRootConv.Value } else { '(absent)' }
     $rootApplied = 'not run'
     if ($PSCmdlet.ShouldProcess($gpoLabel, ('Set root Flags {0} -> 0x{1:X} on {2} (disable bits: 0x2 ignore GP list, 0x4 ignore user-configured)' -f $from, $newRoot, $baseKey))) {
         Invoke-GPWrite { Set-GPRegistryValue @wr -Confirm:$false -Key $baseKey -ValueName Flags -Type DWord -Value ([uint32]$newRoot) | Out-Null }
@@ -897,7 +1005,8 @@ if ($EnableAutoEnrollmentPolicy) {
     $oldAe = Get-PolValue $preRecs $relAe 'AEPolicy'
     $oldPct = Get-PolValue $preRecs $relAe 'OfflineExpirationPercent'
     $oldStore = Get-PolValue $preRecs $relAe 'OfflineExpirationStoreNames'
-    if (($null -ne $oldAe -and [int64]$oldAe -ne $AEPolicy) -or ($null -ne $oldPct -and [int64]$oldPct -ne $AEExpirationPercent) -or ($null -ne $oldStore -and "$oldStore" -cne $AEStore)) {
+    # An existing value that is not a usable DWORD counts as different: the write replaces it.
+    if (($null -ne $oldAe -and (ConvertTo-PolDwordValue $oldAe).Value -ne $AEPolicy) -or ($null -ne $oldPct -and (ConvertTo-PolDwordValue $oldPct).Value -ne $AEExpirationPercent) -or ($null -ne $oldStore -and "$oldStore" -cne $AEStore)) {
         Write-Warning ("This GPO already carries Auto-Enrollment settings (AEPolicy={0}, {1}%, '{2}') which will be changed to (AEPolicy={3}, {4}%, '{5}')." -f $oldAe, $oldPct, $oldStore, $AEPolicy, $AEExpirationPercent, $AEStore)
     }
     if ($PSCmdlet.ShouldProcess($gpoLabel, "Enable Auto-Enrollment under $aeKey (AEPolicy=$AEPolicy, notify at $AEExpirationPercent% on '$AEStore')")) {
@@ -947,6 +1056,11 @@ foreach ($d in $dups) {
                 continue
             }
             Invoke-GPWrite -TolerateNotFound { Remove-GPRegistryValue @wr -Confirm:$false -Key "$baseKey\$($d.Key)" | Out-Null }
+            # Verified from registry.pol on the write DC, as -Remove does: a removal the cmdlet
+            # did not perform must not be reported in DuplicatesRemoved.
+            if (Test-EntryRecordsPresent (Read-PolRecords -Path $polPath) "$relBase\$($d.Key)") {
+                throw "Removal of superseded entry $baseKey\$($d.Key) did not take effect in $gpoLabel (registry.pol still carries records for the key)."
+            }
             $dupRemoved += $d.URL
         }
     } else {
