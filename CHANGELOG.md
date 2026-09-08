@@ -8,7 +8,7 @@ Each script also carries its own version in the `PSScriptInfo` header at the top
 Test-ScriptFileInfo .\Submit-CertificateRequests.ps1 | Select-Object Name, Version
 ```
 
-## [Unreleased]
+## [1.0.12] — 2026-09-08
 
 A coverage audit of the four scripts other than Submit-CertificateRequests.ps1 measured which lines the Unit, Guard and Lab tiers execute. It found three defects in code that no tier had ever run, and it listed the branches that the Lab tier does not reach. This release fixes the defects and adds tests for those branches.
 
@@ -381,6 +381,7 @@ Initial release.
 | Add-CertificateEnrollmentPolicyServerOffline.ps1 | 1.0.0 |
 | Add-CertificateEnrollmentPolicyServerToGpo.ps1 | 1.0.0 |
 
+[1.0.12]: https://github.com/TheOmnilord/ADCS/compare/v1.0.11...v1.0.12
 [1.0.11]: https://github.com/TheOmnilord/ADCS/compare/v1.0.10...v1.0.11
 [1.0.10]: https://github.com/TheOmnilord/ADCS/compare/v1.0.9...v1.0.10
 [1.0.9]: https://github.com/TheOmnilord/ADCS/compare/v1.0.8...v1.0.9
