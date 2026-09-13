@@ -37,3 +37,10 @@ program; this is a best-effort, community-maintained project.
 
 The latest commit on `main` is the supported version. Fixes are applied there; there is no
 long-term-support branch.
+
+## References
+
+- [Certificate substitution risks in the output folder](./Certificate-Substitution-Risks.md) —
+  the threat model behind the `-AllowUnprotectedOutputFolder` CAUTION in
+  `Submit-CertificateRequests.ps1`: how an altered or redirected `.cer` causes a denial of
+  service for identity use, and a silent trust compromise for public-object use.
