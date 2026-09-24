@@ -1374,5 +1374,64 @@ RequestType = PKCS10
             ($row.ErrorMessage + $r.Output) | Should -Match '0x80094800|UNSUPPORTED_CERT_TYPE|not supported'
             $r.Output | Should -Match 'CATemplates'   # the actionable part of the friendly hint
         }
+
+        Context 'content-tested request files (.pem and -AnyExtension)' {
+            BeforeAll {
+                # Two live CSRs from certreq -new (tracked key containers and request-store entries,
+                # so the tier teardown removes them), rewritten into the new forms:
+                #   <prefix>-pem.pem : PEM with the OpenSSL header ("CERTIFICATE REQUEST")
+                #   <prefix>-der     : binary DER, no extension
+                # plus two decoys that must never reach the CA: a private-key-shaped .pem and a
+                # certificate (DER) with no extension.
+                $script:PemDir = Join-Path $TestDrive 'pem-input'
+                New-Item -ItemType Directory -Force $script:PemDir | Out-Null
+                script:New-LabCsr -BaseName "$script:Prefix-pem" -OutDir $script:PemDir
+                script:New-LabCsr -BaseName "$script:Prefix-der" -OutDir $script:PemDir
+
+                $pemReq = Join-Path $script:PemDir "$script:Prefix-pem.req"
+                $text = (Get-Content -LiteralPath $pemReq -Raw) -replace 'NEW CERTIFICATE REQUEST', 'CERTIFICATE REQUEST'
+                [System.IO.File]::WriteAllText((Join-Path $script:PemDir "$script:Prefix-pem.pem"), $text)
+                Remove-Item -LiteralPath $pemReq
+
+                $derReq = Join-Path $script:PemDir "$script:Prefix-der.req"
+                $out = certutil -f -decode $derReq (Join-Path $script:PemDir "$script:Prefix-der") 2>&1 | Out-String
+                if ($LASTEXITCODE -ne 0) { throw "certutil -decode failed: $out" }
+                Remove-Item -LiteralPath $derReq
+
+                [System.IO.File]::WriteAllText((Join-Path $script:PemDir "$script:Prefix-key.pem"), "-----BEGIN PRIVATE KEY-----`nAAAA`n-----END PRIVATE KEY-----`n")
+                $issued = @(Get-ChildItem -LiteralPath $script:CertDir -Filter '*.cer' | Select-Object -First 1)
+                $issued.Count | Should -Be 1 -Because 'the earlier tests delivered certificates to use as a decoy'
+                Copy-Item -LiteralPath $issued[0].FullName -Destination (Join-Path $script:PemDir "$script:Prefix-issued")
+            }
+
+            It 'without -AnyExtension only the .pem CSR is selected (a -WhatIf run submits nothing)' {
+                $before = @(Import-Csv $script:Tracking).Count
+                $r = script:Invoke-Submit @{ InputPath = $script:PemDir; CertificateTemplate = $LabTemplate; Mode = 'Submit'; WhatIf = $true }
+                $r.Rows.Count | Should -Be $before -Because '-WhatIf never writes the tracking file'
+                # "What if:" lines go to the host, not to a stream Invoke-Submit captures, so the
+                # selection is judged from the logged count and the skip warnings.
+                $r.Output | Should -Match 'Found 1 request file\(s\)' -Because 'only the .pem CSR qualifies: the key .pem fails the content test, and the extensionless files need -AnyExtension'
+                $r.Output | Should -Match ([regex]::Escape("Skipping (not a PKCS #10 certificate request): $script:Prefix-key.pem"))
+                $r.Output | Should -Not -Match ([regex]::Escape("$script:Prefix-der")) -Because 'without -AnyExtension a file with no known extension is not even tested'
+            }
+
+            It '-AnyExtension submits the .pem and the extensionless DER CSR, the CA issues both, and the decoys never reach the CA' {
+                $before = @(Import-Csv $script:Tracking)
+                $r = script:Invoke-Submit @{ InputPath = $script:PemDir; CertificateTemplate = $LabTemplate; Mode = 'Submit'; AnyExtension = $true }
+                $new = @($r.Rows | Where-Object { $_.RequestFile -notin $before.RequestFile })
+                @($new.RequestFile | ForEach-Object { [System.IO.Path]::GetFileName($_) } | Sort-Object) |
+                    Should -Be @("$script:Prefix-der", "$script:Prefix-pem.pem")
+                foreach ($row in $new) {
+                    $row.Status | Should -BeExactly 'Issued'
+                    $row.RequestID | Should -Match '^\d+$'
+                    Test-Path -LiteralPath $row.OutputCertFile | Should -BeTrue
+                    $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($row.OutputCertFile)
+                    $cert.Subject | Should -BeExactly ('CN=' + [System.IO.Path]::GetFileNameWithoutExtension($row.RequestFile))
+                }
+                foreach ($decoy in "$script:Prefix-key.pem", "$script:Prefix-issued") {
+                    $r.Output | Should -Match ([regex]::Escape("Skipping (not a PKCS #10 certificate request): $decoy"))
+                }
+            }
+        }
     }
 }
