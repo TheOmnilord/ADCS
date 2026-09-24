@@ -8,7 +8,9 @@ Each script also carries its own version in the `PSScriptInfo` header at the top
 Test-ScriptFileInfo .\Submit-CertificateRequests.ps1 | Select-Object Name, Version
 ```
 
-## [Unreleased]
+## [1.0.13] — 2026-09-24
+
+This release adds `.pem` request files and a content test for CSR files to Submit-CertificateRequests.ps1. The other scripts are unchanged.
 
 ### Added
 
@@ -18,6 +20,20 @@ Test-ScriptFileInfo .\Submit-CertificateRequests.ps1 | Select-Object Name, Versi
   - With `-AnyExtension` the script applies the same content test to every file in the drop folder, whatever its extension. The script submits each file that passes and skips the other files with a warning. So the tracking file, a log file, a certificate or a private key in the folder never goes to the CA.
   - The content test does not accept a Certificate Management over CMS (CMC) request or a PKCS #7 request. Submit such a request as a `.req` file without `-AnyExtension`.
   - Without `-AnyExtension` the script submits `.req`, `.csr` and `.txt` files as before, with no content test.
+
+### Added - tests
+
+- Submit-CertificateRequests.
+  - Unit: the content test accepts a CSR in PEM format with each header, in Base64 without a header, in binary DER and in UTF-16 PEM. It refuses a certificate, a CSV file, an empty file and a file larger than 1 MB. File selection is tested with and without `-AnyExtension`.
+  - Lab: the suite converts two live CSRs into a `.pem` file and a DER file with no extension. It puts a private-key `.pem` file and a certificate next to them. A `-WhatIf` run without `-AnyExtension` selects only the `.pem` CSR. A run with `-AnyExtension` gets both CSRs issued, and the other two files never go to the CA.
+
+| Script | Version |
+|---|---|
+| Set-ADCSTemplateValidity.ps1 | 1.0.6 |
+| Submit-CertificateRequests.ps1 | **1.1.0** |
+| Sync-ADCSTemplate.ps1 | 1.0.8 |
+| Add-CertificateEnrollmentPolicyServerOffline.ps1 | 1.0.8 |
+| Add-CertificateEnrollmentPolicyServerToGpo.ps1 | 1.0.8 |
 
 ## [1.0.12] — 2026-09-08
 
@@ -392,7 +408,7 @@ Initial release.
 | Add-CertificateEnrollmentPolicyServerOffline.ps1 | 1.0.0 |
 | Add-CertificateEnrollmentPolicyServerToGpo.ps1 | 1.0.0 |
 
-[Unreleased]: https://github.com/TheOmnilord/ADCS/compare/v1.0.12...HEAD
+[1.0.13]: https://github.com/TheOmnilord/ADCS/compare/v1.0.12...v1.0.13
 [1.0.12]: https://github.com/TheOmnilord/ADCS/compare/v1.0.11...v1.0.12
 [1.0.11]: https://github.com/TheOmnilord/ADCS/compare/v1.0.10...v1.0.11
 [1.0.10]: https://github.com/TheOmnilord/ADCS/compare/v1.0.9...v1.0.10
