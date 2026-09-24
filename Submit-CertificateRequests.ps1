@@ -1,11 +1,12 @@
 <#PSScriptInfo
-.VERSION 1.0.12
+.VERSION 1.1.0
 .GUID 6f98f16e-0c56-4a72-ba31-443938175c06
 .AUTHOR Sveinung Svea
 .PROJECTURI https://github.com/TheOmnilord/ADCS
 .LICENSEURI https://github.com/TheOmnilord/ADCS/blob/main/LICENSE
 .TAGS ADCS PKI CertificateServices
 .RELEASENOTES
+1.1.0 - The drop folder also accepts .pem files: a .pem file is submitted only when its content decodes as a PKCS #10 certificate request (PEM with or without the header, or binary DER), because a .pem file often holds a certificate or a private key; any other .pem file is skipped with a warning. New -AnyExtension switch: every file in the drop folder, whatever its extension, gets the same content test and is submitted only when it passes. .req/.csr/.txt files without -AnyExtension are submitted as before, with no content test
 1.0.12 - Help text only: the .NOTES now document the per-request checkpoint that 1.0.11 restored - the script writes the tracking file after EVERY request (not only at the end), so a crash mid-batch keeps every RequestID the CA already accepted and a later run resumes without resubmitting; each write replaces the file in one step. No code change
 1.0.11 - Export-TrackingData writes the tracking-file checkpoint again: File.Replace's optional backup-file argument is now passed as [NullString]::Value, not a bare $null (PowerShell marshals a bare $null for a [string] parameter as an EMPTY string, which File.Replace rejects - "The path is not of a legal form." on 5.1, "The path is empty." on 7). Every checkpoint after the FIRST takes the File.Replace branch (the tracking file now exists), so this threw and aborted any multi-file batch on its second request, and every Retrieve or resume run against an existing tracking file, AFTER the CA had already issued - risking the duplicate resubmission the tracking file exists to prevent. First single-file runs (File.Move branch) were unaffected, which hid it. Bug present since 1.0.2; a unit test now exercises the File.Replace (existing-file) branch
 1.0.10 - Help text only: the comment-based help is rewritten to the repository writing style (STYLE.md, derived from ASD-STE100 Simplified Technical English) - short sentences, active voice, no figurative language, acronyms defined, a CAUTION line on -Force and -AllowUnprotectedOutputFolder; every fact, condition and default is kept; no code change
@@ -28,15 +29,32 @@
 
 .DESCRIPTION
     The script submits certificate requests to an Active Directory Certificate Services (AD CS)
-    certification authority (CA). It takes every .req, .csr and .txt file in one folder and
+    certification authority (CA). It takes every .req, .csr, .txt and .pem file in one folder and
     submits each file with certreq.exe. The script records the RequestID of each request in a
     comma-separated values (CSV) tracking file. On a later run the script can retrieve the issued
     certificates with the recorded RequestIDs.
 
 .PARAMETER InputPath
-    The folder that holds the .req, .csr and .txt request files to submit.
+    The folder that holds the .req, .csr, .txt and .pem request files to submit.
     The parameter is required when -Mode is Submit or Both.
     The script does not use it, and does not require it, when -Mode is Retrieve.
+
+    The script submits a .req, .csr or .txt file without a content test. A .pem file often holds a
+    certificate or a private key. So the script submits a .pem file only when its content is a
+    Public-Key Cryptography Standards (PKCS) #10 certificate signing request (CSR). The script skips
+    every other .pem file and writes a warning. The script ignores files with other extensions,
+    unless you pass -AnyExtension.
+
+.PARAMETER AnyExtension
+    With -AnyExtension the script treats every file in the -InputPath folder as a possible CSR,
+    whatever its extension. The script tests the content of each file. It submits the file only
+    when the content is a PKCS #10 CSR. The script skips every other file and writes a warning.
+
+    The test accepts a CSR in Privacy-Enhanced Mail (PEM) format, with or without the BEGIN
+    header. It also accepts a CSR in binary Distinguished Encoding Rules (DER) format. The test
+    does not accept a Certificate Management over CMS (CMC) request or a PKCS #7 request. Submit
+    such a request as a .req file without -AnyExtension. The test also refuses an empty file and a file larger than
+    1 MB. The script does not use the switch when -Mode is Retrieve.
 
 .PARAMETER CAConfig
     The CA configuration string that the script passes to certreq, for example
@@ -127,6 +145,14 @@
     issued certificates to the default output folder .\Certificates.
 
 .EXAMPLE
+    .\Submit-CertificateRequests.ps1 -InputPath "C:\CSRs" `
+        -CAConfig "CA01.domain.com\Contoso Issuing CA 1" `
+        -CertificateTemplate "WebServer" -AnyExtension
+
+    Tests every file in C:\CSRs, whatever its extension, and submits each file that holds a
+    PKCS #10 CSR. The script skips the other files and writes a warning for each.
+
+.EXAMPLE
     .\Submit-CertificateRequests.ps1 -CAConfig "CA01.domain.com\Contoso Issuing CA 1" -Mode Retrieve
 
     Retrieves the issued certificates for every unresolved request in the tracking file. The
@@ -209,8 +235,8 @@
       with the -CAConfig of the run when it retrieves the row.
     - The script allocates the certificate file names before it submits anything. Each name must
       be unique within the batch and against the destinations already recorded for other request
-      files. For example, prod.req, prod.csr and prod.req.txt never share a .cer file. An
-      unresolvable clash stops the run before any submission.
+      files. For example, prod.req, prod.csr, prod.pem and prod.req.txt never share a .cer file.
+      An unresolvable clash stops the run before any submission.
     - Exit code. A run ends with a terminating error when any request failed or needs attention.
       That means a row with Status Error, Denied, Undelivered or Unknown, or a Retrieve row that
       the script skipped as invalid. The error comes after the summary and the final checkpoint.
@@ -280,6 +306,8 @@ param(
     [string]$Mode = "Submit",
 
     [switch]$KeepRspFile,
+
+    [switch]$AnyExtension,
 
     [switch]$Force,
 
@@ -914,8 +942,41 @@ function Test-CAConnectivity {
     }
 }
 
+function Test-CertificateRequestFile {
+    # True when the file decodes as a PKCS #10 certificate request: PEM with or without the BEGIN
+    # header (certreq -new writes "NEW CERTIFICATE REQUEST", OpenSSL writes "CERTIFICATE
+    # REQUEST"), or binary DER. CertEnroll does the decoding, so the test matches what Windows
+    # itself accepts. A certificate, a private key, a PKCS #7 .rsp, the tracking CSV or a log file
+    # does not decode, so it is never sent to the CA. Any read or decode failure means "not a
+    # request". The size cap stops the test from reading a large unrelated file into memory.
+    param([Parameter(Mandatory)][System.IO.FileInfo]$File)
+
+    if ($File.Length -eq 0 -or $File.Length -gt 1MB) { return $false }
+    try { $bytes = [System.IO.File]::ReadAllBytes($File.FullName) } catch { return $false }
+
+    $attempts = [System.Collections.Generic.List[object]]::new()
+    # Text first: the reader honours a UTF-8 or UTF-16 byte order mark. 6 = XCN_CRYPT_STRING_BASE64_ANY
+    # (Base64 with or without a header).
+    $reader = New-Object System.IO.StreamReader((New-Object System.IO.MemoryStream(, $bytes)), [System.Text.Encoding]::UTF8, $true)
+    try { $attempts.Add(@($reader.ReadToEnd(), 6)) } finally { $reader.Dispose() }
+    # Binary DER starts with an ASN.1 SEQUENCE tag. 1 = XCN_CRYPT_STRING_BASE64 (headerless).
+    if ($bytes[0] -eq 0x30) { $attempts.Add(@([Convert]::ToBase64String($bytes), 1)) }
+
+    foreach ($attempt in $attempts) {
+        $pkcs10 = $null
+        try {
+            $pkcs10 = New-Object -ComObject X509Enrollment.CX509CertificateRequestPkcs10
+            $pkcs10.InitializeDecode($attempt[0], $attempt[1])
+            return $true
+        }
+        catch { Write-Verbose "Not a PKCS #10 request as encoding $($attempt[1]): $($File.Name)" }
+        finally { if ($pkcs10) { [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($pkcs10) } }
+    }
+    return $false
+}
+
 function Get-RequestFiles {
-    param([string]$Path)
+    param([string]$Path, [switch]$AnyExtension)
 
     # A misconfigured drop folder is an error, not an empty batch: returning @() here read as
     # "Nothing to submit" and a scheduled run exited 0 with a reachable CA and no work done. An
@@ -934,16 +995,32 @@ function Get-RequestFiles {
     # $_.Extension, not -Filter '*.req': Win32 wildcard matching treats '*.req' as any extension
     # BEGINNING with 'req', so a leftover backup (prod.reqbak, prod.request) would be submitted to
     # the CA as if it were a request. $_.Extension is the true extension; -in is case-insensitive.
-    $files = @(Get-ChildItem -LiteralPath $Path -File | Where-Object { $_.Extension -in '.req', '.csr', '.txt' })
+    # .req/.csr/.txt are submitted as they are (certreq also accepts CMC and PKCS #7 requests in
+    # them). .pem is a general container that often holds a certificate or a private key, so a
+    # .pem file is submitted only when its content decodes as a PKCS #10 request. -AnyExtension
+    # applies that content test to every file in the folder, whatever its extension.
+    $candidates = @(Get-ChildItem -LiteralPath $Path -File)
+    $files = @(foreach ($f in $candidates) {
+        $test = $AnyExtension -or $f.Extension -eq '.pem'
+        if (-not $test) {
+            if ($f.Extension -in '.req', '.csr', '.txt') { $f }
+            continue
+        }
+        if (Test-CertificateRequestFile -File $f) { $f }
+        else { Write-BatchLog "Skipping (not a PKCS #10 certificate request): $($f.Name)" -Level Warning }
+    })
 
     if ($files.Count -eq 0) {
-        Write-BatchLog "No .req/.csr/.txt files found in: $Path" -Level Warning
+        $wanted = if ($AnyExtension) { 'certificate request' } else { '.req/.csr/.txt/.pem' }
+        Write-BatchLog "No $wanted files found in: $Path" -Level Warning
         $other = @(Get-ChildItem -LiteralPath $Path -File -ErrorAction SilentlyContinue)
         if ($other.Count -gt 0) {
             $sample = ($other | Select-Object -First 5 -ExpandProperty Name) -join ', '
             $suffix = if ($other.Count -gt 5) { ", ..." } else { '' }
             Write-BatchLog "  Folder contains $($other.Count) other file(s): $sample$suffix" -Level Warning
-            Write-BatchLog "  Rename them to .req/.csr/.txt or move CSRs into this folder." -Level Warning
+            if (-not $AnyExtension) {
+                Write-BatchLog "  Rename them to .req/.csr/.txt/.pem, pass -AnyExtension, or move CSRs into this folder." -Level Warning
+            }
         }
         else {
             Write-BatchLog "  Folder is empty." -Level Warning
@@ -1620,7 +1697,7 @@ try {   # the lock is released in the finally at the end of the run, on every ex
 
     # Submit mode
     if ($Mode -in 'Submit', 'Both') {
-        $requestFiles = @(Get-RequestFiles -Path $InputPath)
+        $requestFiles = @(Get-RequestFiles -Path $InputPath -AnyExtension:$AnyExtension)
 
         if ($requestFiles.Count -eq 0) {
             Write-BatchLog "Nothing to submit. Skipping Submit phase." -Level Warning

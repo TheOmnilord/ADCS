@@ -8,6 +8,17 @@ Each script also carries its own version in the `PSScriptInfo` header at the top
 Test-ScriptFileInfo .\Submit-CertificateRequests.ps1 | Select-Object Name, Version
 ```
 
+## [Unreleased]
+
+### Added
+
+- **Submit-CertificateRequests.ps1 → 1.1.0.** The drop folder now also accepts `.pem` files, and a new `-AnyExtension` switch reads files of any extension.
+  - A `.pem` file often holds a certificate or a private key. So the script submits a `.pem` file only when its content is a Public-Key Cryptography Standards (PKCS) #10 certificate signing request (CSR). The script skips every other `.pem` file and writes a warning.
+  - The content test accepts a CSR in Privacy-Enhanced Mail (PEM) format, with or without the BEGIN header. It also accepts a CSR in binary Distinguished Encoding Rules (DER) format. The Windows certificate enrollment component (CertEnroll) decodes the file. The test refuses an empty file and a file larger than 1 MB.
+  - With `-AnyExtension` the script applies the same content test to every file in the drop folder, whatever its extension. The script submits each file that passes and skips the other files with a warning. So the tracking file, a log file, a certificate or a private key in the folder never goes to the CA.
+  - The content test does not accept a Certificate Management over CMS (CMC) request or a PKCS #7 request. Submit such a request as a `.req` file without `-AnyExtension`.
+  - Without `-AnyExtension` the script submits `.req`, `.csr` and `.txt` files as before, with no content test.
+
 ## [1.0.12] — 2026-09-08
 
 A coverage audit of the four scripts other than Submit-CertificateRequests.ps1 measured which lines the Unit, Guard and Lab tiers execute. It found three defects in code that no tier had ever run, and it listed the branches that the Lab tier does not reach. This release fixes the defects and adds tests for those branches.
@@ -381,6 +392,7 @@ Initial release.
 | Add-CertificateEnrollmentPolicyServerOffline.ps1 | 1.0.0 |
 | Add-CertificateEnrollmentPolicyServerToGpo.ps1 | 1.0.0 |
 
+[Unreleased]: https://github.com/TheOmnilord/ADCS/compare/v1.0.12...HEAD
 [1.0.12]: https://github.com/TheOmnilord/ADCS/compare/v1.0.11...v1.0.12
 [1.0.11]: https://github.com/TheOmnilord/ADCS/compare/v1.0.10...v1.0.11
 [1.0.10]: https://github.com/TheOmnilord/ADCS/compare/v1.0.9...v1.0.10

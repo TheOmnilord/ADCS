@@ -75,7 +75,7 @@ Describe 'Submit-CertificateRequests' {
         foreach ($name in 'Resolve-FullPath', 'Resolve-TrackingFilePath', 'Assert-NoReparsePointAt', 'New-CertreqCaptureFile', 'Assert-UnambiguousPathComponents', 'ConvertTo-ExtendedPath', 'New-ProtectedDirectory', 'Assert-SafeNativeArgument', 'Assert-CertificateOutputPath', 'Assert-ProtectedDirectoryChain', 'Move-StaleCertificateAside', 'Remove-AsideIfIdentical', 'Move-RetrievedCertificate', 'New-TempCertificatePath',
                           'Get-TrustedPrincipalSet', 'ConvertTo-PrincipalLabel', 'Get-UntrustedGrant', 'Get-UntrustedOwner',
                           'Write-BatchLog', 'Get-RequestIdFromOutput', 'Get-DispositionFromOutput',
-                          'Get-FriendlyErrorHint', 'Import-TrackingData', 'Export-TrackingData', 'Remove-RspFile', 'Resolve-CertificateOutputNames', 'Get-DestinationOwnerConflict', 'Get-RequestFiles') {
+                          'Get-FriendlyErrorHint', 'Import-TrackingData', 'Export-TrackingData', 'Remove-RspFile', 'Resolve-CertificateOutputNames', 'Get-DestinationOwnerConflict', 'Get-RequestFiles', 'Test-CertificateRequestFile') {
             $def = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name }, $false)
             if ($def) { . ([scriptblock]::Create($def[0].Extent.Text)) }
         }
@@ -395,6 +395,97 @@ Describe 'Submit-CertificateRequests' {
             @($files | ForEach-Object { $_.Name } | Sort-Object) | Should -Be (@('a.req', 'b.csr', 'note.txt') | Sort-Object) -Because 'the folder is read with -LiteralPath (not globbed as a character class) and only exact extensions match'
             $files.Name | Should -Not -Contain 'a.reqbak' -Because "-Filter '*.req' would match this backup, submitting it to the CA"
             $files.Name | Should -Not -Contain 'c.request'
+        }
+
+        Context 'CSR content test (.pem files and -AnyExtension)' {
+            BeforeAll {
+                # A real PKCS #10 request from an in-memory key: no key container, no store entry.
+                $rsa = [System.Security.Cryptography.RSA]::Create(2048)
+                $req = New-Object System.Security.Cryptography.X509Certificates.CertificateRequest('CN=PESTER-CSR', $rsa,
+                    [System.Security.Cryptography.HashAlgorithmName]::SHA256, [System.Security.Cryptography.RSASignaturePadding]::Pkcs1)
+                $script:CsrDer = $req.CreateSigningRequest()
+                $b64 = [Convert]::ToBase64String($script:CsrDer, 'InsertLineBreaks')
+                $script:CsrPemNew = "-----BEGIN NEW CERTIFICATE REQUEST-----`r`n$b64`r`n-----END NEW CERTIFICATE REQUEST-----`r`n"
+                $script:CsrPemSsl = "-----BEGIN CERTIFICATE REQUEST-----`n$b64`n-----END CERTIFICATE REQUEST-----`n"
+                $cert = $req.CreateSelfSigned([DateTimeOffset]::Now, [DateTimeOffset]::Now.AddDays(1))
+                $script:CertPem = "-----BEGIN CERTIFICATE-----`n" + [Convert]::ToBase64String($cert.RawData, 'InsertLineBreaks') + "`n-----END CERTIFICATE-----`n"
+                $script:CertDer = $cert.RawData
+                $cert.Dispose(); $rsa.Dispose()
+
+                function New-DropFile([string]$Dir, [string]$Name, $Content) {
+                    $p = Join-Path $Dir $Name
+                    if ($Content -is [byte[]]) { [System.IO.File]::WriteAllBytes($p, $Content) }
+                    else { [System.IO.File]::WriteAllText($p, [string]$Content) }
+                    Get-Item -LiteralPath $p
+                }
+            }
+
+            It 'Test-CertificateRequestFile accepts a PKCS #10 request as <Case>' -TestCases @(
+                @{ Case = 'PEM with the certreq header'; Kind = 'PemNew' }
+                @{ Case = 'PEM with the OpenSSL header'; Kind = 'PemSsl' }
+                @{ Case = 'headerless Base64';           Kind = 'Bare' }
+                @{ Case = 'binary DER';                  Kind = 'Der' }
+                @{ Case = 'UTF-16 PEM with a BOM';       Kind = 'Utf16' }
+            ) {
+                param($Case, $Kind)
+                $dir = Join-Path $TestDrive "ok-$Kind"; [void][System.IO.Directory]::CreateDirectory($dir)
+                $content = switch ($Kind) {
+                    'PemNew' { $script:CsrPemNew }
+                    'PemSsl' { $script:CsrPemSsl }
+                    'Bare'   { [Convert]::ToBase64String($script:CsrDer) }
+                    'Der'    { , $script:CsrDer }   # the comma keeps switch from unrolling the byte[]
+                    'Utf16'  { , [byte[]]([System.Text.Encoding]::Unicode.GetPreamble() + [System.Text.Encoding]::Unicode.GetBytes($script:CsrPemSsl)) }
+                }
+                Test-CertificateRequestFile -File (New-DropFile -Dir $dir -Name 'r.pem' -Content $content) | Should -BeTrue
+            }
+
+            It 'Test-CertificateRequestFile refuses <Case>' -TestCases @(
+                @{ Case = 'a PEM certificate';      Kind = 'CertPem' }
+                @{ Case = 'a DER certificate';      Kind = 'CertDer' }
+                @{ Case = 'a tracking CSV';         Kind = 'Csv' }
+                @{ Case = 'an empty file';          Kind = 'Empty' }
+                @{ Case = 'a file larger than 1 MB'; Kind = 'Large' }
+            ) {
+                param($Case, $Kind)
+                $dir = Join-Path $TestDrive "bad-$Kind"; [void][System.IO.Directory]::CreateDirectory($dir)
+                $content = switch ($Kind) {
+                    'CertPem' { $script:CertPem }
+                    'CertDer' { , $script:CertDer }
+                    'Csv'     { "RequestFile,RequestID`r`nC:\in\a.req,5`r`n" }
+                    'Empty'   { '' }
+                    'Large'   { $script:CsrPemNew + ('#' * 1MB) }
+                }
+                Test-CertificateRequestFile -File (New-DropFile -Dir $dir -Name 'r.pem' -Content $content) | Should -BeFalse
+            }
+
+            It 'Get-RequestFiles takes a .pem file only when it holds a CSR, and submits .req/.csr/.txt without the test' {
+                $dir = Join-Path $TestDrive 'pem-drop'; [void][System.IO.Directory]::CreateDirectory($dir)
+                [void](New-DropFile -Dir $dir -Name 'web.pem' -Content $script:CsrPemSsl)
+                [void](New-DropFile -Dir $dir -Name 'cert.pem' -Content $script:CertPem)
+                [void](New-DropFile -Dir $dir -Name 'legacy.req' -Content 'x')
+                [void](New-DropFile -Dir $dir -Name 'noext' -Content $script:CsrPemNew)
+                $script:SuppressLogFile = $true
+                try { $files = @(Get-RequestFiles -Path $dir 3>$null) } finally { $script:SuppressLogFile = $false }
+                @($files.Name | Sort-Object) | Should -Be @('legacy.req', 'web.pem') -Because 'a .pem certificate is skipped, a .req is taken as before, and a file without a known extension needs -AnyExtension'
+            }
+
+            It 'Get-RequestFiles -AnyExtension takes every file that holds a CSR, whatever its extension, and skips the rest' {
+                $dir = Join-Path $TestDrive 'any-drop'; [void][System.IO.Directory]::CreateDirectory($dir)
+                [void](New-DropFile -Dir $dir -Name 'noext' -Content $script:CsrPemNew)
+                [void](New-DropFile -Dir $dir -Name 'server.bin' -Content $script:CsrDer)
+                [void](New-DropFile -Dir $dir -Name 'web.pem' -Content $script:CsrPemSsl)
+                [void](New-DropFile -Dir $dir -Name 'garbage.req' -Content 'x')
+                [void](New-DropFile -Dir $dir -Name 'CertTracking.csv' -Content "RequestFile,RequestID`r`n")
+                [void](New-DropFile -Dir $dir -Name 'issued.cer' -Content $script:CertDer)
+                $script:SuppressLogFile = $true
+                try { $files = @(Get-RequestFiles -Path $dir -AnyExtension 3>&1) } finally { $script:SuppressLogFile = $false }
+                $warnings = @($files | Where-Object { $_ -is [System.Management.Automation.WarningRecord] })
+                $taken = @($files | Where-Object { $_ -is [System.IO.FileInfo] })
+                @($taken.Name | Sort-Object) | Should -Be @('noext', 'server.bin', 'web.pem')
+                foreach ($n in 'garbage.req', 'CertTracking.csv', 'issued.cer') {
+                    @($warnings | Where-Object { "$_" -match [regex]::Escape($n) }).Count | Should -Be 1 -Because "$n is skipped with a warning that names it"
+                }
+            }
         }
 
         It 'a row from an older tracking file (no CAConfig property) is readable under strict mode' {

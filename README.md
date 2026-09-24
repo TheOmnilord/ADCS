@@ -31,7 +31,7 @@ Jump to a script, or to a section within it. Each script title links to its full
   Bulk-update the validity period, and optionally the renewal overlap period, on one or more certificate templates. The script matches template names with wildcards.
   <br>↳ [Why you need this](#why-you-need-this) · [Features](#features) · [Requirements](#requirements) · [Parameters](#parameters) · [Usage](#usage) · [Output](#output) · [Notes](#notes) · [How It Works](#how-it-works)
 - **[Submit-CertificateRequests.ps1](#submit-certificaterequestsps1)** &nbsp;·&nbsp; [source](./Submit-CertificateRequests.ps1)
-  Batch-submit `.req`, `.csr` and `.txt` files to an ADCS CA through `certreq.exe`. The script tracks the request IDs in a CSV file and later retrieves the issued certificates.
+  Batch-submit `.req`, `.csr`, `.txt` and `.pem` files to an ADCS CA through `certreq.exe`. The script tracks the request IDs in a CSV file and later retrieves the issued certificates.
   <br>↳ [Features](#features-1) · [Requirements](#requirements-1) · [Parameters](#parameters-1) · [Usage](#usage-1) · [Friendly Error Hints](#friendly-error-hints) · [Run Summary](#run-summary) · [Tracking CSV Schema](#tracking-csv-schema) · [Notes](#notes-1)
 - **[Sync-ADCSTemplate.ps1](#sync-adcstemplateps1)** &nbsp;·&nbsp; [source](./Sync-ADCSTemplate.ps1)
   Copy the Kerberos Authentication certificate template, or any other template, between forests. The copy goes through a JSON file or directly forest-to-forest in one run. The script offers an optional rename, four OID-handling modes, per-side credentials, a composable enrollment ACL, and a round-trip validation mode. The target forest does not need AD CS.
@@ -189,7 +189,7 @@ The script prints a color-coded summary at the end:
 
 ## Submit-CertificateRequests.ps1
 
-The script batch-submits certificate signing requests (CSRs) as `.req` / `.csr` / `.txt` files from a folder to an ADCS CA with `certreq.exe`. It tracks the request ID of each submission in a CSV file. Later, it can retrieve the issued certificates.
+The script batch-submits certificate signing requests (CSRs) as `.req` / `.csr` / `.txt` / `.pem` files from a folder to an ADCS CA with `certreq.exe`. It tracks the request ID of each submission in a CSV file. Later, it can retrieve the issued certificates.
 
 ### Features
 
@@ -201,7 +201,9 @@ The script batch-submits certificate signing requests (CSRs) as `.req` / `.csr` 
 - **Connectivity pre-check** with `certutil -ping` before any submission
 - **Per-run timestamped log file** (`CertBatch_yyyyMMdd_HHmmss_<id>.log`). The name is unique per run, and the script writes the file beside the tracking file
 - **Friendly error hints** for common ADCS failures: unsupported template, denied by policy, bad subject, access denied. The script adds the hint to the raw certreq output
-- **Helpful input-folder diagnostics**. When the script finds no `.req`/`.csr`/`.txt` files, it lists what *is* in the folder, or notes that the folder is empty. Then it skips Submit without a PowerShell stack trace
+- **Content test for `.pem` files**. A `.pem` file often holds a certificate or a private key. So the script submits a `.pem` file only when its content is a Public-Key Cryptography Standards (PKCS) #10 CSR. It skips every other `.pem` file with a warning
+- **`-AnyExtension`** applies the same content test to every file in the folder, whatever its extension. The script submits each file that holds a PKCS #10 CSR, and skips the other files with a warning
+- **Helpful input-folder diagnostics**. When the script finds no request files, it lists what *is* in the folder, or notes that the folder is empty. Then it skips Submit without a PowerShell stack trace
 - **Dual-section summary**. It separates the results of *this run* from the *cumulative totals of the tracking file*, so historical errors do not look like new ones
 - **Automatic `.rsp` cleanup** after retrieval. Pass `-KeepRspFile` to keep the file
 - **`-WhatIf` / `-Confirm`** support
@@ -218,13 +220,14 @@ The script batch-submits certificate signing requests (CSRs) as `.req` / `.csr` 
 
 | Parameter | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
-| `-InputPath` | `string` | Submit/Both only | | The folder that holds the `.req` / `.csr` / `.txt` request files. `-Mode Retrieve` does not use it and does not require it. |
+| `-InputPath` | `string` | Submit/Both only | | The folder that holds the `.req` / `.csr` / `.txt` / `.pem` request files. The script submits a `.pem` file only when its content is a PKCS #10 CSR. `-Mode Retrieve` does not use it and does not require it. |
 | `-CAConfig` | `string` | Yes | | The CA configuration string, for example `CA01.domain.com\Contoso Issuing CA 1`. Always required. |
 | `-CertificateTemplate` | `string` | Submit/Both only | | The certificate template name: the CN, not the display name. `-Mode Retrieve` does not use it and does not require it. |
 | `-TrackingFile` | `string` | No | `.\CertTracking.csv` | The CSV file that tracks the request IDs and statuses across runs. |
 | `-OutputFolder` | `string` | No | `.\Certificates` | The folder where the script saves the issued `.cer` files, one per request, named after the request file. In `Retrieve` mode the script writes each row to the path that it recorded at submit time. When you pass `-OutputFolder` explicitly, the script redirects the retrieved files to it and updates the tracking row. |
 | `-Mode` | `Submit` / `Retrieve` / `Both` | No | `Submit` | `Submit` submits new requests only. `Retrieve` retrieves the certificates of previously pending requests. `Both` does both. |
 | `-KeepRspFile` | switch | No | | By default the script deletes the `.rsp` file that `certreq` writes next to each retrieved `.cer`. Pass this switch to keep the file. |
+| `-AnyExtension` | switch | No | | Treat every file in `-InputPath` as a possible CSR, whatever its extension. The script submits a file only when its content is a PKCS #10 CSR in Privacy-Enhanced Mail (PEM) format or in binary Distinguished Encoding Rules (DER) format. It skips every other file with a warning. It also skips an empty file and a file larger than 1 MB. The test does not accept a Certificate Management over CMS (CMC) request or a PKCS #7 request. Submit such a request as a `.req` file without the switch. |
 | `-Force` | switch | No | | Resubmit the request files that already have a tracked RequestID, without a prompt. Without `-Force`, the script asks y/n for each already-submitted file. The default answer is No, which skips the file. |
 | `-AllowUnprotectedOutputFolder` | switch | No | | By default the script refuses to deliver into or through a folder that an untrusted principal owns, or can delete, rename or write to. Such a user could replace the folder with a junction during a delivery, or turn an empty folder into a junction with write rights alone. The script also refuses a delivery folder whose ACL would give an untrusted principal write, append, delete or write-attributes rights on the *files* created inside it. The staging file and the delivered certificate inherit such an entry. CREATOR OWNER entries resolve to the running account and are safe. Pass this switch to accept the risk. The script then only warns about these conditions. |
 | `-TrustedOutputPrincipal` | `string[]` | No | | Additional principals, as SIDs or `DOMAIN\Group` names, that may own the delivery folders, or hold delete, rename or write rights on them. This includes file-inheritable write rights in the delivery folder itself. The script always trusts SYSTEM, Administrators, TrustedInstaller, the running account, and its Domain Admins and Enterprise Admins. |
@@ -243,6 +246,15 @@ The script batch-submits certificate signing requests (CSRs) as `.req` / `.csr` 
     -CAConfig "CA01.domain.com\Contoso Issuing CA 1" `
     -CertificateTemplate "WebServer" `
     -Mode Submit
+```
+
+**Test every file in the folder, whatever its extension, and submit each file that holds a CSR:**
+```powershell
+.\Submit-CertificateRequests.ps1 `
+    -InputPath "C:\CSRs" `
+    -CAConfig "CA01.domain.com\Contoso Issuing CA 1" `
+    -CertificateTemplate "WebServer" `
+    -AnyExtension
 ```
 
 **Retrieve the issued certificates of previously unresolved requests.** This mode needs only `-CAConfig` and the tracking file. It does not use `-InputPath` / `-CertificateTemplate`:
@@ -318,7 +330,7 @@ In this example, the single `Error: 1` is a historical row from an earlier sessi
 
 | Column | Description |
 | --- | --- |
-| `RequestFile` | The full path of the source `.req`/`.csr`/`.txt` file |
+| `RequestFile` | The full path of the source request file |
 | `RequestID` | The numeric request ID that the CA assigned |
 | `SubmitTime` | The ISO-8601 submission timestamp |
 | `Status` | `Issued`, `Pending`, `Denied`, `Error`, `Unknown`, or `Undelivered`. `Undelivered` means that the CA issued, but the script could not deliver the `.cer` to its destination. The row counts as submitted, and `Retrieve` retrieves it again when a RequestID is present. An `Unknown` row **without** a RequestID means that certreq reported success, but the script could read neither a RequestID nor a certificate. That row also counts as submitted, and `Retrieve` lists it for manual reconciliation. |
@@ -356,7 +368,7 @@ In this example, the single `Error: 1` is a historical row from an earlier sessi
   - A file can already be at the destination, from a `-Force` resubmit or from a retry of an unresolved row. The script moves that file aside as `<name>.superseded-<UTC stamp>.cer`. It never deletes that file. It removes that copy again only when the fresh certificate is byte-identical.
   - When a retrieval reports Issued but produces no file, the script records `Error` and retries on the next `Retrieve`.
   - The script parses the RequestID and the `Pending` / `Denied` dispositions from the console text of certreq, which Windows localizes. On a non-English system they can parse as `Unknown`. The script flags a missing RequestID in `ErrorMessage`, so you can fill it in from the CA database.
-- The script allocates the certificate file names before it submits anything. The names must be unique within the batch and against the destinations already recorded for other request files. So `prod.req`, `prod.csr` and `prod.req.txt` no longer map two requests onto one `.cer`. A clash stops the run. When certreq reports a submission as successful, but its reply yields neither a RequestID nor a certificate, the script records `Unknown`. That row counts as submitted, and the script never resubmits it automatically.
+- The script allocates the certificate file names before it submits anything. The names must be unique within the batch and against the destinations already recorded for other request files. So `prod.req`, `prod.csr`, `prod.pem` and `prod.req.txt` no longer map two requests onto one `.cer`. A clash stops the run. When certreq reports a submission as successful, but its reply yields neither a RequestID nor a certificate, the script records `Unknown`. That row counts as submitted, and the script never resubmits it automatically.
 - A run in which any request failed or needs attention ends with a terminating error after the summary. This covers `Error`, `Denied`, `Undelivered`, `Unknown`, and a Retrieve row skipped as invalid. So automation that uses the exit code to decide does not treat a partial batch as success. `Pending` is not a failure.
 - The values that reach the certreq command line must not contain double quotes or control characters. These values are `-CAConfig`, `-CertificateTemplate`, the `.cer` paths and `RequestID`. The script refuses such a value before certreq runs.
 - `Pending` usually means that the CA requires manager approval. Run the script again in `Retrieve` mode after the approval to retrieve the issued certificate.
