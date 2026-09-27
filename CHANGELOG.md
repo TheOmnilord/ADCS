@@ -8,9 +8,9 @@ Each script also carries its own version in the `PSScriptInfo` header at the top
 Test-ScriptFileInfo .\Submit-CertificateRequests.ps1 | Select-Object Name, Version
 ```
 
-## [Unreleased]
+## [1.0.14] — 2026-09-27
 
-This release closes trust gaps that an external review of the repository found. Submit-CertificateRequests.ps1 now checks its drop folder, and it records each request before certreq runs. Sync-ADCSTemplate.ps1 warns about template settings that are known escalation paths. The GPO script reads back every write.
+This release closes trust gaps that an external review of the repository found. Submit-CertificateRequests.ps1 now checks its drop folder, and it records each request before certreq runs. Sync-ADCSTemplate.ps1 warns about template settings that are known escalation paths. The GPO script reads back every write. An iterative Codex review of the fixes ended with an approval after four rounds.
 
 ### Changed
 
@@ -33,6 +33,27 @@ This release closes trust gaps that an external review of the repository found. 
   - The rules judge the application policies that the CA puts in the certificate. They count only `CT_FLAG_ENROLLEE_SUPPLIES_SUBJECT` (0x1), because the CA ignores the SAN-only flag. They count an authorized-signature requirement only from schema version 2.
   - The OID checks now accept only the digits 0 to 9. The .NET pattern `\d` also matched other Unicode digits, for example Arabic-Indic digits.
 - **Add-CertificateEnrollmentPolicyServerToGpo.ps1 → 1.0.9.** The script now reads back the root Flags, the (Default) marker and each marker removal from the registry.pol replay. It also checks the registry type of each value. Before, the script reported these writes as applied without a read-back.
+
+### Added - tests
+
+- Submit-CertificateRequests.
+  - Unit: the backslash rules for certreq values, and the trust check of a request file for its owner, its own ACL and a group member. The input role of the folder chain check, the symbolic-link skip, and the membership cache.
+  - Unit: the exit codes that prove a failed submission, and a test of `Submit-SingleRequest` with a mocked certreq. That test covers a certreq that ends without output, and diagnostic codes in the output of a failed call.
+  - Guard: a drop folder that an untrusted principal can write to, a missing drop folder, and the backslash rules, each before the CA check.
+  - Static: the write-ahead row is saved before certreq runs and is replaced by the result. The drop-folder check runs before the CA check.
+  - Lab: the owner of each request file in the tracking file, and a live group-membership read. A file with an untrusted owner is refused and never reaches the CA.
+- Sync-ADCSTemplate.
+  - Unit: each escalation rule, the effective application policies, the warning inside `Import-Template`, and OIDs with non-ASCII digits.
+- Add-CertificateEnrollmentPolicyServerToGpo.
+  - Unit: the read-back helper for the value, the registry type, a removal, and a deletion record after the value.
+
+| Script | Version |
+|---|---|
+| Set-ADCSTemplateValidity.ps1 | 1.0.6 |
+| Submit-CertificateRequests.ps1 | **1.2.0** |
+| Sync-ADCSTemplate.ps1 | **1.0.9** |
+| Add-CertificateEnrollmentPolicyServerOffline.ps1 | 1.0.8 |
+| Add-CertificateEnrollmentPolicyServerToGpo.ps1 | **1.0.9** |
 
 ## [1.0.13] — 2026-09-24
 
@@ -434,7 +455,7 @@ Initial release.
 | Add-CertificateEnrollmentPolicyServerOffline.ps1 | 1.0.0 |
 | Add-CertificateEnrollmentPolicyServerToGpo.ps1 | 1.0.0 |
 
-[Unreleased]: https://github.com/TheOmnilord/ADCS/compare/v1.0.13...HEAD
+[1.0.14]: https://github.com/TheOmnilord/ADCS/compare/v1.0.13...v1.0.14
 [1.0.13]: https://github.com/TheOmnilord/ADCS/compare/v1.0.12...v1.0.13
 [1.0.12]: https://github.com/TheOmnilord/ADCS/compare/v1.0.11...v1.0.12
 [1.0.11]: https://github.com/TheOmnilord/ADCS/compare/v1.0.10...v1.0.11
