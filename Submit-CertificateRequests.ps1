@@ -1,11 +1,12 @@
 <#PSScriptInfo
-.VERSION 1.1.0
+.VERSION 1.2.0
 .GUID 6f98f16e-0c56-4a72-ba31-443938175c06
 .AUTHOR Sveinung Svea
 .PROJECTURI https://github.com/TheOmnilord/ADCS
 .LICENSEURI https://github.com/TheOmnilord/ADCS/blob/main/LICENSE
 .TAGS ADCS PKI CertificateServices
 .RELEASENOTES
+1.2.0 - The drop folder is an authorization boundary and is now checked like the output folders: every request file in it is submitted with the running account's enrollment rights, so the -InputPath folder chain must be free of reparse points, untrusted owners and untrusted create/write/delete/rename/re-permission grants, and the folder must not hand untrusted principals write rights on the files created in it (BEHAVIOUR CHANGE: a folder that any user can write to, such as a new folder directly under C:\, is refused; new -AllowUnprotectedInputFolder accepts the risk, new -TrustedInputPrincipal names a requester group). A missing -InputPath is refused before the CA is contacted (a folder that did not exist yet skipped the check and could appear as a junction during the CA check). Each request file is checked too: a file owned by, or writable by, an untrusted principal is refused (an Error row), and a file that is a symbolic link or another reparse point is skipped; a member of a group named in -TrustedInputPrincipal counts as trusted for its own files (its tokenGroups, read with ADSI; fail closed when unreadable). The owner of each request file is recorded in the new RequestFileOwner column and in the log. The script now records a request as Unknown BEFORE certreq runs (a write-ahead row) and replaces that row with the result, so a run that stops while certreq runs no longer loses a request the CA may hold (a later run resubmitted it); a failure after certreq has run also records Unknown instead of a resubmittable Error, and a failed certreq without a RequestID is an Error only when its EXIT CODE (certreq exits with the HRESULT that ended it) proves that the request never reached the CA - a connection-phase failure: RPC_S_SERVER_UNAVAILABLE, RPC_S_CALL_FAILED_DNE, EPT_S_NOT_REGISTERED or a DNS name error, per the new helper Test-DefiniteSubmitFailure; anything else - RPC_S_CALL_FAILED, an access, file, ASN.1 or crypto error (each can also occur after the CA accepted the request), a certreq ended from outside - is Unknown. The console text is not judged: certreq also prints HRESULTs of side queries that do not stop a submission the CA then issues. The requester-group membership lookup binds with Secure, Signing and Sealing, so the answer that decides trust is integrity-protected whatever the client LDAP signing policy. Values passed to certreq must not end with a backslash (the final backslash escaped the closing quote, so a drop-folder file name could add certreq switches), -CertificateTemplate must not contain a backslash (certreq reads \n in an -attrib value as a new request attribute), and a tracking-file RequestID must be ASCII digits only
 1.1.0 - The drop folder also accepts .pem files: a .pem file is submitted only when its content decodes as a PKCS #10 certificate request (PEM with or without the header, or binary DER), because a .pem file often holds a certificate or a private key; any other .pem file is skipped with a warning. New -AnyExtension switch: every file in the drop folder, whatever its extension, gets the same content test and is submitted only when it passes. .req/.csr/.txt files without -AnyExtension are submitted as before, with no content test
 1.0.12 - Help text only: the .NOTES now document the per-request checkpoint that 1.0.11 restored - the script writes the tracking file after EVERY request (not only at the end), so a crash mid-batch keeps every RequestID the CA already accepted and a later run resumes without resubmitting; each write replaces the file in one step. No code change
 1.0.11 - Export-TrackingData writes the tracking-file checkpoint again: File.Replace's optional backup-file argument is now passed as [NullString]::Value, not a bare $null (PowerShell marshals a bare $null for a [string] parameter as an EMPTY string, which File.Replace rejects - "The path is not of a legal form." on 5.1, "The path is empty." on 7). Every checkpoint after the FIRST takes the File.Replace branch (the tracking file now exists), so this threw and aborted any multi-file batch on its second request, and every Retrieve or resume run against an existing tracking file, AFTER the CA had already issued - risking the duplicate resubmission the tracking file exists to prevent. First single-file runs (File.Move branch) were unaffected, which hid it. Bug present since 1.0.2; a unit test now exercises the File.Replace (existing-file) branch
@@ -44,6 +45,13 @@
     Public-Key Cryptography Standards (PKCS) #10 certificate signing request (CSR). The script skips
     every other .pem file and writes a warning. The script ignores files with other extensions,
     unless you pass -AnyExtension.
+
+    The script submits every request file in this folder with the enrollment rights of the account
+    that runs it. So anyone who can create or change a file in the folder can obtain a certificate
+    through that account. When the template builds the subject from Active Directory, the
+    certificate names the running account, but with the key of the request author. The script
+    therefore refuses a folder that untrusted principals control. The help of
+    -AllowUnprotectedInputFolder lists the checks.
 
 .PARAMETER AnyExtension
     With -AnyExtension the script treats every file in the -InputPath folder as a possible CSR,
@@ -123,8 +131,8 @@
     GROUP entry resolves to the primary group of the running account, and the script does not
     trust it. To accept a CREATOR GROUP entry, name S-1-3-1 in -TrustedOutputPrincipal.
 
-    Pass this switch to accept those risks, for example for a shared drop folder whose ACL cannot
-    be tightened. The script then only writes a warning for each condition.
+    Pass this switch to accept those risks, for example for a shared output folder whose ACL
+    cannot be tightened. The script then only writes a warning for each condition.
     CAUTION: With this switch an untrusted user can redirect the privileged write, or alter the certificate before or after delivery.
 
 .PARAMETER TrustedOutputPrincipal
@@ -134,6 +142,45 @@
     script delivers certificates through. It may also hold delete, rename or write rights on those
     folders, including file-inheritable write rights in the delivery folder itself. Use this
     parameter when a dedicated operator group, and not Administrators, manages the output folders.
+
+.PARAMETER AllowUnprotectedInputFolder
+    By default the script refuses to read request files from a folder that untrusted principals
+    control. Anyone who can place or change a request file there can obtain a certificate with the
+    enrollment rights of the running account. The trusted principals are the built-in set that the
+    help of -AllowUnprotectedOutputFolder lists, plus the principals named in -TrustedInputPrincipal.
+
+    The script refuses the -InputPath folder when one of these conditions is true for the folder,
+    or for a folder above it:
+    - The folder is a reparse point, that is a junction, a symbolic link or a mount point.
+    - An untrusted principal owns the folder.
+    - An untrusted principal can create files in the folder, write to it, delete it or rename it.
+    - The script cannot read the security descriptor of the folder.
+
+    The script also refuses the -InputPath folder when an inheritable "files" entry gives an
+    untrusted principal write, append, delete, write-attributes or re-permission rights. Every
+    request file placed in the folder inherits such an entry.
+
+    The script checks each request file as well. It refuses a file that an untrusted principal owns,
+    or that the ACL of the file lets an untrusted principal change. It records such a file as an
+    Error row and submits nothing for it. It skips a file that is a symbolic link or another reparse
+    point, and writes a warning.
+
+    Pass this switch to accept those risks, for example for a shared drop folder that requesters
+    write to. The script then only writes a warning for each condition.
+    CAUTION: With this switch anyone who can write to the drop folder can obtain certificates with the enrollment rights of the running account.
+
+.PARAMETER TrustedInputPrincipal
+    Additional trusted principals for the -InputPath folder, as security identifiers (SIDs) or
+    account names, for example 'CONTOSO\PKI-Requesters'. The script adds them to the built-in
+    trusted set. A principal in this set may own the folder, and create or change the request files
+    in it. Name a principal here only when it may obtain certificates with the enrollment rights of
+    the running account.
+
+    For the folder, the script compares the SIDs in its owner and its ACL with the trusted set. For
+    a request file, the script also trusts a member of a trusted group. A file that a member creates
+    is owned by that member, not by the group. The script reads the group membership of a domain account from
+    Active Directory (the tokenGroups attribute), and nested groups count. When the script cannot
+    read the membership, for example for a local account, it treats the account as untrusted.
 
 .EXAMPLE
     .\Submit-CertificateRequests.ps1 -InputPath "C:\CSRs" `
@@ -193,6 +240,13 @@
       has already accepted. A later run reads that file and resumes, and it never resubmits a
       request that already has a RequestID. Each write replaces the file in one step, so an
       interrupted write cannot leave the file corrupt or truncated.
+    - Before the script starts certreq for a request, it writes a row with Status 'Unknown' for
+      that request. When certreq returns, the script replaces that row with the result. So a run
+      that stops while certreq runs leaves an 'Unknown' row, because the CA can already hold the
+      request. A later run does not resubmit that file automatically.
+    - The tracking file records the owner of each request file in the RequestFileOwner column. The
+      per-run log records it too. The owner is normally the account that placed the file in the
+      drop folder.
     - The script creates the run lock and the per-run log only after the tracking folder has
       passed the chain check. That is the same chain check that every delivery gets. The per-run
       log is CertBatch_<stamp>_<id>.log, unique per run, and the script writes it beside the
@@ -226,8 +280,18 @@
       that row as 'Unknown', and the row counts as submitted in the same way. The script never
       resubmits it automatically: a later Submit asks, or needs -Force. -Mode Retrieve lists the
       row for reconciliation.
+    - The script also records 'Unknown' when it fails after certreq ran, and it leaves the
+      'Unknown' row of a run that stopped while certreq ran. When certreq fails without a RequestID,
+      the script records 'Error' only when the exit code of certreq proves that the request never
+      reached the CA. Such a code is a connection failure, for example RPC_S_SERVER_UNAVAILABLE. In
+      every other case it records 'Unknown', for example after RPC_S_CALL_FAILED or an unreadable CSR.
     - Values that reach the certreq command line must not contain double quotes or control
       characters. These values are -CAConfig, -CertificateTemplate, the RequestID and the paths.
+      They also must not end with a backslash. The script puts each value between double quotes,
+      and a final backslash would make certreq read the closing quote as part of the value.
+    - -CertificateTemplate must not contain a backslash at all. Certreq reads \n in a request
+      attribute as the start of a new attribute, for example a subject alternative name. A
+      RequestID from the tracking file must hold only the digits 0 to 9.
     - Every row records the CA that the script submitted it to, in the CAConfig column. In -Mode
       Retrieve the script refuses a row that it submitted to a different CA. RequestIDs are per
       CA, so the request with the same number at another CA is an unrelated certificate. A row
@@ -313,7 +377,11 @@ param(
 
     [switch]$AllowUnprotectedOutputFolder,
 
-    [string[]]$TrustedOutputPrincipal
+    [string[]]$TrustedOutputPrincipal,
+
+    [switch]$AllowUnprotectedInputFolder,
+
+    [string[]]$TrustedInputPrincipal
 )
 
 Set-StrictMode -Version Latest
@@ -474,10 +542,24 @@ function Assert-SafeNativeArgument {
     # been edited or imported from elsewhere.
     param(
         [Parameter(Mandatory)][string]$Name,
-        [AllowEmptyString()][string]$Value
+        [AllowEmptyString()][string]$Value,
+        # The value becomes a request attribute (certreq -attrib "Name:Value"). certreq starts a new
+        # attribute at the two characters \n, so a backslash in the value could add an attribute
+        # of the caller's choosing, for example a subject alternative name.
+        [switch]$RequestAttribute
     )
     if ($Value -match '["\x00-\x1F]') {
         throw "$Name must not contain double quotes or control characters (it is passed to certreq.exe on its command line): '$Value'"
+    }
+    # Every value is wrapped in double quotes. Under the Windows command-line rules a backslash
+    # directly before a quote escapes it, so a value ending in a backslash turns the closing quote
+    # into a literal one: the next argument (a drop-folder file name) is then parsed as part of this
+    # value, and its spaces start further certreq switches. Backslashes elsewhere are literal.
+    if ($Value -match '\\\z') {
+        throw "$Name must not end with a backslash (it is passed to certreq.exe between double quotes, and a final backslash would escape the closing quote): '$Value'"
+    }
+    if ($RequestAttribute -and $Value.Contains('\')) {
+        throw "$Name must not contain a backslash (certreq.exe reads '\n' in a request attribute as the start of a new attribute): '$Value'"
     }
 }
 
@@ -553,7 +635,8 @@ function Assert-CertificateOutputPath {
 function Assert-ProtectedDirectoryChain {
     # See Assert-CertificateOutputPath: every folder from -Directory up to the volume/share root
     # must be a real, non-swappable folder with a readable ACL. Refusals become warnings under
-    # -AllowUnprotectedOutputFolder ($script:AllowUnprotectedOutput).
+    # -AllowUnprotectedOutputFolder ($script:AllowUnprotectedOutput) - for -Role Input, under
+    # -AllowUnprotectedInputFolder ($script:AllowUnprotectedInput) instead.
     param(
         [Parameter(Mandatory)][string]$Name,
         [Parameter(Mandatory)][string]$Directory,
@@ -566,57 +649,86 @@ function Assert-ProtectedDirectoryChain {
         # BEFORE the folder exists; a check after creation cannot close that window. What FILES
         # would inherit is not judged here (none are written into these folders; the folder
         # delivered into gets the full check, file inheritance included, once it exists).
-        [switch]$ForFolderCreation
+        [switch]$ForFolderCreation,
+        # Output (the default): a folder that certificates are delivered into or through, or the
+        # tracking folder. Input: the drop folder the request files are read from. The drop folder
+        # is an authorization boundary - every request file in it is submitted with the running
+        # account's enrollment rights - so it gets the same checks, against its OWN trusted set
+        # (-TrustedInputPrincipal) and its own override switch, with wording about request files.
+        [ValidateSet('Output', 'Input')][string]$Role = 'Output'
     )
+    $isInput    = $Role -eq 'Input'
+    $allow      = if ($isInput) { $script:AllowUnprotectedInput } else { $script:AllowUnprotectedOutput }
+    $trusted    = if ($isInput) { $script:TrustedInputSids } else { $script:TrustedSids }
+    $switchName = if ($isInput) { '-AllowUnprotectedInputFolder' } else { '-AllowUnprotectedOutputFolder' }
+    $trustName  = if ($isInput) { '-TrustedInputPrincipal' } else { '-TrustedOutputPrincipal' }
     # Every directory judged here is also used as a PARENT afterwards (of the lock, the log, a
-    # delivered certificate, a created component), so a component whose leaf and parent spellings
-    # differ (trailing space or period) is refused before the first lookup: the lookup would probe
-    # the trimmed leaf, and the write would then traverse the untrimmed parent.
+    # delivered certificate, a created component, a request file), so a component whose leaf and
+    # parent spellings differ (trailing space or period) is refused before the first lookup: the
+    # lookup would probe the trimmed leaf, and the write would then traverse the untrimmed parent.
     Assert-UnambiguousPathComponents -Path $Directory -Name $Name
     $probe = $Directory
     while ($probe) {
         $item = Get-Item -LiteralPath $probe -Force
         if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
-            $msg = "$Name passes through a reparse point (junction/symlink/mount point) at '$probe', which could redirect the write outside the allowed location: '$Path'."
-            if ($script:AllowUnprotectedOutput) { Write-BatchLog "$msg (-AllowUnprotectedOutputFolder: proceeding anyway)" -Level Warning }
-            else { throw "$msg Use a real folder, or pass -AllowUnprotectedOutputFolder to accept the risk." }
+            $msg = if ($isInput) { "$Name passes through a reparse point (junction/symlink/mount point) at '$probe', which could make this run read request files from a folder other than the one named: '$Path'." }
+                   else { "$Name passes through a reparse point (junction/symlink/mount point) at '$probe', which could redirect the write outside the allowed location: '$Path'." }
+            if ($allow) { Write-BatchLog "$msg ($($switchName): proceeding anyway)" -Level Warning }
+            else { throw "$msg Use a real folder, or pass $switchName to accept the risk." }
         }
         $swappers = $null; $badOwner = $null; $fileWriters = @(); $subfolderWriters = @()
         try {
-            $swappers = @(Get-UntrustedGrant -Path $probe -Kind Swap)
-            $badOwner = Get-UntrustedOwner -Path $probe
-            # The delivery folder itself is also judged on what its ACL hands to the FILES created
-            # inside it: the staging file and the delivered certificate inherit those entries
-            # (inherit-only or not), which the folder-swap check above rightly ignores.
+            $swappers = @(Get-UntrustedGrant -Path $probe -Kind Swap -Trusted $trusted)
+            $badOwner = Get-UntrustedOwner -Path $probe -Trusted $trusted
+            # The judged folder itself is also checked on what its ACL hands to the FILES created
+            # inside it: the staging file and the delivered certificate - or, for the drop folder,
+            # every request file placed there - inherit those entries (inherit-only or not), which
+            # the folder-swap check above rightly ignores.
             if ($probe -eq $Directory) {
-                if ($ForFolderCreation) { $subfolderWriters = @(Get-UntrustedGrant -Path $probe -Kind Subfolder) }
-                else                    { $fileWriters      = @(Get-UntrustedGrant -Path $probe -Kind File) }
+                if ($ForFolderCreation) { $subfolderWriters = @(Get-UntrustedGrant -Path $probe -Kind Subfolder -Trusted $trusted) }
+                else                    { $fileWriters      = @(Get-UntrustedGrant -Path $probe -Kind File -Trusted $trusted) }
             }
         }
         catch {
-            $msg = "$Name lies under '$probe', whose security descriptor could not be read ($($_.Exception.Message)), so it cannot be established that untrusted users are unable to swap it during a delivery."
-            if ($script:AllowUnprotectedOutput) { Write-BatchLog "$msg (-AllowUnprotectedOutputFolder: proceeding anyway)" -Level Warning }
-            else { throw "$msg Fix the folder's ACL/permissions, or pass -AllowUnprotectedOutputFolder to accept the risk." }
+            $msg = if ($isInput) { "$Name lies under '$probe', whose security descriptor could not be read ($($_.Exception.Message)), so it cannot be established that untrusted users are unable to place or change request files through it." }
+                   else { "$Name lies under '$probe', whose security descriptor could not be read ($($_.Exception.Message)), so it cannot be established that untrusted users are unable to swap it during a delivery." }
+            if ($allow) { Write-BatchLog "$msg ($($switchName): proceeding anyway)" -Level Warning }
+            else { throw "$msg Fix the folder's ACL/permissions, or pass $switchName to accept the risk." }
         }
         if ($badOwner) {
-            $msg = "$Name lies under '$probe', which is OWNED by untrusted principal $badOwner (an owner can always re-permission and replace a folder) - it could be swapped for a junction while a certificate is being delivered."
-            if ($script:AllowUnprotectedOutput) { Write-BatchLog "$msg (-AllowUnprotectedOutputFolder: proceeding anyway)" -Level Warning }
-            else { throw "$msg Deliver only through folders owned by trusted principals (SYSTEM, Administrators, the running account, its Domain/Enterprise Admins, or -TrustedOutputPrincipal), or pass -AllowUnprotectedOutputFolder to accept the risk." }
+            if ($isInput) {
+                $msg  = "$Name lies under '$probe', which is OWNED by untrusted principal $badOwner (an owner can always re-permission and replace a folder) - that principal could place request files that this run submits with the running account's enrollment rights."
+                $hint = "Read request files only from folders owned by trusted principals (SYSTEM, Administrators, the running account, its Domain/Enterprise Admins, or $trustName), or pass $switchName to accept the risk."
+            }
+            else {
+                $msg  = "$Name lies under '$probe', which is OWNED by untrusted principal $badOwner (an owner can always re-permission and replace a folder) - it could be swapped for a junction while a certificate is being delivered."
+                $hint = "Deliver only through folders owned by trusted principals (SYSTEM, Administrators, the running account, its Domain/Enterprise Admins, or $trustName), or pass $switchName to accept the risk."
+            }
+            if ($allow) { Write-BatchLog "$msg ($($switchName): proceeding anyway)" -Level Warning }
+            else { throw "$msg $hint" }
         }
         if ($swappers -and $swappers.Count) {
-            $msg = "$Name lies under '$probe', which untrusted principal(s) $($swappers -join ', ') can delete, rename or write to (write-data/write-attributes rights are enough to turn an empty folder into a junction in place) - such a user could redirect it while a certificate is being delivered."
-            if ($script:AllowUnprotectedOutput) { Write-BatchLog "$msg (-AllowUnprotectedOutputFolder: proceeding anyway)" -Level Warning }
-            else { throw "$msg Restrict that folder's ACL to trusted principals (name additional ones with -TrustedOutputPrincipal), or pass -AllowUnprotectedOutputFolder to accept the risk." }
+            if ($isInput) {
+                $msg  = "$Name lies under '$probe', which untrusted principal(s) $($swappers -join ', ') can delete, rename or write to - such a user can place a request file there or replace the folder, and this run would submit that request with the running account's enrollment rights."
+                $hint = "Restrict that folder's ACL so that only trusted principals can create or change files in it (name a requester group with $trustName), or pass $switchName to accept the risk."
+            }
+            else {
+                $msg  = "$Name lies under '$probe', which untrusted principal(s) $($swappers -join ', ') can delete, rename or write to (write-data/write-attributes rights are enough to turn an empty folder into a junction in place) - such a user could redirect it while a certificate is being delivered."
+                $hint = "Restrict that folder's ACL to trusted principals (name additional ones with $trustName), or pass $switchName to accept the risk."
+            }
+            if ($allow) { Write-BatchLog "$msg ($($switchName): proceeding anyway)" -Level Warning }
+            else { throw "$msg $hint" }
         }
         if ($fileWriters -and $fileWriters.Count) {
-            $msg = "$Name would be written in '$probe', whose ACL grants untrusted principal(s) $($fileWriters -join ', ') write, append, delete, write-attributes or re-permission rights on the FILES created inside it (an inheritable 'files' entry) - the staging file certreq writes and the delivered certificate inherit that grant, so such a user could alter the certificate's bytes, or turn the delivered file into a reparse point, before or after delivery."
-            if ($script:AllowUnprotectedOutput) { Write-BatchLog "$msg (-AllowUnprotectedOutputFolder: proceeding anyway)" -Level Warning }
-            else { throw "$msg Remove that entry from the folder's ACL (or name the principal with -TrustedOutputPrincipal), or pass -AllowUnprotectedOutputFolder to accept the risk." }
+            $msg = if ($isInput) { "$Name is '$probe', whose ACL grants untrusted principal(s) $($fileWriters -join ', ') write, append, delete, write-attributes or re-permission rights on the FILES created inside it (an inheritable 'files' entry) - every request file placed there inherits that grant, so such a user could change a request, for example replace its public key, before this run submits it." }
+                   else { "$Name would be written in '$probe', whose ACL grants untrusted principal(s) $($fileWriters -join ', ') write, append, delete, write-attributes or re-permission rights on the FILES created inside it (an inheritable 'files' entry) - the staging file certreq writes and the delivered certificate inherit that grant, so such a user could alter the certificate's bytes, or turn the delivered file into a reparse point, before or after delivery." }
+            if ($allow) { Write-BatchLog "$msg ($($switchName): proceeding anyway)" -Level Warning }
+            else { throw "$msg Remove that entry from the folder's ACL (or name the principal with $trustName), or pass $switchName to accept the risk." }
         }
         if ($subfolderWriters -and $subfolderWriters.Count) {
             $msg = "$Name would create a folder inside '$probe', whose ACL hands untrusted principal(s) $($subfolderWriters -join ', ') delete, write-data, write-attributes or re-permission rights on the SUBFOLDERS created in it (a container-inheritable entry, inherit-only or not) - a folder created here would be theirs from the instant it exists: to swap for a junction, or to open a handle to and keep across any later check, before the next component is created beneath it."
-            if ($script:AllowUnprotectedOutput) { Write-BatchLog "$msg (-AllowUnprotectedOutputFolder: proceeding anyway)" -Level Warning }
-            else { throw "$msg Remove that entry from the folder's ACL (or name the principal with -TrustedOutputPrincipal), or pass -AllowUnprotectedOutputFolder to accept the risk." }
+            if ($allow) { Write-BatchLog "$msg ($($switchName): proceeding anyway)" -Level Warning }
+            else { throw "$msg Remove that entry from the folder's ACL (or name the principal with $trustName), or pass $switchName to accept the risk." }
         }
         $probe = [System.IO.Path]::GetDirectoryName($probe)   # $null at the volume root (C:\) or the share root (\\server\share)
     }
@@ -717,18 +829,25 @@ function Get-UntrustedGrant {
     #           created: to swap for a junction, or to open a handle to and keep across any later
     #           ACL check (a DACL change does not revoke an open handle, and FSCTL_SET_REPARSE_POINT
     #           checks the handle's granted access). So the refusal must come BEFORE creation.
-    # Generic access bits are included because generic ACEs carry them. For Swap and Create,
-    # inherit-only ACEs (the "subfolders and files only" entries the C:\ root carries) do not apply
-    # to the folder itself and are skipped - the folders they propagate to are judged on their own
-    # ACLs; File looks at precisely those entries. An ACL that cannot be read is a terminating
-    # error: the caller must treat "unknown" as unprotected.
+    #   RequestFile what a request FILE's own ACL gives: the entries that apply to the file itself,
+    #           against the File mask. A principal that can write the file can replace the public
+    #           key or the subject of a CSR that a trusted user placed in the drop folder.
+    # Generic access bits are included because generic ACEs carry them. For Swap, Create and
+    # RequestFile, inherit-only ACEs (the "subfolders and files only" entries the C:\ root carries)
+    # do not apply to the object itself and are skipped - the objects they propagate to are judged
+    # on their own ACLs; File looks at precisely those entries. An ACL that cannot be read is a
+    # terminating error: the caller must treat "unknown" as unprotected.
+    # -Trusted is the trusted-principal set to judge against: the output set by default, or the
+    # input set (-TrustedInputPrincipal) for the drop folder and its request files.
     param(
         [Parameter(Mandatory)][string]$Path,
-        [Parameter(Mandatory)][ValidateSet('Swap', 'Create', 'File', 'Subfolder')][string]$Kind
+        [Parameter(Mandatory)][ValidateSet('Swap', 'Create', 'File', 'Subfolder', 'RequestFile')][string]$Kind,
+        [hashtable]$Trusted = $script:TrustedSids,
+        [switch]$AsSid   # return the raw SIDs instead of display labels (Get-RequestFileTrust judges membership on them)
     )
     $mask = if ($Kind -eq 'Swap' -or $Kind -eq 'Subfolder') {
         ([int64][System.Security.AccessControl.FileSystemRights]'Delete, DeleteSubdirectoriesAndFiles, ChangePermissions, TakeOwnership, CreateFiles, WriteAttributes') -bor 0x10000000 -bor 0x40000000   # + GENERIC_ALL, GENERIC_WRITE
-    } elseif ($Kind -eq 'File') {
+    } elseif ($Kind -eq 'File' -or $Kind -eq 'RequestFile') {
         # CreateFiles = FILE_WRITE_DATA and CreateDirectories = FILE_APPEND_DATA on a file
         ([int64][System.Security.AccessControl.FileSystemRights]'CreateFiles, CreateDirectories, Delete, ChangePermissions, TakeOwnership, WriteAttributes') -bor 0x10000000 -bor 0x40000000   # + GENERIC_ALL, GENERIC_WRITE
     } else {
@@ -754,7 +873,7 @@ function Get-UntrustedGrant {
         }
         elseif ($rule.PropagationFlags -band [System.Security.AccessControl.PropagationFlags]::InheritOnly) { continue }
         $sid = $rule.IdentityReference.Value
-        if ($script:TrustedSids.ContainsKey($sid)) { continue }
+        if ($Trusted.ContainsKey($sid)) { continue }
         # Inheritance placeholders (only meaningful in inheritable entries): CREATOR OWNER and
         # OWNER RIGHTS resolve to the account that creates the file - the running account, which
         # is trusted by construction. CREATOR GROUP resolves to that account's primary group and
@@ -762,7 +881,9 @@ function Get-UntrustedGrant {
         if ($sid -eq 'S-1-3-0' -or $sid -eq 'S-1-3-4') { continue }
         $rights = ([int64][int]$rule.FileSystemRights) -band 0xFFFFFFFF
         if ($rights -band $mask) {
-            $found += if ($sid -eq 'S-1-3-1') { "CREATOR GROUP ($sid, resolves to the running account's primary group)" } else { ConvertTo-PrincipalLabel -Sid $sid }
+            $found += if ($AsSid) { $sid }
+                      elseif ($sid -eq 'S-1-3-1') { "CREATOR GROUP ($sid, resolves to the running account's primary group)" }
+                      else { ConvertTo-PrincipalLabel -Sid $sid }
         }
     }
     @($found | Sort-Object -Unique)
@@ -772,12 +893,73 @@ function Get-UntrustedOwner {
     # The label of a folder's owner when that owner is NOT a trusted principal, else $null. An
     # owner can always re-permission the object (WRITE_DAC is implicit for owners) and so rename
     # or replace it - an attacker-created subfolder is owned by the attacker whatever its ACEs say.
-    param([Parameter(Mandatory)][string]$Path)
+    param([Parameter(Mandatory)][string]$Path, [hashtable]$Trusted = $script:TrustedSids)
     $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
     $owner = if ($acl) { $acl.GetOwner([System.Security.Principal.SecurityIdentifier]) } else { $null }
     if (-not $owner) { throw "The owner of '$Path' could not be read." }
-    if ($script:TrustedSids.ContainsKey($owner.Value)) { return $null }
+    if ($Trusted.ContainsKey($owner.Value)) { return $null }
     ConvertTo-PrincipalLabel -Sid $owner.Value
+}
+
+function Get-PrincipalGroupSids {
+    # The transitive security-group SIDs of a domain account: its tokenGroups, which the directory
+    # computes (nested groups and the primary group included). Cached per SID for the run. A SID the
+    # directory cannot resolve - a local account, a well-known SID, another forest, no domain
+    # controller reachable - gives no groups, so the caller treats the principal as untrusted
+    # (fail closed). Read through ADSI, which needs no PowerShell module.
+    param([Parameter(Mandatory)][string]$Sid)
+    if ($null -eq (Get-Variable -Name GroupSidCache -Scope Script -ValueOnly -ErrorAction SilentlyContinue)) { $script:GroupSidCache = @{} }
+    if ($script:GroupSidCache.ContainsKey($Sid)) { return $script:GroupSidCache[$Sid] }
+    $groups = @()
+    if ($Sid -match '^S-1-5-21-[0-9-]+\z') {   # only a domain (or machine) account SID can have tokenGroups
+        try {
+            # The answer decides a trust question, so the bind must protect it: Secure (Kerberos or
+            # NTLM) alone authenticates the connection, and whether LDAP signing is used then depends
+            # on the client policy. Signing and Sealing are requested explicitly, so an on-path
+            # attacker cannot add a trusted group to the reply. A bind that cannot provide them
+            # fails, and the principal stays untrusted.
+            # [NullString]::Value, not $null: a bare $null for a .NET [string] parameter arrives as an
+            # EMPTY string; the credentials must be real nulls (= the running account).
+            $auth  = [System.DirectoryServices.AuthenticationTypes]'Secure, Signing, Sealing'
+            $entry = New-Object System.DirectoryServices.DirectoryEntry("LDAP://<SID=$Sid>", [NullString]::Value, [NullString]::Value, $auth)
+            try {
+                $entry.RefreshCache([string[]]@('tokenGroups'))
+                foreach ($b in @($entry.Properties['tokenGroups'])) { $groups += (New-Object System.Security.Principal.SecurityIdentifier([byte[]]$b, 0)).Value }
+            }
+            finally { $entry.Dispose() }
+        }
+        catch { Write-Verbose "The group membership of $Sid could not be read ($($_.Exception.Message)); it is treated as untrusted." }
+    }
+    $script:GroupSidCache[$Sid] = @($groups)
+    @($groups)
+}
+
+function Get-RequestFileTrust {
+    # Who controls ONE request file in the drop folder: its owner, and every untrusted principal
+    # (judged against the input set) that the file's own ACL lets change it. The folder check
+    # covers what a file inherits; this covers the file itself. An owner can always re-permission
+    # the file (WRITE_DAC is implicit for owners), so an untrusted owner controls the content - for
+    # example a file left from a time when the folder was open to everyone. A principal also counts
+    # as trusted when it is a member (transitively) of a trusted group: a file that a member of the
+    # requester group named in -TrustedInputPrincipal creates is owned by that member, not by the
+    # group, and a CREATOR OWNER entry gives that member an entry of its own on the file. Returns
+    # @{ Owner = label of the owner; Problems = one reason per untrusted owner or writer }.
+    param([Parameter(Mandatory)][System.IO.FileInfo]$File, [hashtable]$Trusted = $script:TrustedInputSids)
+    $isTrusted = {
+        param([string]$Sid)
+        if ($Trusted.ContainsKey($Sid)) { return $true }
+        @(Get-PrincipalGroupSids -Sid $Sid | Where-Object { $Trusted.ContainsKey($_) }).Count -gt 0
+    }
+    $acl = Get-Acl -LiteralPath $File.FullName -ErrorAction Stop
+    $owner = if ($acl) { $acl.GetOwner([System.Security.Principal.SecurityIdentifier]) } else { $null }
+    if (-not $owner) { throw "The owner of '$($File.FullName)' could not be read." }
+    $ownerLabel = ConvertTo-PrincipalLabel -Sid $owner.Value
+    $problems = @()
+    if (-not (& $isTrusted $owner.Value)) { $problems += "it is owned by untrusted principal $ownerLabel" }
+    $writers = @(Get-UntrustedGrant -Path $File.FullName -Kind RequestFile -Trusted $Trusted -AsSid |
+        Where-Object { -not (& $isTrusted $_) } | ForEach-Object { ConvertTo-PrincipalLabel -Sid $_ })
+    if ($writers.Count) { $problems += "its ACL lets untrusted principal(s) $($writers -join ', ') change it" }
+    [pscustomobject]@{ Owner = $ownerLabel; Problems = @($problems) }
 }
 
 function Move-RetrievedCertificate {
@@ -1001,6 +1183,12 @@ function Get-RequestFiles {
     # applies that content test to every file in the folder, whatever its extension.
     $candidates = @(Get-ChildItem -LiteralPath $Path -File)
     $files = @(foreach ($f in $candidates) {
+        # A symbolic link (or another reparse point) in the drop folder would make this elevated run
+        # read - and submit - a file somewhere else, which the folder checks never judged.
+        if ($f.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+            Write-BatchLog "Skipping (symbolic link or other reparse point): $($f.Name)" -Level Warning
+            continue
+        }
         $test = $AnyExtension -or $f.Extension -eq '.pem'
         if (-not $test) {
             if ($f.Extension -in '.req', '.csr', '.txt') { $f }
@@ -1034,7 +1222,7 @@ function Get-RequestIdFromOutput {
     param([string[]]$Output)
 
     foreach ($line in $Output) {
-        if ($line -match 'RequestId:\s*"?(\d+)"?') {
+        if ($line -match 'RequestId:\s*"?([0-9]+)"?') {   # [0-9]: the ID is written to the CSV and later passed to certreq
             return [int]$Matches[1]
         }
     }
@@ -1049,6 +1237,27 @@ function Get-DispositionFromOutput {
     if ($joined -match 'pending|Taken Under Submission') { return 'Pending' }
     if ($joined -match 'denied')                         { return 'Denied' }
     return 'Unknown'
+}
+
+function Test-DefiniteSubmitFailure {
+    # $true only when certreq's EXIT CODE proves that the request never reached the CA, so the file
+    # may be submitted again (an Error row). certreq exits with the HRESULT that ended it (verified:
+    # 0x800706BA for a CA host that does not resolve, 0x8009310B for an unreadable CSR). The exit
+    # code is judged, not the console text: certreq also prints diagnostic HRESULTs for side queries
+    # that do not stop it (CERTSRV_E_PROPERTY_EMPTY, ERROR_FILE_NOT_FOUND) during a submission that the
+    # CA then issues. Only a failure of the CONNECTION phase is proof:
+    #   0x800706BA  RPC_S_SERVER_UNAVAILABLE   - the CA host was never reached
+    #   0x800706BF  RPC_S_CALL_FAILED_DNE      - the call "failed and did not execute"
+    #   0x800706D9  EPT_S_NOT_REGISTERED       - no CA endpoint was listening
+    #   0x8007232B  DNS_ERROR_RCODE_NAME_ERROR - the CA host name did not resolve
+    # Anything else may have left the request at the CA, and the caller records Unknown, which is
+    # never resubmitted automatically: an access or file error can also come from saving the issued
+    # certificate, an ASN.1 or crypto error from decoding the CA's answer, RPC_S_CALL_FAILED from a
+    # call that was sent, and a certreq ended from outside exits with whatever code it was given.
+    # The literals are [int] (a hex literal with bit 31 set is a negative Int32 in PowerShell), the
+    # same type as Process.ExitCode.
+    param([int]$ExitCode)
+    $ExitCode -in @(0x800706BA, 0x800706BF, 0x800706D9, 0x8007232B)
 }
 
 function Get-FriendlyErrorHint {
@@ -1232,7 +1441,7 @@ function Export-TrackingData {
         # lack CAConfig, and a mixed list led by one of them would silently drop that column - and
         # with it the CA binding of every newer row. Every row is projected onto the full schema
         # (plus any extra column an operator added), so the file always carries every field.
-        $columns = [System.Collections.Generic.List[string]]@('RequestFile', 'RequestID', 'SubmitTime', 'Status', 'OutputCertFile', 'LastCheckTime', 'ErrorMessage', 'CAConfig')
+        $columns = [System.Collections.Generic.List[string]]@('RequestFile', 'RequestID', 'SubmitTime', 'Status', 'OutputCertFile', 'LastCheckTime', 'ErrorMessage', 'CAConfig', 'RequestFileOwner')
         foreach ($r in $filtered) { foreach ($pn in $r.PSObject.Properties.Name) { if ($pn -notin $columns) { $columns.Add($pn) } } }
         # -LiteralPath: the temp name inherits $Path, so a tracking path containing [ or ] would be
         # globbed by -Path and the checkpoint would silently fail to write - losing the RequestID of
@@ -1275,10 +1484,11 @@ function Submit-SingleRequest {
         [string]$CertificateTemplate,
         [string]$CerPath,
         [switch]$KeepRspFile,
-        [string[]]$AllowedRoots
+        [string[]]$AllowedRoots,
+        [string]$Owner   # label of the request file's owner (Get-RequestFileTrust), recorded in the row
     )
 
-    Write-BatchLog "Submitting: $($RequestFile.Name)"
+    Write-BatchLog "Submitting: $($RequestFile.Name) (owner: $Owner)"
 
     # Beside the log in the validated tracking folder - never Path.GetTempFileName() under %TEMP%
     # (see New-CertreqCaptureFile). Start-Process reopens them to truncate; they are this run's own
@@ -1301,6 +1511,9 @@ function Submit-SingleRequest {
             "`"$($RequestFile.FullName)`"",
             "`"$tmpCer`""
         ) -NoNewWindow -Wait -PassThru -RedirectStandardOutput $stdoutFile -RedirectStandardError $stderrFile
+        # From here on the CA may hold the request. The caller reads this flag when this function
+        # throws: a failure after certreq ran must not become a resubmittable Error row.
+        $script:CertreqRan = $true
 
         # -Encoding Oem + -LiteralPath: certreq writes its redirected output in the console OEM
         # code page. Get-Content with no -Encoding decodes it as ANSI on 5.1 but UTF-8 on 7 - the
@@ -1376,10 +1589,23 @@ function Submit-SingleRequest {
             $errorMsg = "certreq returned success but neither a RequestID nor a certificate file could be read (localized wording?). The CA may hold this request - check its database before resubmitting (-Force). Output: $($stdout -join ' ')"
             Write-BatchLog "  $errorMsg" -Level Warning
         }
-        else {
+        elseif (Test-DefiniteSubmitFailure -ExitCode $proc.ExitCode) {
+            # certreq failed in the connection phase, so the request never reached the CA: a
+            # resubmittable Error.
             Write-BatchLog "  Could not parse RequestID from output" -Level Warning
             $disposition = 'Error'
             $errorMsg = "No RequestID in output: $($stdout -join ' ')"
+        }
+        else {
+            # certreq failed, but its exit code does not prove that the request never reached the CA
+            # (a remote call that failed after it was sent, a certreq ended from outside, an error
+            # that can also occur after the CA accepted the request). Unknown without a RequestID
+            # counts as submitted, so the next run does not submit the file again - the write-ahead
+            # row's protection is kept.
+            $hr = '0x{0:X8}' -f [BitConverter]::ToUInt32([BitConverter]::GetBytes([int]$proc.ExitCode), 0)
+            $disposition = 'Unknown'
+            $errorMsg = "certreq failed with $hr, which does not prove that the CA did not receive the request. The CA may hold it: check the CA database before you resubmit the file with -Force. Output: $(($stderr + $stdout) -join ' ')"
+            Write-BatchLog "  $errorMsg" -Level Warning
         }
 
         if ($disposition -in 'Denied', 'Error') {
@@ -1391,14 +1617,15 @@ function Submit-SingleRequest {
         }
 
         return [PSCustomObject]@{
-            RequestFile    = $RequestFile.FullName
-            RequestID      = $requestId
-            SubmitTime     = (Get-Date -Format 'o')
-            Status         = $disposition
-            OutputCertFile = $CerPath
-            LastCheckTime  = (Get-Date -Format 'o')
-            ErrorMessage   = $errorMsg
-            CAConfig       = $CAConfig
+            RequestFile      = $RequestFile.FullName
+            RequestID        = $requestId
+            SubmitTime       = (Get-Date -Format 'o')
+            Status           = $disposition
+            OutputCertFile   = $CerPath
+            LastCheckTime    = (Get-Date -Format 'o')
+            ErrorMessage     = $errorMsg
+            CAConfig         = $CAConfig
+            RequestFileOwner = $Owner
         }
     }
     finally {
@@ -1578,7 +1805,7 @@ if ($Mode -in 'Submit', 'Both') {
     }
 }
 Assert-SafeNativeArgument -Name '-CAConfig' -Value $CAConfig
-if ($CertificateTemplate) { Assert-SafeNativeArgument -Name '-CertificateTemplate' -Value $CertificateTemplate }
+if ($CertificateTemplate) { Assert-SafeNativeArgument -Name '-CertificateTemplate' -Value $CertificateTemplate -RequestAttribute }
 
 # One run per tracking file. Two concurrent runs would each read the CSV, append their own rows
 # and replace the file - the last writer silently discarding the other's request IDs, which a
@@ -1606,6 +1833,12 @@ if ($CertificateTemplate) { Assert-SafeNativeArgument -Name '-CertificateTemplat
 $script:FailureCount = 0
 $script:AllowUnprotectedOutput = [bool]$AllowUnprotectedOutputFolder
 $script:TrustedSids = Get-TrustedPrincipalSet -Extra $TrustedOutputPrincipal
+# The drop folder has its own trusted set: a principal trusted to manage the output folders is not
+# thereby trusted to obtain certificates with the running account's enrollment rights.
+$script:AllowUnprotectedInput = [bool]$AllowUnprotectedInputFolder
+$script:TrustedInputSids = Get-TrustedPrincipalSet -Extra $TrustedInputPrincipal
+$script:GroupSidCache = @{}   # SID -> transitive group SIDs (Get-PrincipalGroupSids), per run
+$script:CertreqRan = $false
 if (-not (Test-Path -LiteralPath $trackingDir -PathType Container)) {
     throw "The folder for -TrackingFile does not exist: '$trackingDir'. Create it first."
 }
@@ -1690,6 +1923,21 @@ try {   # the lock is released in the finally at the end of the run, on every ex
         catch { Write-Verbose "Create-rights check skipped for '$root': $_" }   # informational only; the Swap check above already failed closed
     }
 
+    # The drop folder is an authorization boundary: every request file in it is submitted with the
+    # running account's enrollment rights, and for a template that builds the subject from AD the
+    # certificate then names the RUNNING account with the key of whoever wrote the request. So the
+    # folder gets the same chain check as the output locations - before the CA is contacted, so a
+    # refusal never waits on the network. The folder must EXIST now: a missing one would skip the
+    # check, and a user allowed to create folders in its parent (the C:\ root lets Users do that)
+    # could then create it as a junction while the CA check runs. Get-RequestFiles repeats the
+    # existence checks as a second line.
+    if ($Mode -in 'Submit', 'Both') {
+        $InputPath = Resolve-FullPath -Path $InputPath
+        if (-not (Test-Path -LiteralPath $InputPath)) { throw "InputPath does not exist: $InputPath" }
+        if (-not (Test-Path -LiteralPath $InputPath -PathType Container)) { throw "InputPath must be a folder, not a file: $InputPath" }
+        Assert-ProtectedDirectoryChain -Name 'Input folder' -Directory $InputPath -Path $InputPath -Role Input
+    }
+
     # CA connectivity test
     if (-not (Test-CAConnectivity -CAConfig $CAConfig)) {
         throw "Cannot reach CA. Aborting."
@@ -1724,6 +1972,42 @@ try {   # the lock is released in the finally at the end of the run, on every ex
                 if ($file.Length -eq 0) {
                     Write-BatchLog "Skipping (empty file): $($file.Name)" -Level Warning
                     continue
+                }
+
+                # The file itself, judged before the prompt so a refusal never waits on the operator:
+                # who owns it (recorded in the row and the log) and whether an untrusted principal
+                # controls it - an owner, or a writer through the file's OWN entries, which the
+                # folder check (inherited entries) does not see. An unreadable ACL fails closed.
+                try { $trust = Get-RequestFileTrust -File $file }
+                catch { $trust = [pscustomobject]@{ Owner = ''; Problems = @("its security descriptor could not be read ($($_.Exception.Message))") } }
+                if ($trust.Problems.Count) {
+                    $why = "Request file '$($file.Name)' is not under trusted control: $($trust.Problems -join '; ')."
+                    if ($script:AllowUnprotectedInput) {
+                        Write-BatchLog "$why (-AllowUnprotectedInputFolder: proceeding anyway)" -Level Warning
+                    }
+                    else {
+                        Write-BatchLog "$why Refused; nothing was submitted for it. Fix the owner or the ACL of the file (or name the principal with -TrustedInputPrincipal), or pass -AllowUnprotectedInputFolder to accept the risk." -Level Error
+                        $script:FailureCount++
+                        if (-not $WhatIfPreference) {
+                            # An Error row without a RequestID: nothing reached the CA, so a later run
+                            # judges the file again (and submits it once its owner and ACL are fixed).
+                            $refused = [PSCustomObject]@{
+                                RequestFile      = $file.FullName
+                                RequestID        = $null
+                                SubmitTime       = (Get-Date -Format 'o')
+                                Status           = 'Error'
+                                OutputCertFile   = ''
+                                LastCheckTime    = (Get-Date -Format 'o')
+                                ErrorMessage     = "Refused before submission: $why"
+                                CAConfig         = $CAConfig
+                                RequestFileOwner = $trust.Owner
+                            }
+                            [void]$tracking.Add($refused)
+                            [void]$runResults.Add($refused)
+                            Export-TrackingData -Data @($tracking) -Path $TrackingFile
+                        }
+                        continue
+                    }
                 }
 
                 if (-not $PSCmdlet.ShouldProcess($file.Name, "Submit certificate request to $CAConfig")) {
@@ -1768,29 +2052,57 @@ try {   # the lock is released in the finally at the end of the run, on every ex
 
                 $cerPath = Join-Path $OutputFolder $cerNames[$file.FullName]
 
+                # Write-ahead: the request is recorded as Unknown BEFORE certreq runs, and that row is
+                # replaced by the result below. Without it a run that stopped while certreq ran (a
+                # crash, a reboot, Ctrl+C) left no row for a request the CA may already hold, and the
+                # next run submitted the file again - a duplicate request at the CA. 'Unknown' without
+                # a RequestID counts as submitted (never resubmitted automatically) and -Mode Retrieve
+                # lists it for reconciliation.
+                $inFlight = [PSCustomObject]@{
+                    RequestFile      = $file.FullName
+                    RequestID        = $null
+                    SubmitTime       = (Get-Date -Format 'o')
+                    Status           = 'Unknown'
+                    OutputCertFile   = $cerPath
+                    LastCheckTime    = (Get-Date -Format 'o')
+                    ErrorMessage     = 'The run stopped while certreq was submitting this request, before the result was recorded. The CA may hold the request: check the CA database before you resubmit the file with -Force.'
+                    CAConfig         = $CAConfig
+                    RequestFileOwner = $trust.Owner
+                }
+                [void]$tracking.Add($inFlight)
+                $rowIndex = $tracking.Count - 1
+                Export-TrackingData -Data @($tracking) -Path $TrackingFile
+
+                $script:CertreqRan = $false
                 try {
                     $result = Submit-SingleRequest -RequestFile $file `
                         -CAConfig $CAConfig `
                         -CertificateTemplate $CertificateTemplate `
                         -CerPath $cerPath `
                         -KeepRspFile:$KeepRspFile `
-                        -AllowedRoots @($OutputFolder)
+                        -AllowedRoots @($OutputFolder) `
+                        -Owner $trust.Owner
                 }
                 catch {
                     Write-BatchLog "Error submitting $($file.Name): $_" -Level Error
+                    # A failure AFTER certreq ran (a log write, a parse) may follow a submission the
+                    # CA accepted: record Unknown, which is never resubmitted automatically, instead
+                    # of an Error row that the next run would submit again.
+                    $ran = [bool]$script:CertreqRan
                     $result = [PSCustomObject]@{
-                        RequestFile    = $file.FullName
-                        RequestID      = $null
-                        SubmitTime     = (Get-Date -Format 'o')
-                        Status         = 'Error'
-                        OutputCertFile = ''
-                        LastCheckTime  = (Get-Date -Format 'o')
-                        ErrorMessage   = $_.ToString()
-                        CAConfig       = $CAConfig
+                        RequestFile      = $file.FullName
+                        RequestID        = $null
+                        SubmitTime       = (Get-Date -Format 'o')
+                        Status           = if ($ran) { 'Unknown' } else { 'Error' }
+                        OutputCertFile   = if ($ran) { $cerPath } else { '' }
+                        LastCheckTime    = (Get-Date -Format 'o')
+                        ErrorMessage     = if ($ran) { "certreq ran, but the script failed before it recorded the result ($_). The CA may hold the request: check the CA database before you resubmit the file with -Force." } else { $_.ToString() }
+                        CAConfig         = $CAConfig
+                        RequestFileOwner = $trust.Owner
                     }
                 }
 
-                [void]$tracking.Add($result)
+                $tracking[$rowIndex] = $result   # the result replaces the write-ahead row
                 if ($result.Status -in 'Error', 'Denied', 'Undelivered', 'Unknown') { $script:FailureCount++ }
                 [void]$runResults.Add($result)
 
@@ -1836,7 +2148,9 @@ try {   # the lock is released in the finally at the end of the run, on every ex
                 # Both fields below reach the certreq command line verbatim, and both come from the
                 # CSV (editable, importable): a non-numeric RequestID or a path carrying a quote is
                 # refused for this row rather than passed on. The row is left as it is and skipped.
-                if ("$($record.RequestID)" -notmatch '^\d+$') {
+                # [0-9] and \z, not \d and $: .NET's \d matches every Unicode digit (Arabic-Indic and
+                # others), and $ also matches before a final newline in an edited CSV field.
+                if ("$($record.RequestID)" -notmatch '^[0-9]+\z') {
                     Write-BatchLog "Skipping row for '$($record.RequestFile)': RequestID '$($record.RequestID)' is not numeric (edited tracking file?)." -Level Error
                     $script:FailureCount++
                     continue

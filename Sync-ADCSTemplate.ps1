@@ -1,11 +1,12 @@
 <#PSScriptInfo
-.VERSION 1.0.8
+.VERSION 1.0.9
 .GUID 689db74d-e668-410a-9a62-0b208179a369
 .AUTHOR Sveinung Svea
 .PROJECTURI https://github.com/TheOmnilord/ADCS
 .LICENSEURI https://github.com/TheOmnilord/ADCS/blob/main/LICENSE
 .TAGS ADCS PKI CertificateServices
 .RELEASENOTES
+1.0.9 - Import and Sync now name, before the create prompt, each template setting that is a known escalation path, with a warning per finding (the import still proceeds): an enrollee-supplied subject (CT_FLAG_ENROLLEE_SUPPLIES_SUBJECT 0x1; the CA ignores the SAN-only flag 0x10000) on a client-authentication template without manager approval or an authorized signature (ESC1), the Any Purpose application policy or none (ESC2), a Certificate Request Agent template (ESC3), CT_FLAG_NO_SECURITY_EXTENSION on a client-authentication template (ESC9), and a schema-1 template with an enrollee-supplied subject (ESC15); the rules judge the EFFECTIVE application policies (msPKI-Certificate-Application-Policy, or pKIExtendedKeyUsage for a schema-1 template that has EKUs there) and count an authorized-signature requirement only from schema version 2 (schema 1 does not support it); the new pure helper Get-TemplateRiskWarning holds the rules, and -Mode Validate's throwaway copies are not judged. The dotted-OID validation accepts only the ASCII digits 0-9: .NET's \d matches every Unicode decimal digit, so an OID with Arabic-Indic digits passed validation
 1.0.8 - -OidHandling GenerateFromRoot without -OidRoot is now refused by the up-front parameter guards, before any domain controller is contacted and before any grant is resolved (the late check inside Resolve-TemplateOid is kept as a second line); the schema-typed conversion of a PKI attribute the static lists do not know is moved out of an inline switch in Import-Template into the new pure helper ConvertTo-SchemaTypedValue with the same rules (Int and String need exactly one element, MultiString and Bytes are cast, an unknown type or a failed cast drops the attribute with the existing warning) so that every arm can be unit-tested; the "Created template:" line now ends with " (objectGUID <guid>)" taken from the object New-ADObject -PassThru returned, and the companion OID display object is created with -PassThru and reported the same way on a new "Created OID object: <DN> (objectGUID <guid>)" line, so that a caller can identify exactly the objects this run created without a later lookup by name or OID; no other behaviour change
 1.0.7 - Help text only: the comment-based help is rewritten to the repository writing style (STYLE.md, derived from ASD-STE100 Simplified Technical English) - short sentences, active voice, no figurative language, acronyms defined, a CAUTION line on -SkipAcl and -AllowLinkedIssuancePolicy; every fact, condition and default is kept; no code change
 1.0.6 - ConvertTo-ImportAttributeValue checks integrality and range in the value's OWN numeric type before any [decimal] cast: a tiny double (1e-30) cast to decimal underflowed to 0 and was silently coerced to 0 (integer and byte-element branches both); Convert-ToLatestCompatibility computes and validates every replacement value - including the minor-revision increment, which now throws on Int32.MaxValue overflow - BEFORE mutating $Attributes, so a failure no longer leaves a template half-upgraded (v4 schema/flags with an un-bumped revision) while still reporting Upgraded; the Authentication Mechanism Assurance import guard scans only msPKI-Certificate-Policy (the issuance policies stamped into the ISSUED certificate), no longer msPKI-RA-Policies (which constrains the enrollment-agent SIGNING certificate and is not stamped into the issued cert, so an AMA link on it never grants the enrollee) - it was falsely refusing templates that merely require a signing-cert application policy
@@ -461,6 +462,30 @@
       TARGET forest already links to a group, the script refuses the import. Pass
       -AllowLinkedIssuancePolicy to accept it. The reason for the refusal: certificates from the
       copy would grant the membership of that group at logon.
+    - Before Import and Sync ask to create the copy, the script names each template setting that
+      is a known escalation path. It writes a warning for each one and still imports the template.
+      "No approval" below means that the template requires neither manager approval nor an
+      authorized signature. A schema version 1 template cannot require an authorized signature. The
+      labels in brackets are the ESC names that published AD CS attack research uses.
+      - The requester supplies the subject, and so also the subject alternative name. The
+        certificates can authenticate a client, and no approval is needed (ESC1).
+      - The certificates have the Any Purpose application policy or no application policy, and no
+        approval is needed (ESC2).
+      - The certificates are Certificate Request Agent certificates, and no approval is needed
+        (ESC3).
+      - The template sets CT_FLAG_NO_SECURITY_EXTENSION, and its certificates can authenticate a
+        client (ESC9).
+      - The template is schema version 1, and the requester supplies the subject (ESC15).
+    - The script judges the application policies that the CA puts in the certificate. These are
+      the values of msPKI-Certificate-Application-Policy. For a schema version 1 template with a
+      value in pKIExtendedKeyUsage, they are the values of pKIExtendedKeyUsage. The requester
+      supplies the subject only through CT_FLAG_ENROLLEE_SUPPLIES_SUBJECT (0x1), because the CA
+      ignores CT_FLAG_ENROLLEE_SUPPLIES_SUBJECT_ALT_NAME (0x10000).
+    - Whether such a setting can be exploited also depends on who receives Enroll rights on the
+      copy, and on the CA that publishes it. -Mode Validate writes no such warnings for its
+      throwaway copies.
+    - An OID in the import must use only the digits 0 to 9. The script refuses an OID with other
+      digit characters, for example Arabic-Indic digits, which .NET treats as digits too.
     - A v1 template copies too, and the export warns. The object round-trips faithfully, but
       Windows fixes the v1 semantics in code. The v1 consumers match by NAME, the definition is not
       editable, and it never autoenrolls. Import a v1 template under its ORIGINAL name, because a
@@ -778,7 +803,7 @@ function Resolve-TemplateOid {
     if ($ExplicitOid) {
         # Internal (Validate) path today, but validate all the same: this value reaches an LDAP
         # filter and becomes the new template's stored identity.
-        if ($ExplicitOid -notmatch '^(0|[1-9]\d*)(\.(0|[1-9]\d*))+\z') {
+        if ($ExplicitOid -notmatch '^(0|[1-9][0-9]*)(\.(0|[1-9][0-9]*))+\z') {
             throw "The explicit OID '$ExplicitOid' is not a valid dotted OID."
         }
         return @{ Oid = $ExplicitOid; CompanionCn = $null; CompanionContainerDN = $null }
@@ -797,7 +822,7 @@ function Resolve-TemplateOid {
             if (-not $OidRoot) {
                 throw "OidHandling 'GenerateFromRoot' requires -OidRoot (the base OID to generate under, e.g. 1.3.6.1.4.1.311.21.8.<5 arcs>)."
             }
-            if ($OidRoot -notmatch '^(0|[1-9]\d*)(\.(0|[1-9]\d*))+\z') {
+            if ($OidRoot -notmatch '^(0|[1-9][0-9]*)(\.(0|[1-9][0-9]*))+\z') {
                 throw "-OidRoot '$OidRoot' is not a valid dotted OID (digits and dots only, no leading zeros in an arc)."
             }
             if ($OidRoot -eq '1.3.6.1.4.1.311.21.8') {
@@ -822,7 +847,7 @@ function Resolve-TemplateOid {
             if (-not $SourceOid) {
                 throw "OidHandling 'Preserve' needs the source template's OID, but msPKI-Cert-Template-OID is missing (a v1 template, or exported with -StripOid?). Re-export without -StripOid, or use -OidHandling GenerateFromRoot / GenerateRandom / Generate."
             }
-            if ($SourceOid -notmatch '^(0|[1-9]\d*)(\.(0|[1-9]\d*))+\z') {
+            if ($SourceOid -notmatch '^(0|[1-9][0-9]*)(\.(0|[1-9][0-9]*))+\z') {
                 # Externally-supplied value: validate before it reaches any LDAP filter or gets written
                 # as the template's identity (a tampered '*' would otherwise wildcard-match and be stored).
                 throw "The source msPKI-Cert-Template-OID ('$SourceOid') is not a valid dotted OID - the export file (or source object) looks corrupted or tampered with."
@@ -1124,7 +1149,7 @@ function ConvertTo-ImportAttributeValue {
             if ($e -isnot [string]) { & $fail "element '$e' is $($e.GetType().Name), expected a string" }
             if ($e.Length -eq 0) { & $fail 'an empty element' }
             if ($e -match '[\x00-\x1F\x7F]') { & $fail 'an element contains control characters' }
-            if ($Name -in $script:OidListAttributes -and $e -notmatch '^\d+(\.\d+)+\z') { & $fail "'$e' is not a dotted OID" }
+            if ($Name -in $script:OidListAttributes -and $e -notmatch '^[0-9]+(\.[0-9]+)+\z') { & $fail "'$e' is not a dotted OID" }
             $out.Add($e)
         }
         if (-not $out.Count) { & $fail 'no values' }
@@ -1161,6 +1186,76 @@ function Get-LinkedIssuancePolicy {
         -LDAPFilter "(&(objectClass=msPKI-Enterprise-Oid)(msDS-OIDToGroupLink=*)(|$clauses))" `
         -Properties 'msPKI-Cert-Template-OID', 'msDS-OIDToGroupLink' |
         ForEach-Object { [pscustomobject]@{ Oid = "$($_.'msPKI-Cert-Template-OID')"; OidObjectDN = $_.DistinguishedName; GroupDN = "$($_.'msDS-OIDToGroupLink')" } })
+}
+
+function Get-TemplateRiskWarning {
+    # Settings in the template being imported that are known escalation paths - the ESC classes of
+    # the "Certified Pre-Owned" research and its follow-ups. Returns one warning text per finding,
+    # or nothing. The import copies the functional attributes faithfully, and an export can come
+    # from a forest or a file the operator does not control, so these settings are named before
+    # the template is created. They are warnings, not refusals: a legitimate template can need
+    # some of them (a web server template lets the requester supply the subject), and whether one
+    # is exploitable also depends on who receives Enroll rights and on which CA publishes it.
+    # Pure - it reads only the attribute hashtable - so every rule can be unit-tested. The values
+    # are the converted ones: [int] flags (msPKI-Certificate-Name-Flag can be negative, bit 31) and
+    # string collections for the policy lists.
+    param([Parameter(Mandatory)][hashtable]$Attributes)
+
+    $attr = $Attributes   # read inside the script blocks below
+    $intOf = {
+        param($n, $default)
+        if ($attr.ContainsKey($n) -and $null -ne $attr[$n]) { [int]$attr[$n] } else { $default }
+    }
+    $nameFlag   = & $intOf 'msPKI-Certificate-Name-Flag' 0
+    $enrollFlag = & $intOf 'msPKI-Enrollment-Flag' 0
+    $raSig      = & $intOf 'msPKI-RA-Signature' 0
+    $schema     = & $intOf 'msPKI-Template-Schema-Version' 1
+    # The EFFECTIVE application policies of the issued certificate. The CA does not merge the two
+    # attributes: msPKI-Certificate-Application-Policy takes precedence over pKIExtendedKeyUsage,
+    # unless the template is schema version 1 and pKIExtendedKeyUsage holds EKUs (SpecterOps, "ADCS
+    # Attack Paths in BloodHound - Part 1", the rule BloodHound's effective EKUs follow). An empty
+    # effective list means a certificate without an EKU: valid for any purpose.
+    $listOf = {
+        param($n)
+        if ($attr.ContainsKey($n) -and $null -ne $attr[$n]) { @(@($attr[$n]) | ForEach-Object { "$_" } | Where-Object { $_ }) } else { @() }
+    }
+    $ekuV1  = @(& $listOf 'pKIExtendedKeyUsage')
+    $appPol = @(& $listOf 'msPKI-Certificate-Application-Policy')
+    $ekus   = @(if ($schema -le 1 -and $ekuV1.Count) { $ekuV1 } else { $appPol })   # @(): an if-expression unrolls the array
+
+    $anyPurpose   = $ekus -contains '2.5.29.37.0'
+    $noEku        = $ekus.Count -eq 0
+    # Client Authentication, PKINIT Client Authentication, Smart Card Logon - or any purpose.
+    $clientAuth   = $anyPurpose -or $noEku -or @($ekus | Where-Object { $_ -in '1.3.6.1.5.5.7.3.2', '1.3.6.1.5.2.3.4', '1.3.6.1.4.1.311.20.2.2' }).Count -gt 0
+    $requestAgent = $ekus -contains '1.3.6.1.4.1.311.20.2.1'
+    # CT_FLAG_ENROLLEE_SUPPLIES_SUBJECT (0x1) only: the CA MUST ignore
+    # CT_FLAG_ENROLLEE_SUPPLIES_SUBJECT_ALT_NAME (0x10000) and takes the subject AND the subject
+    # alternative name from the request only when 0x1 is set ([MS-WCCE] 3.2.2.6.2.1.4.5.9).
+    $suppliesName = ($nameFlag -band 0x1) -ne 0
+    # Manager approval (CT_FLAG_PEND_ALL_REQUESTS, 0x2) or a required authorized signature stops a
+    # request from being issued on the requester's word alone. Schema version 1 templates do not
+    # support the authorized-signature requirement, so msPKI-RA-Signature counts only from version 2.
+    $unattended   = (($enrollFlag -band 0x2) -eq 0) -and ($schema -le 1 -or $raSig -le 0)
+    $hint = 'Check who receives Enroll rights on the copy (-AclBase, -EnrollPrincipals) and whether a CA must publish it.'
+
+    $out = @()
+    if ($suppliesName -and $clientAuth -and $unattended) {
+        $out += "The template lets the requester supply the subject and the subject alternative name (msPKI-Certificate-Name-Flag 0x$('{0:X}' -f $nameFlag)), its certificates can authenticate a client, and it needs no manager approval or authorized signature. Anyone with Enroll rights can then request a certificate for any user, computer or administrator (ESC1). $hint"
+    }
+    if (($anyPurpose -or $noEku) -and $unattended) {
+        $what = if ($anyPurpose) { 'the Any Purpose application policy (2.5.29.37.0)' } else { 'no application policy (EKU) at all' }
+        $out += "The template issues certificates with $what, and it needs no manager approval or authorized signature. Such a certificate is valid for every purpose, client authentication and code signing included (ESC2). $hint"
+    }
+    if ($requestAgent -and $unattended) {
+        $out += "The template issues Certificate Request Agent certificates (1.3.6.1.4.1.311.20.2.1) without manager approval or an authorized signature. An enrollment agent can request certificates on behalf of other users (ESC3). $hint"
+    }
+    if (($enrollFlag -band 0x80000) -and $clientAuth) {
+        $out += "The template sets CT_FLAG_NO_SECURITY_EXTENSION (msPKI-Enrollment-Flag 0x80000): its certificates carry no SID security extension, so a domain controller cannot map them strongly to an account (ESC9). $hint"
+    }
+    if ($schema -le 1 -and $suppliesName) {
+        $out += "The template is schema version 1 and lets the requester supply the subject. On a CA without the fix for CVE-2024-49019, a requester can add application policies, for example client authentication, to the request (ESC15). $hint"
+    }
+    $out
 }
 
 function Import-Template {
@@ -1294,6 +1389,14 @@ function Import-Template {
         else {
             Write-Warning "-UpgradeCompatibility: $($compat.Reason); the template is imported at its existing compatibility."
         }
+    }
+
+    # Settings that are known escalation paths (ESC1, ESC2, ESC3, ESC9, ESC15) are named before the
+    # create prompt, so the operator decides with them in view. Warnings only: see
+    # Get-TemplateRiskWarning. Skipped for Validate's throwaway copies (-ExplicitOid), which are
+    # copies of the source inside the source forest and are removed again.
+    if (-not $ExplicitOid) {
+        foreach ($riskWarning in @(Get-TemplateRiskWarning -Attributes $oa)) { Write-Warning $riskWarning }
     }
 
     # Pre-flight: issuance policies the copy carries must not be ones THIS forest already binds to

@@ -73,7 +73,7 @@ Describe 'Submit-CertificateRequests' {
         $shim | Should -Not -BeNullOrEmpty
         . ([scriptblock]::Create($shim[0].Extent.Text))
         foreach ($name in 'Resolve-FullPath', 'Resolve-TrackingFilePath', 'Assert-NoReparsePointAt', 'New-CertreqCaptureFile', 'Assert-UnambiguousPathComponents', 'ConvertTo-ExtendedPath', 'New-ProtectedDirectory', 'Assert-SafeNativeArgument', 'Assert-CertificateOutputPath', 'Assert-ProtectedDirectoryChain', 'Move-StaleCertificateAside', 'Remove-AsideIfIdentical', 'Move-RetrievedCertificate', 'New-TempCertificatePath',
-                          'Get-TrustedPrincipalSet', 'ConvertTo-PrincipalLabel', 'Get-UntrustedGrant', 'Get-UntrustedOwner',
+                          'Get-TrustedPrincipalSet', 'ConvertTo-PrincipalLabel', 'Get-UntrustedGrant', 'Get-UntrustedOwner', 'Get-RequestFileTrust', 'Get-PrincipalGroupSids', 'Test-DefiniteSubmitFailure', 'Submit-SingleRequest',
                           'Write-BatchLog', 'Get-RequestIdFromOutput', 'Get-DispositionFromOutput',
                           'Get-FriendlyErrorHint', 'Import-TrackingData', 'Export-TrackingData', 'Remove-RspFile', 'Resolve-CertificateOutputNames', 'Get-DestinationOwnerConflict', 'Get-RequestFiles', 'Test-CertificateRequestFile') {
             $def = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name }, $false)
@@ -104,6 +104,10 @@ Describe 'Submit-CertificateRequests' {
         }
         $script:EnvTrusted = @($script:EnvTrusted | Sort-Object -Unique)
         $script:TrustedSids = Get-TrustedPrincipalSet -Extra $script:EnvTrusted
+        # The drop folder has its own trusted set and override (-TrustedInputPrincipal,
+        # -AllowUnprotectedInputFolder), which the main block sets next to the output ones.
+        $script:AllowUnprotectedInput = $false
+        $script:TrustedInputSids = Get-TrustedPrincipalSet -Extra $script:EnvTrusted
     }
 
     Context 'Unit: pure helpers' -Tag 'Unit' {
@@ -366,6 +370,205 @@ Describe 'Submit-CertificateRequests' {
             { Assert-SafeNativeArgument -Name T -Value 'x" -foo "y' } | Should -Throw -ExpectedMessage '*double quotes*'
             { Assert-SafeNativeArgument -Name T -Value "a`tb" }      | Should -Throw -ExpectedMessage '*control characters*'
             { Assert-SafeNativeArgument -Name T -Value '' }          | Should -Not -Throw
+        }
+
+        It 'Assert-SafeNativeArgument refuses a final backslash (it would escape the closing quote), and any backslash in a request attribute' {
+            # Under the Windows command-line rules \" is a literal quote, so a value ending in a
+            # backslash swallowed the closing quote the script adds, and the next argument - a
+            # drop-folder file name with spaces - was split into further certreq switches.
+            { Assert-SafeNativeArgument -Name T -Value 'CA01\Issuing CA\' }  | Should -Throw -ExpectedMessage '*must not end with a backslash*'
+            { Assert-SafeNativeArgument -Name T -Value 'CA01\Issuing CA\\' } | Should -Throw -ExpectedMessage '*must not end with a backslash*'
+            { Assert-SafeNativeArgument -Name T -Value 'CA01\nCA' }          | Should -Not -Throw -Because 'a backslash inside -CAConfig is the host\CA separator (and a CA name can begin with n)'
+            # certreq reads \n in an -attrib value as the start of a new attribute (for example SAN:)
+            { Assert-SafeNativeArgument -Name T -Value 'WebServer\nSAN:dns=dc01.contoso.com' -RequestAttribute } | Should -Throw -ExpectedMessage '*must not contain a backslash*'
+            { Assert-SafeNativeArgument -Name T -Value 'Web\Server' -RequestAttribute } | Should -Throw -ExpectedMessage '*must not contain a backslash*'
+            { Assert-SafeNativeArgument -Name T -Value 'WebServer' -RequestAttribute }  | Should -Not -Throw
+        }
+
+        It 'Get-RequestFileTrust reports the owner, and flags an untrusted owner or an untrusted writer of the file itself' {
+            $d = Join-Path $TestDrive 'trust-files'; [void][System.IO.Directory]::CreateDirectory($d)
+            $mine = Join-Path $d 'mine.req'; [System.IO.File]::WriteAllText($mine, 'x')
+            $t = Get-RequestFileTrust -File (Get-Item -LiteralPath $mine)
+            $t.Owner | Should -Not -BeNullOrEmpty
+            @($t.Problems).Count | Should -Be 0 -Because 'a file we created is owned by the running account or Administrators'
+
+            # An explicit entry on the FILE (the folder check sees only inherited entries): Modify for
+            # an untrusted, unresolvable principal lets it replace the key in the CSR.
+            $writable = Join-Path $d 'writable.req'; [System.IO.File]::WriteAllText($writable, 'x')
+            $acl = Get-Acl -LiteralPath $writable
+            $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+                (New-Object System.Security.Principal.SecurityIdentifier('S-1-5-21-111-222-333-513')), 'Modify', 'Allow')))
+            Set-Acl -LiteralPath $writable -AclObject $acl
+            $t = Get-RequestFileTrust -File (Get-Item -LiteralPath $writable)
+            ($t.Problems -join ' ') | Should -Match 'S-1-5-21-111-222-333-513'
+            # ...unless that principal is in the INPUT trusted set
+            # (plus this machine's TEMP-chain principals, which the file inherits - see the outer BeforeAll)
+            $t = Get-RequestFileTrust -File (Get-Item -LiteralPath $writable) -Trusted (Get-TrustedPrincipalSet -Extra (@($script:EnvTrusted) + 'S-1-5-21-111-222-333-513'))
+            @($t.Problems).Count | Should -Be 0
+            # Read-only for everyone is not a problem.
+            $readable = Join-Path $d 'readable.req'; [System.IO.File]::WriteAllText($readable, 'x')
+            $acl = Get-Acl -LiteralPath $readable
+            $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+                (New-Object System.Security.Principal.SecurityIdentifier('S-1-1-0')), 'ReadAndExecute', 'Allow')))
+            Set-Acl -LiteralPath $readable -AclObject $acl
+            @((Get-RequestFileTrust -File (Get-Item -LiteralPath $readable)).Problems).Count | Should -Be 0
+
+            # An untrusted OWNER controls the content (an owner can always re-permission the file).
+            $owned = Join-Path $d 'owned.req'; [System.IO.File]::WriteAllText($owned, 'x')
+            $acl = Get-Acl -LiteralPath $owned
+            try { $acl.SetOwner((New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-545'))); Set-Acl -LiteralPath $owned -AclObject $acl -ErrorAction Stop }
+            catch { Set-ItResult -Skipped -Because "cannot reassign ownership here: $_"; return }
+            $t = Get-RequestFileTrust -File (Get-Item -LiteralPath $owned)
+            $t.Owner | Should -Match 'S-1-5-32-545'
+            ($t.Problems -join ' ') | Should -Match 'owned by untrusted principal'
+            $acl = Get-Acl -LiteralPath $owned
+            $acl.SetOwner([System.Security.Principal.WindowsIdentity]::GetCurrent().User); Set-Acl -LiteralPath $owned -AclObject $acl
+        }
+
+        It 'Get-RequestFileTrust trusts a MEMBER of a trusted requester group (owner and writer), and nobody else' {
+            # A file that a member of the requester group creates is owned by that member, not by the
+            # group, and a CREATOR OWNER entry gives the member an entry of its own. The membership
+            # lookup (tokenGroups) needs AD, so it is stubbed here: BUILTIN\Users (S-1-5-32-545), the
+            # owner this test can assign, plays the member of the fake requester group.
+            $group = 'S-1-5-21-111-222-333-5000'
+            function Get-PrincipalGroupSids { param([string]$Sid) if ($Sid -eq 'S-1-5-32-545') { @($group) } else { @() } }
+            $d = Join-Path $TestDrive 'trust-members'; [void][System.IO.Directory]::CreateDirectory($d)
+            $f = Join-Path $d 'member.req'; [System.IO.File]::WriteAllText($f, 'x')
+            $acl = Get-Acl -LiteralPath $f
+            $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+                (New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-545')), 'Modify', 'Allow')))
+            try { $acl.SetOwner((New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-545'))); Set-Acl -LiteralPath $f -AclObject $acl -ErrorAction Stop }
+            catch { Set-ItResult -Skipped -Because "cannot reassign ownership here: $_"; return }
+            try {
+                $withGroup = Get-TrustedPrincipalSet -Extra (@($script:EnvTrusted) + $group)
+                @((Get-RequestFileTrust -File (Get-Item -LiteralPath $f) -Trusted $withGroup).Problems).Count | Should -Be 0 -Because 'the owner and the writer are members of a trusted group'
+                $withoutGroup = Get-TrustedPrincipalSet -Extra $script:EnvTrusted
+                $p = (Get-RequestFileTrust -File (Get-Item -LiteralPath $f) -Trusted $withoutGroup).Problems -join ' '
+                $p | Should -Match 'owned by untrusted principal' -Because 'without the group, the member is not trusted'
+                $p | Should -Match 'lets untrusted principal'
+            }
+            finally {
+                $acl = Get-Acl -LiteralPath $f
+                $acl.SetOwner([System.Security.Principal.WindowsIdentity]::GetCurrent().User); Set-Acl -LiteralPath $f -AclObject $acl
+            }
+        }
+
+        It 'Get-PrincipalGroupSids never looks up a SID that cannot have tokenGroups, and caches every answer' {
+            $script:GroupSidCache = @{}
+            @(Get-PrincipalGroupSids -Sid 'S-1-5-32-545').Count | Should -Be 0 -Because 'a well-known builtin SID is not a directory account'
+            @(Get-PrincipalGroupSids -Sid 'S-1-1-0').Count      | Should -Be 0
+            $script:GroupSidCache.ContainsKey('S-1-5-32-545')   | Should -BeTrue
+            $script:GroupSidCache['S-1-1-0'] = @('S-1-5-21-9-9-9-512')
+            @(Get-PrincipalGroupSids -Sid 'S-1-1-0') | Should -Be @('S-1-5-21-9-9-9-512') -Because 'the cached answer is reused'
+            $script:GroupSidCache = @{}
+        }
+
+        It 'Test-DefiniteSubmitFailure accepts only a CONNECTION-phase exit code as proof that the request never reached the CA' {
+            # certreq exits with the HRESULT that ended it (0x800706BA for an unreachable host was
+            # observed live). The literals below are [int]: a hex literal with bit 31 set is negative.
+            Test-DefiniteSubmitFailure -ExitCode 0x800706BA | Should -BeTrue -Because 'RPC_S_SERVER_UNAVAILABLE: the CA host was never reached'
+            Test-DefiniteSubmitFailure -ExitCode -2147023174 | Should -BeTrue -Because 'the same code as Process.ExitCode reports it'
+            Test-DefiniteSubmitFailure -ExitCode 0x800706BF | Should -BeTrue -Because 'RPC_S_CALL_FAILED_DNE: the call did not execute'
+            Test-DefiniteSubmitFailure -ExitCode 0x800706D9 | Should -BeTrue -Because 'EPT_S_NOT_REGISTERED: no CA endpoint'
+            Test-DefiniteSubmitFailure -ExitCode 0x8007232B | Should -BeTrue -Because 'the CA host name did not resolve'
+            # Everything else may have left the request at the CA (Unknown, never resubmitted automatically).
+            Test-DefiniteSubmitFailure -ExitCode 0x800706BE | Should -BeFalse -Because 'RPC_S_CALL_FAILED: the call was sent'
+            Test-DefiniteSubmitFailure -ExitCode 0x80070005 | Should -BeFalse -Because 'access denied can come from saving the issued certificate'
+            Test-DefiniteSubmitFailure -ExitCode 0x80070002 | Should -BeFalse -Because 'a file error can come from saving the issued certificate'
+            Test-DefiniteSubmitFailure -ExitCode 0x8009310B | Should -BeFalse -Because 'an ASN.1 error can come from decoding the CA answer'
+            Test-DefiniteSubmitFailure -ExitCode 1 | Should -BeFalse -Because 'a certreq ended from outside exits with whatever code it was given'
+        }
+
+        It 'Submit-SingleRequest records Unknown after a failed certreq unless the output proves non-submission' {
+            # Behavioural: certreq is replaced by a mock that exits nonzero with the given output. The
+            # write-ahead row this result replaces must not turn into a resubmittable Error when the
+            # CA may hold the request - for example when certreq was ended from outside and printed nothing.
+            $script:LogFile = Join-Path $TestDrive 'ssr\unit.log'
+            $dir = Join-Path $TestDrive 'ssr'; [void][System.IO.Directory]::CreateDirectory($dir)
+            $req = Join-Path $dir 'a.req'; [System.IO.File]::WriteAllText($req, 'x')
+            $cer = Join-Path $dir 'a.cer'
+            $script:FakeCertreq = @{ Exit = 1; Out = @() }
+            Mock Start-Process {
+                if (@($script:FakeCertreq.Out).Count) { [System.IO.File]::WriteAllLines($RedirectStandardOutput, [string[]]$script:FakeCertreq.Out) }
+                [pscustomobject]@{ ExitCode = $script:FakeCertreq.Exit }
+            }
+            $call = { Submit-SingleRequest -RequestFile (Get-Item -LiteralPath $req) -CAConfig 'CA01\Issuing CA' -CertificateTemplate 'WebServer' -CerPath $cer -AllowedRoots @($dir) -Owner 'T' 3>$null 2>$null 6>$null }
+            $script:SuppressLogFile = $true
+            try {
+                # certreq ended from outside: nonzero exit, no output at all
+                (& $call).Status | Should -BeExactly 'Unknown'
+                # a remote call that failed after it was sent
+                $script:FakeCertreq = @{ Exit = 0x800706BE; Out = @('The remote procedure call failed. 0x800706be (WIN32: 1726 RPC_S_CALL_FAILED)') }
+                (& $call).Status | Should -BeExactly 'Unknown'
+                # preliminary diagnostics (seen in real certreq output of a submission the CA issued) prove
+                # nothing: an allow-listed code in the TEXT must not turn the row into a resubmittable Error
+                $script:FakeCertreq = @{ Exit = 0x800706BE; Out = @('3000.839.0:<2021/12/17, 18:26:44>: 0x80094004 (-2146877436 CERTSRV_E_PROPERTY_EMPTY)',
+                                                                  '437.625.0:<2021/12/17, 18:26:44>: 0x80070002 (WIN32: 2 ERROR_FILE_NOT_FOUND): Active',
+                                                                  'The RPC server is unavailable. 0x800706ba (a side query)',
+                                                                  'The remote procedure call failed. 0x800706be (WIN32: 1726 RPC_S_CALL_FAILED)') }
+                (& $call).Status | Should -BeExactly 'Unknown'
+                # an unreadable CSR may also be an undecodable CA answer: Unknown, never a blind resubmission
+                $script:FakeCertreq = @{ Exit = 0x8009310B; Out = @('ASN1 bad tag value met. 0x8009310b (ASN: 267 CRYPT_E_ASN1_BADTAG)') }
+                (& $call).Status | Should -BeExactly 'Unknown'
+                # proven non-submission: the exit code is a connection-phase failure
+                $script:FakeCertreq = @{ Exit = 0x800706BA; Out = @('The RPC server is unavailable. 0x800706ba (WIN32: 1722 RPC_S_SERVER_UNAVAILABLE)') }
+                (& $call).Status | Should -BeExactly 'Error'
+                # a CA answer that carries a RequestID keeps it (such a row counts as submitted in any case)
+                $script:FakeCertreq = @{ Exit = 1; Out = @('RequestId: 42', 'Denied by Policy Module 0x80094012') }
+                (& $call).RequestID | Should -Be 42
+                # nothing was written or left behind beside the destination
+                @(Get-ChildItem -LiteralPath $dir -Filter '*.staging.*').Count | Should -Be 0
+                Test-Path -LiteralPath $cer | Should -BeFalse
+            }
+            finally { $script:SuppressLogFile = $true }
+        }
+
+        It 'Assert-ProtectedDirectoryChain -Role Input judges the drop folder against its OWN trusted set and override, with drop-folder wording' {
+            $drop = Join-Path $TestDrive 'drop-open'; [void][System.IO.Directory]::CreateDirectory($drop)
+            $acl = Get-Acl -LiteralPath $drop
+            $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+                (New-Object System.Security.Principal.SecurityIdentifier('S-1-5-21-111-222-333-513')), 'CreateFiles', 'None', 'None', 'Allow')))
+            Set-Acl -LiteralPath $drop -AclObject $acl
+            # CreateFiles alone on the drop folder lets that principal place a request file there.
+            { Assert-ProtectedDirectoryChain -Name 'Input folder' -Directory $drop -Path $drop -Role Input } |
+                Should -Throw -ExpectedMessage '*place a request file there*-AllowUnprotectedInputFolder*'
+            # The OUTPUT override does not cover the drop folder...
+            $script:AllowUnprotectedOutput = $true
+            try { { Assert-ProtectedDirectoryChain -Name 'Input folder' -Directory $drop -Path $drop -Role Input } | Should -Throw -ExpectedMessage '*place a request file there*' }
+            finally { $script:AllowUnprotectedOutput = $false }
+            # ...the input override does (a warning instead)...
+            $script:AllowUnprotectedInput = $true
+            try { { Assert-ProtectedDirectoryChain -Name 'Input folder' -Directory $drop -Path $drop -Role Input 3>$null } | Should -Not -Throw }
+            finally { $script:AllowUnprotectedInput = $false }
+            # ...and so does naming the principal in the INPUT trusted set - which leaves the output set untouched.
+            $saved = $script:TrustedInputSids
+            try {
+                $script:TrustedInputSids = Get-TrustedPrincipalSet -Extra (@($script:EnvTrusted) + 'S-1-5-21-111-222-333-513')
+                { Assert-ProtectedDirectoryChain -Name 'Input folder' -Directory $drop -Path $drop -Role Input } | Should -Not -Throw
+                { Assert-ProtectedDirectoryChain -Name 'Output location' -Directory $drop -Path $drop } | Should -Throw -ExpectedMessage '*can delete, rename or write to*'
+            }
+            finally { $script:TrustedInputSids = $saved }
+
+            # An inheritable FILES entry: every request file placed in the folder would be writable.
+            $filesOpen = Join-Path $TestDrive 'drop-files-open'; [void][System.IO.Directory]::CreateDirectory($filesOpen)
+            $acl = Get-Acl -LiteralPath $filesOpen
+            $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+                (New-Object System.Security.Principal.SecurityIdentifier('S-1-5-21-111-222-333-513')), 'Modify', 'ObjectInherit', 'InheritOnly', 'Allow')))
+            Set-Acl -LiteralPath $filesOpen -AclObject $acl
+            { Assert-ProtectedDirectoryChain -Name 'Input folder' -Directory $filesOpen -Path $filesOpen -Role Input } |
+                Should -Throw -ExpectedMessage '*every request file placed there inherits that grant*'
+        }
+
+        It 'Get-RequestFiles skips a request file that is a symbolic link' {
+            $dir = Join-Path $TestDrive 'drop-links'; [void][System.IO.Directory]::CreateDirectory($dir)
+            $elsewhere = Join-Path $TestDrive 'elsewhere.req'; [System.IO.File]::WriteAllText($elsewhere, 'x')
+            [System.IO.File]::WriteAllText((Join-Path $dir 'real.req'), 'x')
+            try { New-Item -ItemType SymbolicLink -Path (Join-Path $dir 'link.req') -Target $elsewhere -ErrorAction Stop | Out-Null }
+            catch { Set-ItResult -Skipped -Because "symbolic links cannot be created in this session ($($_.Exception.Message))"; return }
+            $script:SuppressLogFile = $true
+            try { $out = @(Get-RequestFiles -Path $dir 3>&1) } finally { $script:SuppressLogFile = $false }
+            @($out | Where-Object { $_ -is [System.IO.FileInfo] } | ForEach-Object { $_.Name }) | Should -Be @('real.req')
+            @($out | Where-Object { $_ -is [System.Management.Automation.WarningRecord] -and "$_" -match 'link\.req' }).Count | Should -Be 1
         }
 
         It 'Import-TrackingData reads a tracking file whose name carries wildcard characters literally' {
@@ -1105,6 +1308,40 @@ Describe 'Submit-CertificateRequests' {
             ($src -join "`n") | Should -Not -Match 'New-Item -Path \$OutputFolder -ItemType Directory' -Because 'New-Item -Force creates the whole path through whatever already occupies a component; creation must be the atomic per-component New-ProtectedDirectory'
             $src[$anchorCheck - 1] | Should -Match '-ForFolderCreation' -Because 'a parent is judged for folder creation: on what the new folder would inherit, not on what files would inherit (none are written there)'
         }
+
+        It 'persists a write-ahead Unknown row BEFORE certreq runs and replaces it with the result, never appending a second row' {
+            # A run that stops while certreq runs must leave a row that counts as submitted, or the
+            # next run submits the file again (a duplicate request at the CA).
+            $src = Get-Content -LiteralPath $script:Submit
+            $inFlight = ($src | Select-String -Pattern '^\s*\$inFlight = \[PSCustomObject\]@\{' | Select-Object -First 1).LineNumber
+            $inFlight | Should -Not -BeNullOrEmpty
+            $block = $src[($inFlight - 1)..($inFlight + 12)] -join "`n"
+            $block | Should -Match "Status\s+= 'Unknown'" -Because 'Unknown without a RequestID counts as submitted and is never resubmitted automatically'
+            $add    = ($src | Select-String -Pattern '^\s*\[void\]\$tracking\.Add\(\$inFlight\)' | Select-Object -First 1).LineNumber
+            $submit = ($src | Select-String -Pattern '\$result = Submit-SingleRequest ' | Select-Object -First 1).LineNumber
+            $add    | Should -Not -BeNullOrEmpty
+            $submit | Should -Not -BeNullOrEmpty
+            $persist = ($src[($add - 1)..($submit - 1)] | Select-String -Pattern 'Export-TrackingData -Data @\(\$tracking\)').Count
+            $persist | Should -BeGreaterThan 0 -Because 'the write-ahead row must be ON DISK before certreq starts'
+            ($src -join "`n") | Should -Match '\$tracking\[\$rowIndex\] = \$result' -Because 'the result replaces the write-ahead row'
+            ($src -join "`n") | Should -Not -Match '\[void\]\$tracking\.Add\(\$result\)' -Because 'appending would leave the write-ahead row behind as a second, stale row'
+            # certreq having run turns a later failure into Unknown (never resubmitted automatically), not Error.
+            $flag = ($src | Select-String -Pattern '^\s*\$script:CertreqRan = \$true' | Select-Object -First 1).LineNumber
+            $proc = ($src | Select-String -Pattern "Start-Process -FilePath 'certreq\.exe' -ArgumentList @\(" | Select-Object -First 1).LineNumber
+            $flag | Should -BeGreaterThan $proc -Because 'the flag is set only after certreq has run'
+            # A failed certreq is a resubmittable Error only when its output proves non-submission.
+            ($src -join "`n") | Should -Match 'elseif \(Test-DefiniteSubmitFailure -ExitCode \$proc\.ExitCode\)' -Because 'the exit code, not the console text, is the terminal error'
+        }
+
+        It 'checks the drop folder (as an INPUT) before the CA is contacted' {
+            $src = Get-Content -LiteralPath $script:Submit
+            $inputCheck = ($src | Select-String -Pattern "Assert-ProtectedDirectoryChain -Name 'Input folder' .*-Role Input" | Select-Object -First 1).LineNumber
+            $caTest     = ($src | Select-String -Pattern 'if \(-not \(Test-CAConnectivity -CAConfig' | Select-Object -First 1).LineNumber
+            $listing    = ($src | Select-String -Pattern '\$requestFiles = @\(Get-RequestFiles ' | Select-Object -First 1).LineNumber
+            $inputCheck | Should -Not -BeNullOrEmpty
+            $inputCheck | Should -BeLessThan $caTest
+            $inputCheck | Should -BeLessThan $listing
+        }
     }
 
     Context 'Guard: validation before any CA contact' -Tag 'Guard' {
@@ -1146,6 +1383,51 @@ Describe 'Submit-CertificateRequests' {
             { & $script:Submit -CAConfig 'localhost\PESTER-NoSuchCA' -Mode Retrieve -WhatIf -AllowUnprotectedOutputFolder `
                   -TrackingFile (Join-Path $TestDrive 'g4.csv') -OutputFolder $loose 3>$null 2>$null 6>$null } |
                 Should -Throw -ExpectedMessage '*Cannot reach CA*'
+        }
+
+        It 'refuses a drop folder that an untrusted principal can write to, before the CA is contacted, unless trusted or overridden' {
+            $drop = Join-Path $TestDrive 'guard-drop'; New-Item -ItemType Directory -Force $drop | Out-Null
+            $acl = Get-Acl -LiteralPath $drop
+            $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+                (New-Object System.Security.Principal.SecurityIdentifier('S-1-5-21-111-222-333-513')), 'Modify', 'ContainerInherit, ObjectInherit', 'None', 'Allow')))
+            Set-Acl -LiteralPath $drop -AclObject $acl
+            $common = @{ CAConfig = 'localhost\PESTER-NoSuchCA'; CertificateTemplate = 'WebServer'; Mode = 'Submit'; WhatIf = $true
+                         InputPath = $drop; TrackingFile = (Join-Path $TestDrive 'g5.csv'); OutputFolder = (Join-Path $TestDrive 'g5')
+                         TrustedOutputPrincipal = $script:EnvTrusted }
+            { & $script:Submit @common -TrustedInputPrincipal $script:EnvTrusted 3>$null 6>$null } |
+                Should -Throw -ExpectedMessage '*Input folder*place a request file there*'
+            # The OUTPUT override does not accept a drop folder.
+            { & $script:Submit @common -TrustedInputPrincipal $script:EnvTrusted -AllowUnprotectedOutputFolder 3>$null 6>$null } |
+                Should -Throw -ExpectedMessage '*Input folder*place a request file there*'
+            # Naming the requester group as trusted for INPUT, or accepting the risk, lets the run reach the CA check.
+            { & $script:Submit @common -TrustedInputPrincipal (@($script:EnvTrusted) + 'S-1-5-21-111-222-333-513') 3>$null 2>$null 6>$null } |
+                Should -Throw -ExpectedMessage '*Cannot reach CA*'
+            { & $script:Submit @common -AllowUnprotectedInputFolder 3>$null 2>$null 6>$null } |
+                Should -Throw -ExpectedMessage '*Cannot reach CA*'
+        }
+
+        It 'refuses a missing -InputPath BEFORE the CA is contacted (a folder created later could be a junction)' {
+            # Were the folder allowed to be missing at the check, a user who can create folders in its
+            # parent could create it as a junction while the CA check runs. The run must stop at the
+            # input path, not reach the connectivity check.
+            { & $script:Submit -CAConfig 'localhost\PESTER-NoSuchCA' -CertificateTemplate 'WebServer' -Mode Submit -WhatIf `
+                  -InputPath (Join-Path $TestDrive 'no-such-drop') -TrustedOutputPrincipal $script:EnvTrusted `
+                  -TrackingFile (Join-Path $TestDrive 'g7.csv') -OutputFolder (Join-Path $TestDrive 'g7') 3>$null 6>$null } |
+                Should -Throw -ExpectedMessage '*InputPath does not exist*'
+            $file = Join-Path $TestDrive 'drop-is-a-file.req'; [System.IO.File]::WriteAllText($file, 'x')
+            { & $script:Submit -CAConfig 'localhost\PESTER-NoSuchCA' -CertificateTemplate 'WebServer' -Mode Submit -WhatIf `
+                  -InputPath $file -TrustedOutputPrincipal $script:EnvTrusted `
+                  -TrackingFile (Join-Path $TestDrive 'g7.csv') -OutputFolder (Join-Path $TestDrive 'g7') 3>$null 6>$null } |
+                Should -Throw -ExpectedMessage '*InputPath must be a folder*'
+        }
+
+        It 'refuses a -CAConfig that ends in a backslash and a -CertificateTemplate with a backslash, before anything else' {
+            { & $script:Submit -CAConfig 'CA01\Issuing CA\' -Mode Retrieve -WhatIf `
+                  -TrackingFile (Join-Path $TestDrive 'g6.csv') -OutputFolder (Join-Path $TestDrive 'g6') } |
+                Should -Throw -ExpectedMessage '*-CAConfig must not end with a backslash*'
+            { & $script:Submit -CAConfig 'CA01\Issuing CA' -CertificateTemplate 'WebServer\nSAN:dns=dc01' -InputPath $TestDrive -Mode Submit -WhatIf `
+                  -TrackingFile (Join-Path $TestDrive 'g6.csv') -OutputFolder (Join-Path $TestDrive 'g6') } |
+                Should -Throw -ExpectedMessage '*-CertificateTemplate must not contain a backslash*'
         }
     }
 
@@ -1207,7 +1489,8 @@ RequestType = PKCS10
             function script:Invoke-Submit {
                 param([hashtable]$Params)
                 $call = @{ CAConfig = $script:Ca; TrackingFile = $script:Tracking; OutputFolder = $script:CertDir; Confirm = $false
-                           TrustedOutputPrincipal = $script:EnvTrusted }   # this machine's TEMP-chain grants (see the outer BeforeAll)
+                           TrustedOutputPrincipal = $script:EnvTrusted     # this machine's TEMP-chain grants (see the outer BeforeAll)
+                           TrustedInputPrincipal  = $script:EnvTrusted }   # the drop folders live in the same chain
                 foreach ($k in $Params.Keys) { $call[$k] = $Params[$k] }   # a test may override a default (e.g. OutputFolder)
                 # NoOutputFolder sentinel: drop -OutputFolder entirely so the script delivers to the
                 # row's own recorded OutputCertFile (the "only -CAConfig and the tracking file" path).
@@ -1299,6 +1582,13 @@ RequestType = PKCS10
                 Test-Path ([System.IO.Path]::ChangeExtension($row.OutputCertFile, '.rsp')) | Should -BeFalse
             }
             @($r.Rows.RequestID | Sort-Object -Unique).Count | Should -Be 2
+            # Each row records who owns the request file; the write-ahead Unknown rows were replaced
+            # (two files, two rows - not four).
+            $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+            foreach ($row in $r.Rows) {
+                $row.RequestFileOwner | Should -Match ([regex]::Escape($me) + '|S-1-5-32-544') -Because 'the CSR files were created by this account (or, elevated, owned by Administrators)'
+            }
+            $r.Output | Should -Match 'Submitting: .* \(owner: '
         }
 
         It 'rerunning without -Force skips already-submitted files (non-interactive prompt falls back to skip)' {
@@ -1373,6 +1663,44 @@ RequestType = PKCS10
             $row.Status | Should -BeIn @('Error', 'Denied')
             ($row.ErrorMessage + $r.Output) | Should -Match '0x80094800|UNSUPPORTED_CERT_TYPE|not supported'
             $r.Output | Should -Match 'CATemplates'   # the actionable part of the friendly hint
+        }
+
+        It 'Get-PrincipalGroupSids reads the transitive group membership of a live domain account' {
+            # The requester-group trust depends on it: the running account is a domain account in
+            # the lab, so its tokenGroups must hold its primary group (Domain Users, RID 513).
+            $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+            $script:GroupSidCache = @{}
+            $groups = @(Get-PrincipalGroupSids -Sid $me.Value)
+            $groups.Count | Should -BeGreaterThan 0
+            $groups | Should -Contain "$($me.AccountDomainSid.Value)-513"
+            $script:GroupSidCache = @{}
+        }
+
+        It 'refuses a request file that an untrusted principal owns: an Error row, and nothing reaches the CA' {
+            $ownedDir = Join-Path $TestDrive 'owned-input'
+            New-Item -ItemType Directory -Force $ownedDir | Out-Null
+            script:New-LabCsr -BaseName "$script:Prefix-owned" -OutDir $ownedDir
+            $csr = Join-Path $ownedDir "$script:Prefix-owned.req"
+            $acl = Get-Acl -LiteralPath $csr
+            $acl.SetOwner((New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-545')))   # BUILTIN\Users
+            Set-Acl -LiteralPath $csr -AclObject $acl
+            try {
+                $r = script:Invoke-Submit @{ InputPath = $ownedDir; CertificateTemplate = $LabTemplate; Mode = 'Submit' }
+                $row = @($r.Rows | Where-Object { $_.RequestFile -eq $csr }) | Select-Object -Last 1
+                $row | Should -Not -BeNullOrEmpty
+                $row.Status | Should -BeExactly 'Error'
+                $row.RequestID | Should -BeNullOrEmpty -Because 'the file was refused before certreq ran'
+                $row.ErrorMessage | Should -Match 'Refused before submission'
+                $row.RequestFileOwner | Should -Match 'S-1-5-32-545'
+                $r.Output | Should -Match 'not under trusted control'
+                $r.Output | Should -Match 'TERMINATING: .*failed or need attention' -Because 'a refused file is a failure for automation'
+                (certutil -config $script:Ca -view -restrict "CommonName=$script:Prefix-owned" -out RequestId 2>&1 | Out-String) |
+                    Should -Not -Match 'Request ID:\s*0x' -Because 'nothing may reach the CA'
+            }
+            finally {
+                $acl = Get-Acl -LiteralPath $csr
+                $acl.SetOwner([System.Security.Principal.WindowsIdentity]::GetCurrent().User); Set-Acl -LiteralPath $csr -AclObject $acl
+            }
         }
 
         Context 'content-tested request files (.pem and -AnyExtension)' {

@@ -8,6 +8,32 @@ Each script also carries its own version in the `PSScriptInfo` header at the top
 Test-ScriptFileInfo .\Submit-CertificateRequests.ps1 | Select-Object Name, Version
 ```
 
+## [Unreleased]
+
+This release closes trust gaps that an external review of the repository found. Submit-CertificateRequests.ps1 now checks its drop folder, and it records each request before certreq runs. Sync-ADCSTemplate.ps1 warns about template settings that are known escalation paths. The GPO script reads back every write.
+
+### Changed
+
+- **Submit-CertificateRequests.ps1 → 1.2.0.** The drop folder is now an authorization boundary that the script checks.
+  - The script submits every request file with the enrollment rights of the running account. So anyone who can write to the drop folder can obtain a certificate through that account. When the template builds the subject from Active Directory, the certificate names the running account, but with the key of the request author.
+  - The script now checks the `-InputPath` folder with the same chain check as an output folder. It refuses a reparse point and an untrusted owner. It also refuses an untrusted principal that can create files in the folder, write to it, delete it or rename it. It also refuses an inheritable entry that gives an untrusted principal write rights on the files in the folder.
+  - Behaviour change: a drop folder that any user can write to now stops the run. A new folder directly under `C:\` is such a folder, because it inherits the right of `BUILTIN\Users` to create files. The new `-TrustedInputPrincipal` names a requester group, and the new `-AllowUnprotectedInputFolder` accepts the risk.
+  - The script now refuses a missing `-InputPath` before it contacts the CA. Before, a folder that did not exist yet skipped the check. A user who can create folders in the parent could then create it as a junction.
+  - The script checks each request file too. It refuses a file that an untrusted principal owns or can change, and records an `Error` row for it. It skips a symbolic link or another reparse point with a warning.
+  - For a request file, a member of a group in `-TrustedInputPrincipal` counts as trusted. The script reads the membership from Active Directory over a signed and sealed connection, and nested groups count. When it cannot read the membership, it treats the account as untrusted.
+  - The new `RequestFileOwner` column of the tracking file, and the per-run log, record the owner of each request file.
+  - The script now writes a row with Status `Unknown` before certreq runs, and replaces it with the result. Before, a run that stopped while certreq ran left no row, and the next run submitted the file again. The CA could then hold two requests for one CSR.
+  - A failure after certreq ran now records `Unknown` instead of `Error`. The next run submits an `Error` row without a RequestID again, but the CA could already hold that request.
+  - A failed certreq without a RequestID now records `Error` only when its exit code proves that the request never reached the CA. Only a connection failure is such proof, for example `RPC_S_SERVER_UNAVAILABLE`. Every other failure records `Unknown`, for example `RPC_S_CALL_FAILED` or an unreadable CSR. The script judges the exit code, because certreq also prints error codes for side queries that do not stop it.
+  - A value that reaches the certreq command line must not end with a backslash. The script puts each value between double quotes, and a final backslash escaped the closing quote. The spaces in a drop-folder file name then added certreq switches.
+  - `-CertificateTemplate` must not contain a backslash. Certreq reads `\n` in a request attribute as the start of a new attribute, for example a subject alternative name.
+  - A RequestID from the tracking file must hold only the digits 0 to 9. The .NET pattern `\d` also matched other Unicode digits, and `$` matched before a final newline.
+- **Sync-ADCSTemplate.ps1 → 1.0.9.** Import and Sync now warn about template settings that are known escalation paths.
+  - Before the create prompt, the script names the ESC1, ESC2, ESC3, ESC9 and ESC15 settings of the imported template. It writes a warning for each finding and still imports the template.
+  - The rules judge the application policies that the CA puts in the certificate. They count only `CT_FLAG_ENROLLEE_SUPPLIES_SUBJECT` (0x1), because the CA ignores the SAN-only flag. They count an authorized-signature requirement only from schema version 2.
+  - The OID checks now accept only the digits 0 to 9. The .NET pattern `\d` also matched other Unicode digits, for example Arabic-Indic digits.
+- **Add-CertificateEnrollmentPolicyServerToGpo.ps1 → 1.0.9.** The script now reads back the root Flags, the (Default) marker and each marker removal from the registry.pol replay. It also checks the registry type of each value. Before, the script reported these writes as applied without a read-back.
+
 ## [1.0.13] — 2026-09-24
 
 This release adds `.pem` request files and a content test for CSR files to Submit-CertificateRequests.ps1. The other scripts are unchanged.
@@ -408,6 +434,7 @@ Initial release.
 | Add-CertificateEnrollmentPolicyServerOffline.ps1 | 1.0.0 |
 | Add-CertificateEnrollmentPolicyServerToGpo.ps1 | 1.0.0 |
 
+[Unreleased]: https://github.com/TheOmnilord/ADCS/compare/v1.0.13...HEAD
 [1.0.13]: https://github.com/TheOmnilord/ADCS/compare/v1.0.12...v1.0.13
 [1.0.12]: https://github.com/TheOmnilord/ADCS/compare/v1.0.11...v1.0.12
 [1.0.11]: https://github.com/TheOmnilord/ADCS/compare/v1.0.10...v1.0.11

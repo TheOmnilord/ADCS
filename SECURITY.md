@@ -29,6 +29,11 @@ program; this is a best-effort, community-maintained project.
   (Administrators, SYSTEM, the OCSP responder's `S-1-5-80-…` service SID). Template OIDs are
   stripped from the files under [`Templates/`](./Templates/README.md) so they cannot fingerprint a
   forest.
+- **The Submit drop folder is an authorization boundary.** `Submit-CertificateRequests.ps1`
+  submits every request file in `-InputPath` with the enrollment rights of the account that runs
+  it, so whoever can write there can obtain certificates through that account. The script refuses
+  a drop folder, or a request file, that an untrusted principal controls, unless
+  `-AllowUnprotectedInputFolder` accepts the risk.
 - **Destructive operations are exact-scoped.** The test suites, when run against a lab
   (`-RunLab`), create and remove only objects carrying a unique per-run `PESTER-<hex>` prefix and
   never touch pre-existing objects; see the per-suite notes under [`Tests/`](./Tests).

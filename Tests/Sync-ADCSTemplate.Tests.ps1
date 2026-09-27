@@ -75,7 +75,7 @@ Describe 'Sync-ADCSTemplate' {
         # Resolve-PrincipalSid, Import-Template and Export-Template reach the directory only through
         # Get-ADObject / New-ADObject / Remove-ADObject / Get-ADObjectIfPresent / Get-SchemaAttributeType,
         # which their Unit Contexts shadow with stub functions - no AD module is needed for them.
-        foreach ($name in 'Get-RandomHex', 'ConvertTo-LdapFilterValue', 'New-SyntheticOidBase', 'Get-AttrCanonical', 'Compare-TemplateAttributes', 'Convert-ToLatestCompatibility', 'ConvertTo-ImportAttributeValue', 'Get-LinkedIssuancePolicy',
+        foreach ($name in 'Get-RandomHex', 'ConvertTo-LdapFilterValue', 'New-SyntheticOidBase', 'Get-AttrCanonical', 'Compare-TemplateAttributes', 'Convert-ToLatestCompatibility', 'ConvertTo-ImportAttributeValue', 'Get-LinkedIssuancePolicy', 'Get-TemplateRiskWarning',
                          'ConvertTo-SchemaTypedValue', 'Get-RootDomainSid', 'Get-WellKnownTokenSid', 'Resolve-PrincipalSid', 'Export-Template', 'Resolve-OidDisplay', 'Resolve-TemplateOid', 'Import-Template') {
             $def = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name }, $false)
             $def | Should -Not -BeNullOrEmpty -Because "function $name must be defined in the script"
@@ -379,17 +379,83 @@ public static class PesterSyncFsNative {
             { ConvertTo-ImportAttributeValue -Name 'msPKI-Supersede-Templates' -Value @('') }        | Should -Throw -ExpectedMessage '*empty element*'
         }
 
+        It 'the OID checks accept only the digits 0-9 (.NET \d also matches Arabic-Indic and other Unicode digits)' {
+            $arabic3 = [string][char]0x0663   # ARABIC-INDIC DIGIT THREE: '\d' matches it, '[0-9]' does not
+            { ConvertTo-ImportAttributeValue -Name 'msPKI-Certificate-Policy' -Value @("1.3.6.1.4.1.311.21.8.$arabic3") } | Should -Throw -ExpectedMessage '*not a dotted OID*'
+            { ConvertTo-ImportAttributeValue -Name 'pKIExtendedKeyUsage' -Value @("$arabic3.3.6.1.5.5.7.3.1") }           | Should -Throw -ExpectedMessage '*not a dotted OID*'
+            { Resolve-TemplateOid -OidHandling Preserve -ExplicitOid "1.3.6.1$arabic3" -ConfigNC 'CN=Configuration,DC=x' -ADParams @{} } |
+                Should -Throw -ExpectedMessage '*not a valid dotted OID*'
+            (Resolve-TemplateOid -OidHandling Preserve -ExplicitOid '1.3.6.1.4.1.311.21.8.1' -ConfigNC 'CN=Configuration,DC=x' -ADParams @{}).Oid | Should -BeExactly '1.3.6.1.4.1.311.21.8.1'
+        }
+
+        It 'Get-TemplateRiskWarning names ESC1, ESC2, ESC3, ESC9 and ESC15 settings, and stays quiet for an approval-gated or directory-built template' {
+            $clientAuth = [object[]]@('1.3.6.1.5.5.7.3.2')
+            $serverAuth = [object[]]@('1.3.6.1.5.5.7.3.1')
+            $risk = { param($a) @(Get-TemplateRiskWarning -Attributes $a) -join "`n" }
+            # Schema 2 and later: msPKI-Certificate-Application-Policy holds the effective application policies.
+            # ESC1: requester-supplied subject (0x1) + client authentication + no approval
+            & $risk @{ 'msPKI-Certificate-Name-Flag' = 1; 'msPKI-Template-Schema-Version' = 2; 'msPKI-Certificate-Application-Policy' = $clientAuth } | Should -Match 'ESC1'
+            & $risk @{ 'msPKI-Certificate-Name-Flag' = 1; 'msPKI-Template-Schema-Version' = 2; 'msPKI-Certificate-Application-Policy' = [object[]]@('1.3.6.1.4.1.311.20.2.2') } | Should -Match 'ESC1' -Because 'Smart Card Logon authenticates a client'
+            # The SAN-only flag (0x10000) is IGNORED by the CA ([MS-WCCE] 3.2.2.6.2.1.4.5.9): no ESC1, and no ESC15 on schema 1.
+            & $risk @{ 'msPKI-Certificate-Name-Flag' = 0x10000; 'msPKI-Template-Schema-Version' = 2; 'msPKI-Certificate-Application-Policy' = $clientAuth } | Should -Not -Match 'ESC'
+            & $risk @{ 'msPKI-Certificate-Name-Flag' = 0x10000; 'msPKI-Template-Schema-Version' = 1; 'pKIExtendedKeyUsage' = $serverAuth } | Should -Not -Match 'ESC'
+            # ...no warning with manager approval (CT_FLAG_PEND_ALL_REQUESTS), or a required authorized signature from schema 2...
+            & $risk @{ 'msPKI-Certificate-Name-Flag' = 1; 'msPKI-Template-Schema-Version' = 2; 'msPKI-Certificate-Application-Policy' = $clientAuth; 'msPKI-Enrollment-Flag' = 2 } | Should -Not -Match 'ESC'
+            & $risk @{ 'msPKI-Certificate-Name-Flag' = 1; 'msPKI-Template-Schema-Version' = 2; 'msPKI-Certificate-Application-Policy' = $clientAuth; 'msPKI-RA-Signature' = 1 } | Should -Not -Match 'ESC'
+            # ...but schema 1 does not support authorized signatures: msPKI-RA-Signature mitigates nothing there.
+            & $risk @{ 'msPKI-Template-Schema-Version' = 1; 'pKIExtendedKeyUsage' = [object[]]@('1.3.6.1.4.1.311.20.2.1'); 'msPKI-RA-Signature' = 1 } | Should -Match 'ESC3'
+            & $risk @{ 'msPKI-Template-Schema-Version' = 1; 'pKIExtendedKeyUsage' = [object[]]@('1.3.6.1.4.1.311.20.2.1'); 'msPKI-Enrollment-Flag' = 2 } | Should -Not -Match 'ESC' -Because 'manager approval applies at every schema version'
+            # ...and not for a server-authentication-only template (a web server can supply its own subject)
+            & $risk @{ 'msPKI-Certificate-Name-Flag' = 1; 'msPKI-Template-Schema-Version' = 2; 'msPKI-Certificate-Application-Policy' = $serverAuth } | Should -Not -Match 'ESC'
+            # bit 31 set (CT_FLAG_SUBJECT_REQUIRE_DIRECTORY_PATH, a negative Int32) is not "supplies subject"
+            & $risk @{ 'msPKI-Certificate-Name-Flag' = [int]-2147483648; 'msPKI-Template-Schema-Version' = 2; 'msPKI-Certificate-Application-Policy' = $clientAuth } | Should -Not -Match 'ESC'
+            & $risk @{ 'msPKI-Certificate-Name-Flag' = [int]-2147483647; 'msPKI-Template-Schema-Version' = 2; 'msPKI-Certificate-Application-Policy' = $clientAuth } | Should -Match 'ESC1' -Because 'bit 0 is still set'
+            # ESC2: Any Purpose, or no application policy at all
+            & $risk @{ 'msPKI-Template-Schema-Version' = 2; 'msPKI-Certificate-Application-Policy' = [object[]]@('2.5.29.37.0') } | Should -Match 'ESC2'
+            & $risk @{ 'msPKI-Template-Schema-Version' = 2 } | Should -Match 'ESC2'
+            # ESC3: Certificate Request Agent without approval
+            & $risk @{ 'msPKI-Template-Schema-Version' = 2; 'msPKI-Certificate-Application-Policy' = [object[]]@('1.3.6.1.4.1.311.20.2.1') } | Should -Match 'ESC3'
+            # ESC9: CT_FLAG_NO_SECURITY_EXTENSION on a client-authentication template
+            & $risk @{ 'msPKI-Template-Schema-Version' = 2; 'msPKI-Enrollment-Flag' = 0x80000; 'msPKI-Certificate-Application-Policy' = $clientAuth } | Should -Match 'ESC9'
+            & $risk @{ 'msPKI-Template-Schema-Version' = 2; 'msPKI-Enrollment-Flag' = 0x80000; 'msPKI-Certificate-Application-Policy' = $serverAuth } | Should -Not -Match 'ESC9'
+            # ESC15: schema version 1 with a requester-supplied subject (the built-in WebServer shape)
+            & $risk @{ 'msPKI-Certificate-Name-Flag' = 1; 'msPKI-Template-Schema-Version' = 1; 'pKIExtendedKeyUsage' = $serverAuth } | Should -Match 'ESC15'
+            # A Kerberos Authentication-like template (subject built from AD, client+server+KDC auth) raises nothing.
+            $kdc = [object[]]@('1.3.6.1.5.5.7.3.2', '1.3.6.1.5.5.7.3.1', '1.3.6.1.4.1.311.20.2.2', '1.3.6.1.5.2.3.5')
+            & $risk @{ 'msPKI-Certificate-Name-Flag' = 0x08400000; 'msPKI-Enrollment-Flag' = 0x28; 'msPKI-Template-Schema-Version' = 2
+                       'pKIExtendedKeyUsage' = $kdc; 'msPKI-Certificate-Application-Policy' = $kdc } | Should -Not -Match 'ESC'
+        }
+
+        It 'Get-TemplateRiskWarning judges the EFFECTIVE application policies, not the union of both attributes' {
+            $risk = { param($a) @(Get-TemplateRiskWarning -Attributes $a) -join "`n" }
+            # Schema 2: msPKI-Certificate-Application-Policy takes precedence over pKIExtendedKeyUsage.
+            & $risk @{ 'msPKI-Template-Schema-Version' = 2; 'pKIExtendedKeyUsage' = [object[]]@('1.3.6.1.4.1.311.20.2.1')
+                       'msPKI-Certificate-Application-Policy' = [object[]]@('1.3.6.1.5.5.7.3.1') } | Should -Not -Match 'ESC' -Because 'the Request Agent EKU in pKIExtendedKeyUsage is not in the certificate'
+            & $risk @{ 'msPKI-Template-Schema-Version' = 2; 'msPKI-Certificate-Name-Flag' = 1; 'pKIExtendedKeyUsage' = [object[]]@('1.3.6.1.5.5.7.3.1')
+                       'msPKI-Certificate-Application-Policy' = [object[]]@('1.3.6.1.5.5.7.3.2') } | Should -Match 'ESC1' -Because 'client authentication in the application policy is what the certificate carries'
+            # Schema 2 without an application policy: no EKU in the certificate - any purpose.
+            & $risk @{ 'msPKI-Template-Schema-Version' = 2; 'pKIExtendedKeyUsage' = [object[]]@('1.3.6.1.5.5.7.3.1') } | Should -Match 'ESC2'
+            # Schema 1 with EKUs in pKIExtendedKeyUsage: those are the effective ones.
+            & $risk @{ 'msPKI-Template-Schema-Version' = 1; 'pKIExtendedKeyUsage' = [object[]]@('1.3.6.1.5.5.7.3.1')
+                       'msPKI-Certificate-Application-Policy' = [object[]]@('2.5.29.37.0') } | Should -Not -Match 'ESC'
+            # Schema 1 with an empty pKIExtendedKeyUsage falls back to the application policy.
+            & $risk @{ 'msPKI-Template-Schema-Version' = 1; 'msPKI-Certificate-Application-Policy' = [object[]]@('1.3.6.1.4.1.311.20.2.1') } | Should -Match 'ESC3'
+        }
+
         It 'the dotted-OID validation pattern is anchored with \z, so a trailing newline cannot slip past the OID uniqueness guard' {
             # $ matches before a trailing LF, so a tampered msPKI-Cert-Template-OID ending in "\n"
             # passed validation and then missed the (msPKI-Cert-Template-OID=<oid>) uniqueness search
             # (AD does not fold the newline). \z anchors at the true end of the string.
-            $pat = '^(0|[1-9]\d*)(\.(0|[1-9]\d*))+\z'
+            $pat = '^(0|[1-9][0-9]*)(\.(0|[1-9][0-9]*))+\z'
             '1.3.6.1.4.1.311.21.8.1.2'            | Should -Match $pat
             ("1.3.6.1.4.1.311.21.8.1.2" + "`n")   | Should -Not -Match $pat -Because 'a trailing LF must not pass ($ would have allowed it)'
             ("1.3.6.1.4.1.311.21.8.1.2" + "`r`n") | Should -Not -Match $pat
-            # tie the assertion to the real code: Resolve-TemplateOid must use \z, not $
-            (Get-Content -LiteralPath $script:Sync -Raw) | Should -Match ([regex]::Escape('(\.(0|[1-9]\d*))+\z')) -Because 'the OID validations must be anchored with \z'
-            (Get-Content -LiteralPath $script:Sync -Raw) | Should -Not -Match ([regex]::Escape('(\.(0|[1-9]\d*))+$')) -Because 'no OID validation may still use the newline-permissive $'
+            # tie the assertion to the real code: Resolve-TemplateOid must use \z, not $, and [0-9], not \d
+            $src = Get-Content -LiteralPath $script:Sync -Raw
+            $src | Should -Match ([regex]::Escape('(\.(0|[1-9][0-9]*))+\z')) -Because 'the OID validations must be anchored with \z'
+            $src | Should -Not -Match ([regex]::Escape('(\.(0|[1-9][0-9]*))+$')) -Because 'no OID validation may still use the newline-permissive $'
+            $src | Should -Not -Match ([regex]::Escape('(\.(0|[1-9]\d*))')) -Because '\d matches every Unicode decimal digit, not only 0-9'
+            $src | Should -Not -Match ([regex]::Escape("'^\d+(\.\d+)+\z'")) -Because 'the OID-list check must use [0-9] as well'
         }
 
         It 'Convert-ToLatestCompatibility: CSP-based v2 -> v4 with the exact stock v4 bytes (0x06060100)' {
@@ -882,6 +948,21 @@ public static class PesterSyncFsNative {
             $warn = @($out | Where-Object { $_ -is [System.Management.Automation.WarningRecord] } | ForEach-Object { $_.Message })
             @($warn | Where-Object { $_ -match 'will NOT be written' -and $_ -match 'msPKI-Bar' -and $_ -match 'msPKI-Unknown' }).Count | Should -Be 1
             $script:Imp.Removes.Count | Should -Be 0
+        }
+
+        It 'names an escalation-path setting in a warning BEFORE the create, still imports, and says nothing for Validate''s explicit-OID copies' {
+            # No application policy at all counts as client authentication (any purpose) - and keeps the
+            # view free of multi-value attributes, whose AD collection type this stub context avoids.
+            $esc1 = [pscustomobject]@{ name = 'Src'; displayName = 'Src'; flags = 1; 'msPKI-Cert-Template-OID' = '1.2.3.4'
+                                       'msPKI-Template-Schema-Version' = 2; 'msPKI-Certificate-Name-Flag' = 1 }
+            $out = @(script:Invoke-FakeImport -View $esc1)
+            $warn = @($out | Where-Object { $_ -is [System.Management.Automation.WarningRecord] } | ForEach-Object { $_.Message })
+            @($warn | Where-Object { $_ -match 'ESC1' }).Count | Should -Be 1
+            @($script:Imp.Creates | Where-Object { $_.Type -eq 'pKICertificateTemplate' }).Count | Should -Be 1 -Because 'a warning, not a refusal'
+            # Validate's throwaway copies (-ExplicitOid) live in the source forest and are removed again: no warning.
+            $script:Imp.Creates.Clear()
+            $out = @(script:Invoke-WithCmdlet -Body { param($c) Import-Template -InputObject $esc1 -NewTemplateName 'SrcVal' -ExplicitOid '1.2.3.5' -ConfigNC 'CN=Configuration,DC=x,DC=test' -ADParams @{} -CallerCmdlet $c 6>$null 3>&1 })
+            @($out | Where-Object { $_ -is [System.Management.Automation.WarningRecord] -and $_.Message -match 'ESC\d' }).Count | Should -Be 0
         }
 
         It 'prints a "Created OID object:" and a "Created template:" line carrying the DN and objectGUID New-ADObject returned at creation, and the Lab parser reads them back' {

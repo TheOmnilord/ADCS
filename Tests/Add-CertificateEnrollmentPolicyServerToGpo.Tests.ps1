@@ -74,7 +74,7 @@ Describe 'Add-CertificateEnrollmentPolicyServerToGpo' {
         $ast = [System.Management.Automation.Language.Parser]::ParseFile($script:Gpo, [ref]$null, [ref]$null)
         foreach ($name in 'Read-PolRecords', 'Get-PolEffectiveValues', 'Get-PolEntries', 'Get-PolValue', 'Test-EntryRecordsPresent', 'Test-PolEntryUsable',
                           'Test-PolDeletionOrder', 'Test-GpoEntry', 'Invoke-GPWrite', 'ConvertTo-PolDwordValue', 'Get-PolRawRecord',
-                          'Get-PolDwordRecordReason', 'Get-RootFlagsDisplay') {
+                          'Get-PolDwordRecordReason', 'Get-RootFlagsDisplay', 'Get-PolWriteMismatch') {
             $def = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name }, $false)
             if ($def) { . ([scriptblock]::Create($def[0].Extent.Text)) }
         }
@@ -127,6 +127,28 @@ Describe 'Add-CertificateEnrollmentPolicyServerToGpo' {
     }
 
     Context 'Unit: registry.pol parser and extractors' -Tag 'Unit' {
+
+        It 'Get-PolWriteMismatch reads a write back from the replay: value AND registry type, and a removal leaves nothing' {
+            $recs = @(Read-PolRecords -Path $script:PolPath)   # root Flags = DWORD 0x4, (Default) marker = REG_SZ '241064013'
+            Get-PolWriteMismatch -Recs $recs -RelKey $script:relBase -ValueName Flags -Kind Dword -Expected 4 | Should -BeExactly ''
+            Get-PolWriteMismatch -Recs $recs -RelKey $script:relBase -ValueName Flags -Kind Dword -Expected 6 | Should -Match 'is 0x4, not 0x6'
+            Get-PolWriteMismatch -Recs $recs -RelKey $script:relBase -ValueName '' -Kind String -Expected '241064013' | Should -BeExactly ''
+            Get-PolWriteMismatch -Recs $recs -RelKey $script:relBase -ValueName '' -Kind String -Expected '241064014' | Should -Match "not '241064014'"
+            Get-PolWriteMismatch -Recs $recs -RelKey $script:relBase -ValueName '' -Kind Absent | Should -Match 'still present'
+            Get-PolWriteMismatch -Recs $recs -RelKey $script:relBase -ValueName 'Nope' -Kind Absent | Should -BeExactly ''
+            Get-PolWriteMismatch -Recs $recs -RelKey $script:relBase -ValueName 'Nope' -Kind Dword -Expected 0 | Should -Match 'absent'
+            # The TYPE decides as well: a Flags left as REG_SZ '4', or a marker as REG_DWORD, is not what a client reads.
+            $typed = @(
+                [pscustomobject]@{ Key = $script:relBase; ValueName = 'Flags'; Type = 1; Data = '4';         Size = 4; Index = 0 }
+                [pscustomobject]@{ Key = $script:relBase; ValueName = '';      Type = 4; Data = [uint32]241064013; Size = 4; Index = 1 }
+            )
+            Get-PolWriteMismatch -Recs $typed -RelKey $script:relBase -ValueName Flags -Kind Dword -Expected 4 | Should -Match 'not a 4-byte REG_DWORD'
+            Get-PolWriteMismatch -Recs $typed -RelKey $script:relBase -ValueName '' -Kind String -Expected '241064013' | Should -Match 'not REG_SZ'
+            # A deletion record ordered AFTER the write means clients end up without the value.
+            $deleted = $recs + [pscustomobject]@{ Key = $script:relBase; ValueName = '**del.Flags'; Type = 1; Data = ' '; Size = 4; Index = 99 }
+            Get-PolWriteMismatch -Recs $deleted -RelKey $script:relBase -ValueName Flags -Kind Dword -Expected 4 | Should -Match 'absent'
+            Get-PolWriteMismatch -Recs $deleted -RelKey $script:relBase -ValueName Flags -Kind Absent | Should -BeExactly ''
+        }
 
         It 'Read-PolRecords parses every record from a Registry.pol byte stream' {
             $recs = @(Read-PolRecords -Path $script:PolPath)

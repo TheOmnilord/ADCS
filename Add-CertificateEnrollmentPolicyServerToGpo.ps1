@@ -1,11 +1,12 @@
 <#PSScriptInfo
-.VERSION 1.0.8
+.VERSION 1.0.9
 .GUID 54763db6-2359-401f-8960-ef0de5911aaf
 .AUTHOR Sveinung Svea
 .PROJECTURI https://github.com/TheOmnilord/ADCS
 .LICENSEURI https://github.com/TheOmnilord/ADCS/blob/main/LICENSE
 .TAGS ADCS PKI CertificateServices
 .RELEASENOTES
+1.0.9 - The root Flags write, the (Default) marker write and both -ClearDefault marker removals are now read back from the registry.pol replay before they are reported (value AND registry type: Flags must be a 4-byte REG_DWORD with the written bits, the marker the REG_SZ PolicyID, a removal must leave no surviving value); previously these four writes were reported as applied without any read-back, while every entry write was verified. New pure helper Get-PolWriteMismatch
 1.0.8 - The registry.pol reader checks every framing character of a record: it refuses a missing ';' separator, a missing closing ']' and one leftover byte after the last record (the 1.0.1 check caught two or more bytes only), so a file cut at the end of a record's data is reported as corrupt instead of intact; the existing root Flags value is converted by a new helper (ConvertTo-PolDwordValue) BEFORE the first write in Add mode, and a value that is not a DWORD or a numeric string (a REG_SZ 'abc' another tool left) is refused with a clear message while nothing has been written (previously a raw cast error after the AD row and the CEP entry were already in the GPO); the same helper drives the RootFlags display (an unusable value shows as 'unusable: ...' instead of a crash) and the Auto-Enrollment old-value comparison; a root Flags record of another type (a REG_BINARY, a REG_QWORD, a REG_MULTI_SZ) or a REG_DWORD whose data is not exactly 4 bytes, which the parser reads as no value, is refused the same way (the record judged is the one that establishes the value in the same replay the effective view performs: the last literal write wins, a **soft.Flags write applies only when no value exists at that point, a later deletion record removes the value, and a soft write never recreates a key that a **DeleteKeys record removed; a value that a soft write restores after a deletion is no longer reported as lost by the deletion-order scan); the reader refuses a file shorter than the 8-byte header as corrupt instead of reading it as empty (a zero-byte file still counts as no records) before the first write (new helpers Get-PolRawRecord and Get-PolDwordRecordReason judge the newest raw record, and fail closed even when a later deletion record would remove it) instead of passing for an absent value that step 3 overwrote with DWORD 0 after the AD row and the CEP entry were written, and the RootFlags display shows such a record as 'unusable: ...' instead of '(absent)'; -ReplaceExisting verifies each sibling removal from registry.pol before it reports the sibling in DuplicatesRemoved, as -Remove already did, and fails the run when the records are still there
 1.0.7 - Help text only: the comment-based help is rewritten to the repository writing style (STYLE.md, derived from ASD-STE100 Simplified Technical English) - short sentences, active voice, no figurative language, acronyms defined, a CAUTION line on -ReplaceExisting and -Remove; every fact, condition and default is kept; no code change
 1.0.6 - The root-Flags gate recognises any pre-existing USABLE policy-server entry (a complete row - URL, PolicyID, FriendlyName and numeric Flags/AuthFlags/Cost - not an incomplete fragment) in the scope, not only the requested CEP entry and the AD row: a declined requested entry no longer wrongly blocks a legitimate root-Flags change when another working server exists, while an incomplete fragment cannot make clearing 0x2 activate a zero-server list
@@ -64,7 +65,9 @@
     detects such mis-ordered deletion records in the GPO and warns about them.
 
     The script verifies every entry by read-back, and the read-back also detects missing
-    values. The script retries transient contention on SYSVOL and registry.pol. State
+    values. It also reads back the root Flags, the (Default) marker and each marker removal, and
+    it checks the registry type of each value. The script retries transient contention on SYSVOL
+    and registry.pol. State
     inspection reads registry.pol from the Primary Domain Controller (PDC) emulator, or from
     -Server when you give it. Reads and writes therefore see the same replica.
 
@@ -695,6 +698,34 @@ function Get-RootFlagsDisplay([object[]]$Recs) {
     $conv = ConvertTo-PolDwordValue $v
     if ($conv.Reason) { "unusable: $($conv.Reason)" } else { '0x{0:X}' -f $conv.Value }
 }
+function Get-PolWriteMismatch {
+    # Read-back of one write, judged on the registry.pol replay (Get-PolRawRecord: the record that
+    # establishes the value on a client, deletions honoured): '' when a client ends up with exactly
+    # what this run wrote, else the reason. Dword and String also check the record TYPE - a Flags
+    # left as REG_SZ, or a marker as REG_DWORD, is not the value a client reads. Absent checks that
+    # no value of that name survives. Pure, so every branch can be unit-tested.
+    param(
+        [object[]]$Recs,
+        [string]$RelKey,
+        [AllowEmptyString()][string]$ValueName,
+        [ValidateSet('Dword', 'String', 'Absent')][string]$Kind,
+        $Expected
+    )
+    $rec = Get-PolRawRecord $Recs $RelKey $ValueName
+    if ($Kind -eq 'Absent') {
+        if ($null -ne $rec) { return "the value is still present (record type $($rec.Type))" }
+        return ''
+    }
+    if ($null -eq $rec) { return 'the value is absent' }
+    if ($Kind -eq 'Dword') {
+        if ([int64]$rec.Type -ne 4 -or $null -eq $rec.Data) { return "the record is of type $($rec.Type) with $($rec.Size) data byte(s), not a 4-byte REG_DWORD" }
+        if ([int64]$rec.Data -ne [int64]$Expected) { return "the value is 0x{0:X}, not 0x{1:X}" -f [int64]$rec.Data, [int64]$Expected }
+        return ''
+    }
+    if ([int64]$rec.Type -ne 1) { return "the record is of type $($rec.Type), not REG_SZ" }
+    if ("$($rec.Data)" -cne "$Expected") { return "the value is '$($rec.Data)', not '$Expected'" }
+    ''
+}
 
 $preRecs = Read-PolRecords -Path $polPath
 
@@ -743,6 +774,9 @@ if ($PSCmdlet.ParameterSetName -eq 'Remove') {
     if ($ClearDefault -and -not $defaultCleared -and (Get-PolValue $preRecs $relBase '')) {
         if ($PSCmdlet.ShouldProcess($gpoLabel, 'Clear (Default) marker')) {
             Invoke-GPWrite -TolerateNotFound { Remove-GPRegistryValue @wr -Confirm:$false -Key $baseKey -ValueName '' | Out-Null }
+            # Verified from registry.pol like every other write, before it is reported as done.
+            $why = Get-PolWriteMismatch -Recs (Read-PolRecords -Path $polPath) -RelKey $relBase -ValueName '' -Kind Absent
+            if ($why) { throw "Clearing the (Default) marker in $gpoLabel did not take effect ($why)." }
             $defaultCleared = $true
         }
     }
@@ -979,6 +1013,12 @@ elseif (($null -eq $existingRoot) -or ($existingRootConv.Value -ne $newRoot)) {
     $rootApplied = 'not run'
     if ($PSCmdlet.ShouldProcess($gpoLabel, ('Set root Flags {0} -> 0x{1:X} on {2} (disable bits: 0x2 ignore GP list, 0x4 ignore user-configured)' -f $from, $newRoot, $baseKey))) {
         Invoke-GPWrite { Set-GPRegistryValue @wr -Confirm:$false -Key $baseKey -ValueName Flags -Type DWord -Value ([uint32]$newRoot) | Out-Null }
+        # Read back from the registry.pol replay, as the entry writes are: value AND REG_DWORD type.
+        $why = Get-PolWriteMismatch -Recs (Read-PolRecords -Path $polPath) -RelKey $relBase -ValueName Flags -Kind Dword -Expected $newRoot
+        if ($why) {
+            $hex = '0x{0:X}' -f $newRoot
+            throw "Root Flags written to $gpoLabel, but the registry.pol replay shows that clients would not end up with $hex ($why). A deletion record after the value, or a concurrent edit of this GPO, causes this. Inspect the PolicyServers key of the GPO in GPME, then run the script again."
+        }
         $rootApplied = 'applied'
     }
 }
@@ -990,12 +1030,17 @@ if ($SetAsDefault) {
     }
     elseif ($PSCmdlet.ShouldProcess($gpoLabel, "Set (Default) marker = $PolicyId on $baseKey (default enrollment policy = '$PolicyName')")) {
         Invoke-GPWrite { Set-GPRegistryValue @wr -Confirm:$false -Key $baseKey -ValueName '' -Type String -Value $PolicyId | Out-Null }
+        # Read back from the registry.pol replay: the marker must be the REG_SZ PolicyID, as written.
+        $why = Get-PolWriteMismatch -Recs (Read-PolRecords -Path $polPath) -RelKey $relBase -ValueName '' -Kind String -Expected $PolicyId
+        if ($why) { throw "The (Default) marker written to $gpoLabel does not read back as '$PolicyId' from the registry.pol replay ($why). A deletion record after the value, or a concurrent edit of this GPO, causes this. Inspect the PolicyServers key of the GPO in GPME, then run the script again." }
         $defaultChanged = $true
     }
 }
 if ($ClearDefault -and (Get-PolValue $preRecs $relBase '')) {
     if ($PSCmdlet.ShouldProcess($gpoLabel, 'Clear (Default) marker')) {
         Invoke-GPWrite -TolerateNotFound { Remove-GPRegistryValue @wr -Confirm:$false -Key $baseKey -ValueName '' | Out-Null }
+        $why = Get-PolWriteMismatch -Recs (Read-PolRecords -Path $polPath) -RelKey $relBase -ValueName '' -Kind Absent
+        if ($why) { throw "Clearing the (Default) marker in $gpoLabel did not take effect ($why)." }
         $defaultChanged = $true
     }
 }

@@ -92,7 +92,7 @@ Switches that need a CAUTION:
 
 | Script | Switches |
 |---|---|
-| Submit-CertificateRequests.ps1 | `-AllowUnprotectedOutputFolder`, `-Force` |
+| Submit-CertificateRequests.ps1 | `-AllowUnprotectedOutputFolder`, `-AllowUnprotectedInputFolder`, `-Force` |
 | Sync-ADCSTemplate.ps1 | `-SkipAcl`, `-AllowLinkedIssuancePolicy` |
 | Add-CertificateEnrollmentPolicyServerOffline.ps1 | `-ReplaceExisting`, `-Remove` |
 | Add-CertificateEnrollmentPolicyServerToGpo.ps1 | `-ReplaceExisting`, `-Remove` |
