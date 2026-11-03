@@ -8,6 +8,29 @@ Each script also carries its own version in the `PSScriptInfo` header at the top
 Test-ScriptFileInfo .\Submit-CertificateRequests.ps1 | Select-Object Name, Version
 ```
 
+## [1.0.15] — 2026-11-03
+
+This release makes one warning of Submit-CertificateRequests.ps1 clearer. The script behaviour does not change. The other scripts do not change.
+
+### Changed
+
+- **Submit-CertificateRequests.ps1 → 1.2.1.** The `Retrieve` warning for a row without a RequestID now names the source of its stored error.
+  - `Retrieve` repeats the stored `ErrorMessage` of such a row on every run. Before, an old certreq error looked like a failure of the current run.
+  - The warning now gives the time of the submit attempt and the certification authority (CA) that it went to. It also says that the error is not from the current run.
+
+### Added - tests
+
+- Submit-CertificateRequests.
+  - Unit: the warning text for a row with a submit time, a CA and an error, and for an old row without these values.
+
+| Script | Version |
+|---|---|
+| Set-ADCSTemplateValidity.ps1 | 1.0.6 |
+| Submit-CertificateRequests.ps1 | **1.2.1** |
+| Sync-ADCSTemplate.ps1 | 1.0.9 |
+| Add-CertificateEnrollmentPolicyServerOffline.ps1 | 1.0.8 |
+| Add-CertificateEnrollmentPolicyServerToGpo.ps1 | 1.0.9 |
+
 ## [1.0.14] — 2026-09-27
 
 This release closes trust gaps that an external review of the repository found. Submit-CertificateRequests.ps1 now checks its drop folder, and it records each request before certreq runs. Sync-ADCSTemplate.ps1 warns about template settings that are known escalation paths. The GPO script reads back every write. An iterative Codex review of the fixes ended with an approval after four rounds.
@@ -455,6 +478,7 @@ Initial release.
 | Add-CertificateEnrollmentPolicyServerOffline.ps1 | 1.0.0 |
 | Add-CertificateEnrollmentPolicyServerToGpo.ps1 | 1.0.0 |
 
+[1.0.15]: https://github.com/TheOmnilord/ADCS/compare/v1.0.14...v1.0.15
 [1.0.14]: https://github.com/TheOmnilord/ADCS/compare/v1.0.13...v1.0.14
 [1.0.13]: https://github.com/TheOmnilord/ADCS/compare/v1.0.12...v1.0.13
 [1.0.12]: https://github.com/TheOmnilord/ADCS/compare/v1.0.11...v1.0.12

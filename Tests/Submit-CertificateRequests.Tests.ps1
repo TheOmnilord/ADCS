@@ -73,7 +73,7 @@ Describe 'Submit-CertificateRequests' {
         $shim | Should -Not -BeNullOrEmpty
         . ([scriptblock]::Create($shim[0].Extent.Text))
         foreach ($name in 'Resolve-FullPath', 'Resolve-TrackingFilePath', 'Assert-NoReparsePointAt', 'New-CertreqCaptureFile', 'Assert-UnambiguousPathComponents', 'ConvertTo-ExtendedPath', 'New-ProtectedDirectory', 'Assert-SafeNativeArgument', 'Assert-CertificateOutputPath', 'Assert-ProtectedDirectoryChain', 'Move-StaleCertificateAside', 'Remove-AsideIfIdentical', 'Move-RetrievedCertificate', 'New-TempCertificatePath',
-                          'Get-TrustedPrincipalSet', 'ConvertTo-PrincipalLabel', 'Get-UntrustedGrant', 'Get-UntrustedOwner', 'Get-RequestFileTrust', 'Get-PrincipalGroupSids', 'Test-DefiniteSubmitFailure', 'Submit-SingleRequest',
+                          'Get-TrustedPrincipalSet', 'ConvertTo-PrincipalLabel', 'Get-UntrustedGrant', 'Get-UntrustedOwner', 'Get-RequestFileTrust', 'Get-PrincipalGroupSids', 'Test-DefiniteSubmitFailure', 'Get-ReconciliationWarning', 'Submit-SingleRequest',
                           'Write-BatchLog', 'Get-RequestIdFromOutput', 'Get-DispositionFromOutput',
                           'Get-FriendlyErrorHint', 'Import-TrackingData', 'Export-TrackingData', 'Remove-RspFile', 'Resolve-CertificateOutputNames', 'Get-DestinationOwnerConflict', 'Get-RequestFiles', 'Test-CertificateRequestFile') {
             $def = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name }, $false)
@@ -477,6 +477,25 @@ Describe 'Submit-CertificateRequests' {
             Test-DefiniteSubmitFailure -ExitCode 0x80070002 | Should -BeFalse -Because 'a file error can come from saving the issued certificate'
             Test-DefiniteSubmitFailure -ExitCode 0x8009310B | Should -BeFalse -Because 'an ASN.1 error can come from decoding the CA answer'
             Test-DefiniteSubmitFailure -ExitCode 1 | Should -BeFalse -Because 'a certreq ended from outside exits with whatever code it was given'
+        }
+
+        It 'Get-ReconciliationWarning names the earlier submit attempt as the source of the stored error' {
+            # The stored ErrorMessage comes from the Submit run that made the row. Retrieve repeats it
+            # on every run, so the text must not read as a failure of the current run.
+            $submitTime = '2026-11-02T14:05:09.0000000+01:00'
+            $localTime  = ([datetimeoffset]::Parse($submitTime)).ToLocalTime().ToString('yyyy-MM-dd HH:mm:ss')
+            $row = [PSCustomObject]@{
+                RequestFile = 'C:\CSRs\a.csr'; RequestID = ''; SubmitTime = $submitTime; Status = 'Unknown'
+                CAConfig = 'CA01\Issuing CA'; ErrorMessage = 'certreq failed with 0x8000401D.'
+            }
+            $msg = Get-ReconciliationWarning -Row $row
+            $msg | Should -BeLike "Needs manual reconciliation: 'C:\CSRs\a.csr' has no RequestID (Status Unknown)*"
+            $msg | Should -BeLike "*from the submit attempt at $localTime to 'CA01\Issuing CA', not from this run: certreq failed with 0x8000401D."
+            # A legacy row: no CAConfig, an unparseable SubmitTime and no error text.
+            $legacy = [PSCustomObject]@{ RequestFile = 'C:\CSRs\b.csr'; RequestID = ''; SubmitTime = ''; Status = 'Undelivered'; CAConfig = ''; ErrorMessage = '' }
+            $msg = Get-ReconciliationWarning -Row $legacy
+            $msg | Should -BeLike '*The submit attempt at an unknown time recorded no error text.'
+            $msg | Should -Not -BeLike "* to '*"
         }
 
         It 'Submit-SingleRequest records Unknown after a failed certreq unless the output proves non-submission' {

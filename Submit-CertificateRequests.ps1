@@ -1,11 +1,12 @@
 <#PSScriptInfo
-.VERSION 1.2.0
+.VERSION 1.2.1
 .GUID 6f98f16e-0c56-4a72-ba31-443938175c06
 .AUTHOR Sveinung Svea
 .PROJECTURI https://github.com/TheOmnilord/ADCS
 .LICENSEURI https://github.com/TheOmnilord/ADCS/blob/main/LICENSE
 .TAGS ADCS PKI CertificateServices
 .RELEASENOTES
+1.2.1 - The Retrieve warning for a row without a RequestID (manual reconciliation) now says that its stored ErrorMessage comes from the earlier submit attempt, with that attempt's SubmitTime and CAConfig, not from the current run; before, an old certreq error such as 0x8000401D read like a failure of the run that printed it. New helper Get-ReconciliationWarning builds the text. No behaviour change
 1.2.0 - The drop folder is an authorization boundary and is now checked like the output folders: every request file in it is submitted with the running account's enrollment rights, so the -InputPath folder chain must be free of reparse points, untrusted owners and untrusted create/write/delete/rename/re-permission grants, and the folder must not hand untrusted principals write rights on the files created in it (BEHAVIOUR CHANGE: a folder that any user can write to, such as a new folder directly under C:\, is refused; new -AllowUnprotectedInputFolder accepts the risk, new -TrustedInputPrincipal names a requester group). A missing -InputPath is refused before the CA is contacted (a folder that did not exist yet skipped the check and could appear as a junction during the CA check). Each request file is checked too: a file owned by, or writable by, an untrusted principal is refused (an Error row), and a file that is a symbolic link or another reparse point is skipped; a member of a group named in -TrustedInputPrincipal counts as trusted for its own files (its tokenGroups, read with ADSI; fail closed when unreadable). The owner of each request file is recorded in the new RequestFileOwner column and in the log. The script now records a request as Unknown BEFORE certreq runs (a write-ahead row) and replaces that row with the result, so a run that stops while certreq runs no longer loses a request the CA may hold (a later run resubmitted it); a failure after certreq has run also records Unknown instead of a resubmittable Error, and a failed certreq without a RequestID is an Error only when its EXIT CODE (certreq exits with the HRESULT that ended it) proves that the request never reached the CA - a connection-phase failure: RPC_S_SERVER_UNAVAILABLE, RPC_S_CALL_FAILED_DNE, EPT_S_NOT_REGISTERED or a DNS name error, per the new helper Test-DefiniteSubmitFailure; anything else - RPC_S_CALL_FAILED, an access, file, ASN.1 or crypto error (each can also occur after the CA accepted the request), a certreq ended from outside - is Unknown. The console text is not judged: certreq also prints HRESULTs of side queries that do not stop a submission the CA then issues. The requester-group membership lookup binds with Secure, Signing and Sealing, so the answer that decides trust is integrity-protected whatever the client LDAP signing policy. Values passed to certreq must not end with a backslash (the final backslash escaped the closing quote, so a drop-folder file name could add certreq switches), -CertificateTemplate must not contain a backslash (certreq reads \n in an -attrib value as a new request attribute), and a tracking-file RequestID must be ASCII digits only
 1.1.0 - The drop folder also accepts .pem files: a .pem file is submitted only when its content decodes as a PKCS #10 certificate request (PEM with or without the header, or binary DER), because a .pem file often holds a certificate or a private key; any other .pem file is skipped with a warning. New -AnyExtension switch: every file in the drop folder, whatever its extension, gets the same content test and is submitted only when it passes. .req/.csr/.txt files without -AnyExtension are submitted as before, with no content test
 1.0.12 - Help text only: the .NOTES now document the per-request checkpoint that 1.0.11 restored - the script writes the tracking file after EVERY request (not only at the end), so a crash mid-batch keeps every RequestID the CA already accepted and a later run resumes without resubmitting; each write replaces the file in one step. No code change
@@ -1260,6 +1261,27 @@ function Test-DefiniteSubmitFailure {
     $ExitCode -in @(0x800706BA, 0x800706BF, 0x800706D9, 0x8007232B)
 }
 
+function Get-ReconciliationWarning {
+    # The Retrieve warning for a row that has no RequestID. Its ErrorMessage was recorded by the
+    # Submit run that made the row, not by this run, so the text names that attempt (time and CA).
+    # Without the attribution an old certreq error reads like a failure of the current run.
+    param([Parameter(Mandatory)][psobject]$Row)
+    $parsed = [datetimeoffset]::MinValue
+    $when = if ([datetimeoffset]::TryParse("$($Row.SubmitTime)", [ref]$parsed)) {
+        $parsed.ToLocalTime().ToString('yyyy-MM-dd HH:mm:ss')
+    }
+    else { 'an unknown time' }
+    $toCa = if ($Row.CAConfig) { " to '$($Row.CAConfig)'" } else { '' }
+    $msg = "Needs manual reconciliation: '$($Row.RequestFile)' has no RequestID (Status $($Row.Status)), so this run cannot retrieve it. The CA may hold it."
+    if ($Row.ErrorMessage) {
+        $msg += " This message is from the submit attempt at $when$toCa, not from this run: $($Row.ErrorMessage)"
+    }
+    else {
+        $msg += " The submit attempt at $when$toCa recorded no error text."
+    }
+    $msg
+}
+
 function Get-FriendlyErrorHint {
     param(
         [string[]]$Output,
@@ -2130,7 +2152,7 @@ try {   # the lock is released in the finally at the end of the run, on every ex
             # never resubmitted either, so they need the operator: the certificate itself is still
             # in its staging file (path in ErrorMessage) and the ID can be found in the CA database.
             foreach ($orphan in @($tracking | Where-Object { -not $_.RequestID -and $_.Status -in 'Undelivered', 'Unknown' })) {
-                Write-BatchLog "Needs manual reconciliation: '$($orphan.RequestFile)' has no RequestID (Status $($orphan.Status)) and cannot be fetched - the CA may hold it. $($orphan.ErrorMessage)" -Level Warning
+                Write-BatchLog (Get-ReconciliationWarning -Row $orphan) -Level Warning
                 $script:FailureCount++
             }
 
